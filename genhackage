@@ -12,6 +12,7 @@ PRESET_PACKAGES = {
     "c2hs": "c2hs",
     "cabal-install": "cabal-install",
     "darcs": "darcs",
+    "gtk2hs-buildtools": "gtk2hs-buildtools",
     "haddock": "haddock",
     "happy": "happy",
     "haskell-graphscc": "GraphSCC",
@@ -21,8 +22,12 @@ PRESET_PACKAGES = {
     "haskell-safesemaphore": "SafeSemaphore",
     "haskell-src-exts": "haskell-src-exts",
     "haskell-juicypixels": "JuicyPixels",
+    "hlint": "hlint",
     "pandoc": "pandoc",
     "shellcheck": "ShellCheck",
+    "xmobar": "xmobar",
+    "xmonad": "xmonad",
+    "xmonad-contrib": "xmonad-contrib",
 }
 
 URL_PATTERN = "https://www.archlinux.org/packages/community/x86_64/%(pkgname)s"
