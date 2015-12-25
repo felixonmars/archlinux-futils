@@ -23,7 +23,6 @@ PRESET_PACKAGES = {
     "haskell-src-exts": "haskell-src-exts",
     "haskell-juicypixels": "JuicyPixels",
     "hlint": "hlint",
-    "pandoc": "pandoc",
     "shellcheck": "ShellCheck",
     "xmobar": "xmobar",
     "xmonad": "xmonad",
