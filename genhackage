@@ -24,6 +24,7 @@ PRESET_PACKAGES = {
     "haskell-juicypixels": "JuicyPixels",
     "hlint": "hlint",
     "shellcheck": "ShellCheck",
+    "statevar": "StateVar",
     "xmobar": "xmobar",
     "xmonad": "xmonad",
     "xmonad-contrib": "xmonad-contrib",
