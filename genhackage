@@ -16,6 +16,7 @@ PRESET_PACKAGES = {
     "haddock": "haddock",
     "happy": "happy",
     "haskell-graphscc": "GraphSCC",
+    "haskell-http": "HTTP",
     "haskell-hunit": "HUnit",
     "haskell-ifelse": "IfElse",
     "haskell-missingh": "MissingH",
