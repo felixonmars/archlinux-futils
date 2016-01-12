@@ -20,6 +20,7 @@ PRESET_PACKAGES = {
     "haskell-hunit": "HUnit",
     "haskell-ifelse": "IfElse",
     "haskell-missingh": "MissingH",
+    "haskell-monadrandom": "MonadRandom",
     "haskell-safesemaphore": "SafeSemaphore",
     "haskell-src-exts": "haskell-src-exts",
     "haskell-statevar": "StateVar",
