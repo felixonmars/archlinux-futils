@@ -36,6 +36,7 @@ URL_PATTERN = "https://www.archlinux.org/packages/community/x86_64/%(pkgname)s"
 
 result_fd = StringIO()
 result_csv = csv.writer(result_fd, quoting=csv.QUOTE_ALL)
+counter = 0
 
 for line in pacman("-Sl", "community", "--color=never"):
     found = False
@@ -56,14 +57,22 @@ for line in pacman("-Sl", "community", "--color=never"):
         found.append(URL_PATTERN % {"pkgname": package})
         result_csv.writerow(found)
 
+        counter += 1
+
 result_fd.seek(0)
 result_body = result_fd.read().rstrip("\r\n")
 
-URL = "https://hackage.haskell.org/distro/Arch/packages"
-r = requests.put(
-    URL,
-    data=result_body,
-    auth=(os.environ["HACKAGE_USERNAME"], os.environ["HACKAGE_PASSWORD"]),
-    headers={"Content-Type": "text/csv"},
-)
-print("Upload:", r.status_code, r.text)
+print(counter, "packages found.")
+
+if "HACKAGE_USERNAME" in os.environ and "HACKAGE_PASSWORD" in os.environ:
+    URL = "https://hackage.haskell.org/distro/Arch/packages"
+    r = requests.put(
+        URL,
+        data=result_body,
+        auth=(os.environ["HACKAGE_USERNAME"], os.environ["HACKAGE_PASSWORD"]),
+        headers={"Content-Type": "text/csv"},
+    )
+    print("Upload:", r.status_code, r.text)
+
+else:
+    print("Please make sure you have HACKAGE_USERNAME and HACKAGE_PASSWORD set to upload the package list.")
