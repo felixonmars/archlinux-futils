@@ -15,6 +15,7 @@ PRESET_PACKAGES = {
     "gtk2hs-buildtools": "gtk2hs-buildtools",
     "haddock": "haddock",
     "happy": "happy",
+    "haskell-dav": "DAV",
     "haskell-graphscc": "GraphSCC",
     "haskell-http": "HTTP",
     "haskell-hunit": "HUnit",
