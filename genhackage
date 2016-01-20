@@ -24,6 +24,7 @@ PRESET_PACKAGES = {
     "haskell-ifelse": "IfElse",
     "haskell-missingh": "MissingH",
     "haskell-monadrandom": "MonadRandom",
+    "haskell-quickcheck": "QuickCheck",
     "haskell-safesemaphore": "SafeSemaphore",
     "haskell-sha": "SHA",
     "haskell-src-exts": "haskell-src-exts",
