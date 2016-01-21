@@ -3,11 +3,12 @@
 import os
 import csv
 from io import StringIO
-from sh import pacman
+from sh import pacman, expac
 import requests
 
 # Preset: "arch pkgname": "hackage package name"
 PRESET_PACKAGES = {
+    "agda": "Agda",
     "alex": "alex",
     "c2hs": "c2hs",
     "cabal-install": "cabal-install",
@@ -32,7 +33,11 @@ PRESET_PACKAGES = {
     "haskell-stmonadtrans": "STMonadTrans",
     "haskell-juicypixels": "JuicyPixels",
     "hasktags": "hasktags",
+    "hindent": "hindent",
+    "hoogle": "hoogle",
+    "idris": "idris",
     "shellcheck": "ShellCheck",
+    "stylish-haskell": "stylish-haskell",
     "xmobar": "xmobar",
     "xmonad": "xmonad",
     "xmonad-contrib": "xmonad-contrib",
@@ -43,6 +48,25 @@ URL_PATTERN = "https://www.archlinux.org/packages/community/x86_64/%(pkgname)s"
 result_fd = StringIO()
 result_csv = csv.writer(result_fd, quoting=csv.QUOTE_ALL)
 counter = 0
+
+for item in expac("-S", "%P", "community/ghc").split():
+    found = False
+
+    # Fetch package and version
+    package, version = item.split("=")
+
+    # Remove pkgrel
+    version = version.split("-")[0]
+
+    if package.startswith("haskell-"):
+        found = [package[8:], version]
+
+    if found:
+        print("Found", *found)
+        found.append(URL_PATTERN % {"pkgname": package})
+        result_csv.writerow(found)
+
+        counter += 1
 
 for line in pacman("-Sl", "community", "--color=never"):
     found = False
