@@ -12,6 +12,7 @@ PRESET_PACKAGES = {
     "alex": "alex",
     "c2hs": "c2hs",
     "cabal-install": "cabal-install",
+    "cgrep": "cgrep",
     "darcs": "darcs",
     "git-annex": "git-annex",
     "gtk2hs-buildtools": "gtk2hs-buildtools",
