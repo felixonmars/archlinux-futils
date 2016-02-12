@@ -19,6 +19,7 @@ PRESET_PACKAGES = {
     "haddock": "haddock",
     "happy": "happy",
     "haskell-dav": "DAV",
+    "haskell-glob": "Glob",
     "haskell-gtk": "gtk3",
     "haskell-graphscc": "GraphSCC",
     "haskell-http": "HTTP",
