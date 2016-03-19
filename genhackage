@@ -18,6 +18,7 @@ PRESET_PACKAGES = {
     "gtk2hs-buildtools": "gtk2hs-buildtools",
     "haddock": "haddock",
     "happy": "happy",
+    "haskell-cabal": "Cabal",
     "haskell-dav": "DAV",
     "haskell-glob": "Glob",
     "haskell-gtk": "gtk3",
@@ -60,7 +61,9 @@ for item in expac("-S", "%P", "community/ghc").split():
     # Remove pkgrel
     version = version.split("-")[0]
 
-    if package.startswith("haskell-"):
+    if package in PRESET_PACKAGES:
+        found = [PRESET_PACKAGES[package], version]
+    elif package.startswith("haskell-"):
         found = [package[8:], version]
 
     if found:
