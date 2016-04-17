@@ -20,6 +20,8 @@ PRESET_PACKAGES = {
     "happy": "happy",
     "haskell-cabal": "Cabal",
     "haskell-dav": "DAV",
+    "haskell-edisonapi": "EdisonAPI",
+    "haskell-edisoncore": "EdisonCore",
     "haskell-glob": "Glob",
     "haskell-gtk": "gtk3",
     "haskell-graphscc": "GraphSCC",
