@@ -41,6 +41,7 @@ PRESET_PACKAGES = {
     "hindent": "hindent",
     "hoogle": "hoogle",
     "idris": "idris",
+    "purescript": "purescript",
     "shellcheck": "ShellCheck",
     "stylish-haskell": "stylish-haskell",
     "xmobar": "xmobar",
