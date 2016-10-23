@@ -31,6 +31,7 @@ PRESET_PACKAGES = {
     "haskell-missingh": "MissingH",
     "haskell-monadrandom": "MonadRandom",
     "haskell-hopenpgp": "hOpenPGP",
+    "haskell-optparse-applicative0.12": False,
     "haskell-quickcheck": "QuickCheck",
     "haskell-safesemaphore": "SafeSemaphore",
     "haskell-sha": "SHA",
@@ -92,7 +93,7 @@ for line in pacman("-Sl", "community", "--color=never"):
     elif package.startswith("haskell-"):
         found = [package[8:], version]
 
-    if found:
+    if found and found[0]:
         print("Found", *found)
         found.append(URL_PATTERN % {"pkgname": package})
         result_csv.writerow(found)
