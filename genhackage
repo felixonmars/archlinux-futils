@@ -33,6 +33,7 @@ PRESET_PACKAGES = {
     "haskell-hopenpgp": "hOpenPGP",
     "haskell-optparse-applicative0.12": False,
     "haskell-quickcheck": "QuickCheck",
+    "haskell-ranged-sets": "Ranged-sets",
     "haskell-safesemaphore": "SafeSemaphore",
     "haskell-sha": "SHA",
     "haskell-src-exts": "haskell-src-exts",
