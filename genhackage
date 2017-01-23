@@ -16,6 +16,7 @@ PRESET_PACKAGES = {
     "cgrep": "cgrep",
     "darcs": "darcs",
     "git-annex": "git-annex",
+    "git-repair": "git-repair",
     "gtk2hs-buildtools": "gtk2hs-buildtools",
     "haddock": "haddock",
     "happy": "happy",
