@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 import os
+import sys
 import csv
 from io import StringIO
 from sh import pacman, expac
@@ -28,6 +29,8 @@ PRESET_PACKAGES = {
     "haskell-http": "HTTP",
     "haskell-hunit": "HUnit",
     "haskell-ifelse": "IfElse",
+    "haskell-juicypixels": "JuicyPixels",
+    "haskell-listlike": "ListLike",
     "haskell-missingh": "MissingH",
     "haskell-monadrandom": "MonadRandom",
     "haskell-hopenpgp": "hOpenPGP",
@@ -37,9 +40,12 @@ PRESET_PACKAGES = {
     "haskell-safesemaphore": "SafeSemaphore",
     "haskell-sha": "SHA",
     "haskell-src-exts": "haskell-src-exts",
+    "haskell-src-meta": "haskell-src-meta",
     "haskell-statevar": "StateVar",
     "haskell-stmonadtrans": "STMonadTrans",
-    "haskell-juicypixels": "JuicyPixels",
+    "haskell-turtle1.2": False,
+    "haskell-x11": "X11",
+    "haskell-x11-xft": "X11-xft",
     "hasktags": "hasktags",
     "hindent": "hindent",
     "hoogle": "hoogle",
@@ -53,10 +59,16 @@ PRESET_PACKAGES = {
     "xmonad-contrib": "xmonad-contrib",
 }
 
+FORMAT = os.environ.get("FORMAT", "hackage")
+if FORMAT not in ("hackage", "cblrepo"):
+    print("Invalid FORMAT specified")
+    sys.exit(1)
+
 URL_PATTERN = "https://www.archlinux.org/packages/community/x86_64/%(pkgname)s"
 
 result_fd = StringIO()
 result_csv = csv.writer(result_fd, quoting=csv.QUOTE_ALL)
+result_cblrepo = "cblrepo add"
 counter = 0
 
 for item in expac("-S", "%P", "community/ghc").split():
@@ -75,10 +87,13 @@ for item in expac("-S", "%P", "community/ghc").split():
 
     if found:
         print("Found", *found)
+        result_cblrepo += " -g " + ",".join(found)
         found.append(URL_PATTERN % {"pkgname": package})
         result_csv.writerow(found)
 
         counter += 1
+
+result_cblrepo += "\ncblrepo add"
 
 for line in pacman("-Sl", "community", "--color=never"):
     found = False
@@ -96,6 +111,7 @@ for line in pacman("-Sl", "community", "--color=never"):
 
     if found and found[0]:
         print("Found", *found)
+        result_cblrepo += " " + ",".join(found)
         found.append(URL_PATTERN % {"pkgname": package})
         result_csv.writerow(found)
 
@@ -106,15 +122,19 @@ result_body = result_fd.read().rstrip("\r\n")
 
 print(counter, "packages found.")
 
-if "HACKAGE_USERNAME" in os.environ and "HACKAGE_PASSWORD" in os.environ:
-    URL = "https://hackage.haskell.org/distro/Arch/packages"
-    r = requests.put(
-        URL,
-        data=result_body,
-        auth=(os.environ["HACKAGE_USERNAME"], os.environ["HACKAGE_PASSWORD"]),
-        headers={"Content-Type": "text/csv"},
-    )
-    print("Upload:", r.status_code, r.text)
+if FORMAT == "hackage":
+    if "HACKAGE_USERNAME" in os.environ and "HACKAGE_PASSWORD" in os.environ:
+        URL = "https://hackage.haskell.org/distro/Arch/packages"
+        r = requests.put(
+            URL,
+            data=result_body,
+            auth=(os.environ["HACKAGE_USERNAME"], os.environ["HACKAGE_PASSWORD"]),
+            headers={"Content-Type": "text/csv"},
+        )
+        print("Upload:", r.status_code, r.text)
 
-else:
-    print("Please make sure you have HACKAGE_USERNAME and HACKAGE_PASSWORD set to upload the package list.")
+    else:
+        print("Please make sure you have HACKAGE_USERNAME and HACKAGE_PASSWORD set to upload the package list.")
+
+elif FORMAT == "cblrepo":
+    print(result_cblrepo)
