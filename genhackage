@@ -14,6 +14,7 @@ PRESET_PACKAGES = {
     "alex": "alex",
     "c2hs": "c2hs",
     "cabal-install": "cabal-install",
+    "cabal-helper": "cabal-helper",
     "cblrepo": "cblrepo",
     "cgrep": "cgrep",
     "darcs": "darcs",
