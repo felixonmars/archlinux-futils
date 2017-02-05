@@ -22,6 +22,7 @@ PRESET_PACKAGES = {
     "gtk2hs-buildtools": "gtk2hs-buildtools",
     "haddock": "haddock",
     "happy": "happy",
+    "hlint": "hlint",
     "haskell-cabal": "Cabal",
     "haskell-dav": "DAV",
     "haskell-edisonapi": "EdisonAPI",
@@ -56,8 +57,12 @@ PRESET_PACKAGES = {
     "hoogle": "hoogle",
     "hopenpgp-tools": "hopenpgp-tools",
     "idris": "idris",
+    "pandoc": "pandoc",
+    "pandoc-citeproc": "pandoc-citeproc",
+    "pandoc-crossref": "pandoc-crossref",
     "purescript": "purescript",
     "shellcheck": "ShellCheck",
+    "stack": "stack",
     "stylish-haskell": "stylish-haskell",
     "xmobar": "xmobar",
     "xmonad": "xmonad",
@@ -118,7 +123,9 @@ def gen_hackage_mapping(quiet=False):
                 print("Found", package, version)
 
             version_mapping[package] = version
-            arch_package_mapping[package] = arch_package
+
+            if package not in arch_package_mapping or arch_package in PRESET_PACKAGES:
+                arch_package_mapping[package] = arch_package
 
             counter += 1
 
