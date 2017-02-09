@@ -49,7 +49,6 @@ PRESET_PACKAGES = {
     "haskell-src-meta": "haskell-src-meta",
     "haskell-statevar": "StateVar",
     "haskell-stmonadtrans": "STMonadTrans",
-    "haskell-turtle1.2": False,
     "haskell-unixutils": "Unixutils",
     "haskell-x11": "X11",
     "haskell-x11-xft": "X11-xft",
