@@ -26,6 +26,7 @@ PRESET_PACKAGES = {
     "hlint": "hlint",
     "haskell-cabal": "Cabal",
     "haskell-dav": "DAV",
+    "haskell-decimal": "Decimal",
     "haskell-edisonapi": "EdisonAPI",
     "haskell-edisoncore": "EdisonCore",
     "haskell-glob": "Glob",
