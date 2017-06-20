@@ -23,6 +23,7 @@ PRESET_PACKAGES = {
     "gtk2hs-buildtools": "gtk2hs-buildtools",
     "haddock": "haddock",
     "happy": "happy",
+    "hledger": "hledger",
     "hlint": "hlint",
     "haskell-cabal": "Cabal",
     "haskell-dav": "DAV",
