@@ -24,6 +24,7 @@ PRESET_PACKAGES = {
     "haddock": "haddock",
     "happy": "happy",
     "hledger": "hledger",
+    "hledger-ui": "hledger-ui",
     "hledger-web": "hledger-web",
     "hlint": "hlint",
     "haskell-cabal": "Cabal",
