@@ -24,6 +24,7 @@ PRESET_PACKAGES = {
     "haddock": "haddock",
     "happy": "happy",
     "hledger": "hledger",
+    "hledger-api": "hledger-api",
     "hledger-ui": "hledger-ui",
     "hledger-web": "hledger-web",
     "hlint": "hlint",
