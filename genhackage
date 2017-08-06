@@ -70,6 +70,7 @@ PRESET_PACKAGES = {
     "shellcheck": "ShellCheck",
     "stack": "stack",
     "stylish-haskell": "stylish-haskell",
+    "tamarin-prover": "tamarin-prover",
     "xmobar": "xmobar",
     "xmonad": "xmonad",
     "xmonad-contrib": "xmonad-contrib",
