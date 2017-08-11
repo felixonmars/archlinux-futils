@@ -66,7 +66,6 @@ PRESET_PACKAGES = {
     "pandoc": "pandoc",
     "pandoc-citeproc": "pandoc-citeproc",
     "pandoc-crossref": "pandoc-crossref",
-    "purescript": "purescript",
     "shellcheck": "ShellCheck",
     "stack": "stack",
     "stylish-haskell": "stylish-haskell",
