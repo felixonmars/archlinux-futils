@@ -6,9 +6,11 @@ from nvchecker import core as nvchecker_core
 
 
 def main():
-    parser = argparse.ArgumentParser(description='New version checker for software')
+    parser = argparse.ArgumentParser(description='Update nvchecker newver db with data from deepin-code-release')
     parser.add_argument('nvchecker_config', metavar='NVCHECKER_CONFIG', type=open,
                         help='nvchecker configuration file')
+    parser.add_argument('--branch', metavar="BRANCH", default="panda/current", required=False,
+                        help="deepin-code-review branch to use (default: panda/current)")
     args = parser.parse_args()
 
     source = nvchecker_core.Source(args.nvchecker_config)
@@ -24,7 +26,7 @@ def main():
 
     source.curvers = source.oldvers.copy()
 
-    dcr_versions = requests.get("https://raw.githubusercontent.com/linuxdeepin/deepin-code-release/panda/current/project_list.json").json()
+    dcr_versions = requests.get("https://raw.githubusercontent.com/linuxdeepin/deepin-code-release/%s/project_list.json" % args.branch).json()
     dcr_updates = {}
     for project in dcr_versions:
         if project in source.oldvers:
