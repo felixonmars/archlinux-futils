@@ -1,0 +1,49 @@
+#!/usr/bin/env python
+
+import argparse
+import requests
+from nvchecker import core as nvchecker_core
+
+
+def main():
+    parser = argparse.ArgumentParser(description='New version checker for software')
+    parser.add_argument('nvchecker_config', metavar='NVCHECKER_CONFIG', type=open,
+                        help='nvchecker configuration file')
+    args = parser.parse_args()
+
+    source = nvchecker_core.Source(args.nvchecker_config)
+    if source.oldver:
+        source.oldvers = nvchecker_core.read_verfile(source.oldver)
+    else:
+        source.oldvers = {}
+
+    if source.newver:
+        source.newvers = nvchecker_core.read_verfile(source.newver)
+    else:
+        source.newvers = {}
+
+    source.curvers = source.oldvers.copy()
+
+    dcr_versions = requests.get("https://raw.githubusercontent.com/linuxdeepin/deepin-code-release/panda/current/project_list.json").json()
+    dcr_updates = {}
+    for project in dcr_versions:
+        if project in source.oldvers:
+            dcr_updates[project] = dcr_versions[project]["tag"]
+        elif "python-" + project in source.oldvers:
+            dcr_updates["python-" + project] = dcr_versions[project]["tag"]
+        elif "deepin-" + project in source.oldvers:
+            dcr_updates["deepin-" + project] = dcr_versions[project]["tag"]
+        elif project.replace("dde-", "deepin-") in source.oldvers:
+            dcr_updates[project.replace("dde-", "deepin-")] = dcr_versions[project]["tag"]
+        elif project.replace("go-", "deepin-") in source.oldvers:
+            dcr_updates[project.replace("go-", "deepin-")] = dcr_versions[project]["tag"]
+
+    for pkg in dcr_updates:
+        print(pkg, dcr_updates[pkg])
+
+    source.newvers.update(dcr_updates)
+    nvchecker_core.write_verfile(source.newver, source.newvers)
+
+
+if __name__ == '__main__':
+    main()
