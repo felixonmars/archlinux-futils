@@ -9,13 +9,14 @@ from argparse import ArgumentParser
 
 # Preset: "arch pkgname": "hackage package name"
 PRESET_PACKAGES = {
-    "agda": "Agda",
+    "agda": None, # "Agda",
     "alex": "alex",
     "c2hs": "c2hs",
     "cabal-install": "cabal-install",
     "cabal-helper": "cabal-helper",
     "cblrepo": "cblrepo",
     "cgrep": "cgrep",
+    "cryptol": "cryptol",
     "darcs": "darcs",
     "ghc-mod": "ghc-mod",
     "git-annex": "git-annex",
@@ -29,10 +30,12 @@ PRESET_PACKAGES = {
     "hledger-web": "hledger-web",
     "hlint": "hlint",
     "haskell-cabal": "Cabal",
+    "haskell-cracknum": "crackNum",
     "haskell-dav": "DAV",
     "haskell-decimal": "Decimal",
     "haskell-edisonapi": "EdisonAPI",
     "haskell-edisoncore": "EdisonCore",
+    "haskell-floatinghex": "FloatingHex",
     "haskell-glob": "Glob",
     "haskell-gtk": "gtk3",
     "haskell-graphscc": "GraphSCC",
@@ -44,6 +47,7 @@ PRESET_PACKAGES = {
     "haskell-lexer": "haskell-lexer",
     "haskell-listlike": "ListLike",
     "haskell-missingh": "MissingH",
+    "haskell-monadlib": "monadLib",
     "haskell-monadrandom": "MonadRandom",
     "haskell-only": "Only",
     "haskell-puremd5": "pureMD5",
@@ -51,6 +55,7 @@ PRESET_PACKAGES = {
     "haskell-ranged-sets": "Ranged-sets",
     "haskell-safesemaphore": "SafeSemaphore",
     "haskell-sha": "SHA",
+    "haskell-smtlib": "smtLib",
     "haskell-src-exts": "haskell-src-exts",
     "haskell-src-meta": "haskell-src-meta",
     "haskell-statevar": "StateVar",
@@ -86,7 +91,7 @@ def gen_hackage_mapping(repo, quiet=False):
     arch_package_mapping = {}
     base_packages = set()
 
-    for item in expac("-S", "%P", repo + "/ghc").split():
+    for item in expac("-S", "%P", repo + "/ghc", repo + "/ghc-libs").split():
         # Fetch package and version
         package, version = item.split("=")
 
