@@ -45,6 +45,7 @@ PRESET_PACKAGES = {
     "haskell-http": "HTTP",
     "haskell-hunit": "HUnit",
     "haskell-ifelse": "IfElse",
+    "haskell-jose0.5": "jose",
     "haskell-juicypixels": "JuicyPixels",
     "haskell-lexer": "haskell-lexer",
     "haskell-listlike": "ListLike",
@@ -59,6 +60,7 @@ PRESET_PACKAGES = {
     "haskell-sha": "SHA",
     "haskell-smtlib": "smtLib",
     "haskell-src-exts": "haskell-src-exts",
+    "haskell-src-exts-util": "haskell-src-exts-util",
     "haskell-src-meta": "haskell-src-meta",
     "haskell-statevar": "StateVar",
     "haskell-stmonadtrans": "STMonadTrans",
@@ -72,7 +74,7 @@ PRESET_PACKAGES = {
     "idris": "idris",
     "pandoc": "pandoc",
     "pandoc-citeproc": "pandoc-citeproc",
-    "pandoc-crossref": False,
+    "pandoc-crossref": "pandoc-crossref",
     "postgrest": "postgrest",
     "shellcheck": "ShellCheck",
     "stack": "stack",
@@ -81,6 +83,10 @@ PRESET_PACKAGES = {
     "xmobar": "xmobar",
     "xmonad": "xmonad",
     "xmonad-contrib": "xmonad-contrib",
+}
+
+VERSION_SUBSTITUTION = {
+    "0.3.0.0beta3a": "0.3.0.0"
 }
 
 URL_PATTERN = "https://www.archlinux.org/packages/%(repo)s/x86_64/%(pkgname)s"
@@ -155,7 +161,11 @@ def gen_hackage_csv(repo):
     result_csv = csv.writer(result_fd, quoting=csv.QUOTE_ALL)
 
     for package, version in version_mapping.items():
-        result_csv.writerow([package, version, URL_PATTERN % {"pkgname": arch_package_mapping[package], "repo": repo}])
+        result_csv.writerow([
+            package,
+            VERSION_SUBSTITUTION.get(version, version),
+            URL_PATTERN % {"pkgname": arch_package_mapping[package], "repo": repo}
+        ])
 
     result_fd.seek(0)
     result_body = result_fd.read().rstrip("\r\n")
