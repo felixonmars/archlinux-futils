@@ -83,6 +83,7 @@ PRESET_PACKAGES = {
     "xmobar": "xmobar",
     "xmonad": "xmonad",
     "xmonad-contrib": "xmonad-contrib",
+    "xmonad-utils": "xmonad-utils",
 }
 
 VERSION_SUBSTITUTION = {
