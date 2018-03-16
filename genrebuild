@@ -1,0 +1,59 @@
+#!/usr/bin/python
+import os
+import sys
+import json
+import toposort
+import logging
+
+logging.basicConfig() #format="%(message)s", level=logging.INFO)
+pkglist = set(sys.argv[1:])
+reverse_deps = {}
+
+with open(os.path.join(sys.path[0], "package.db"), "r") as f:
+    package_db = json.load(f)
+
+
+def cached_get_reverse_dep(pkg, resolve_circular=False):
+    if resolve_circular or pkg not in reverse_deps:
+        reverse_deps[pkg] = set()
+        if not ({"ghc", "ghc-libs"} & set(package_db[pkg]["depends"])):
+           return reverse_deps[pkg]
+
+        for _pkg in package_db:
+            if not ({"ghc", "ghc-libs"} & set(package_db[_pkg]["depends"])):
+                continue
+            if resolve_circular:
+                if pkg in package_db[_pkg]["depends"]:
+                    reverse_deps[pkg].add(_pkg)
+            else:
+                if pkg in package_db[_pkg]["depends"] or pkg in package_db[_pkg]["makedepends"] or \
+                   pkg in package_db[_pkg]["checkdepends"]:
+                    reverse_deps[pkg].add(_pkg)
+
+    return reverse_deps[pkg]
+
+
+# Expand reverse dependencies
+while len(pkglist) != len(reverse_deps):
+    for pkg in list(pkglist):
+        if pkg not in reverse_deps:
+            logging.info("Expanding", pkg)
+            pkglist |= cached_get_reverse_dep(pkg)
+            logging.info("Expanded pkglist to", pkglist)
+
+
+# Resolve circular dependencies
+# try:
+#     toposort.toposort_flatten(reverse_deps)
+# except toposort.CircularDependencyError as e:
+#     logging.info("Resolving circular dependency:", e.data)
+#     for pkg in e.data:
+#         cached_get_reverse_dep(pkg, resolve_circular=True)
+
+
+# Do sorting
+# for pkgs in list(toposort.toposort(reverse_deps))[::-1]:
+#     logging.info(" ".join(pkgs))
+
+logging.info(">>> Rebuild list:")
+print(" ".join(toposort.toposort_flatten(reverse_deps)[::-1]))
