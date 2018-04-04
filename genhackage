@@ -38,6 +38,7 @@ PRESET_PACKAGES = {
     "haskell-diff": "Diff",
     "haskell-edisonapi": "EdisonAPI",
     "haskell-edisoncore": "EdisonCore",
+    "haskell-findbin": "FindBin",
     "haskell-floatinghex": "FloatingHex",
     "haskell-glob": "Glob",
     "haskell-gtk": "gtk3",
