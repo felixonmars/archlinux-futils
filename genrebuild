@@ -22,7 +22,10 @@ def cached_get_reverse_dep(pkg, resolve_circular=False):
         for _pkg in package_db:
             if not ({"ghc", "ghc-libs"} & set(package_db[_pkg]["depends"])):
                 continue
-            if resolve_circular:
+            if resolve_circular and "make" in resolve_circular:
+                if pkg in package_db[_pkg]["depends"]:
+                    reverse_deps[pkg].add(_pkg)
+            elif resolve_circular and "check" in resolve_circular:
                 if pkg in package_db[_pkg]["depends"] or pkg in package_db[_pkg]["makedepends"]:
                     reverse_deps[pkg].add(_pkg)
             else:
@@ -46,9 +49,16 @@ while len(pkglist) != len(reverse_deps):
 try:
     toposort.toposort_flatten(reverse_deps)
 except toposort.CircularDependencyError as e:
-    logging.info("Resolving circular dependency:", e.data)
+    logging.info("Resolving circular dependency by ignoring checkdepends:", e.data)
     for pkg in e.data:
-        cached_get_reverse_dep(pkg, resolve_circular=True)
+        cached_get_reverse_dep(pkg, resolve_circular=("check"))
+    try:
+        toposort.toposort_flatten(reverse_deps)
+    except toposort.CircularDependencyError as e:
+        logging.info("Resolving circular dependency by ignoring also makedepends:", e.data)
+        for pkg in e.data:
+            cached_get_reverse_dep(pkg, resolve_circular=("make", "check"))
+
 
 
 # Do sorting
