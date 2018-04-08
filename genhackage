@@ -34,6 +34,7 @@ PRESET_PACKAGES = {
     "haskell-configfile": "ConfigFile",
     "haskell-cracknum": "crackNum",
     "haskell-dav": "DAV",
+    "haskell-dbus0.10": False,
     "haskell-decimal": "Decimal",
     "haskell-diff": "Diff",
     "haskell-edisonapi": "EdisonAPI",
