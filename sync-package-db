@@ -10,6 +10,7 @@ import requests
 
 
 URL = "https://www.archlinux.org/packages/search/json/?q=&repo=Core&repo=Extra&repo=Community&repo=Multilib&page="
+#URL = "https://www.archlinux.org/packages/search/json/?q=&repo=Community-Testing&page="
 PACKAGE_DB = {}
 
 
@@ -20,7 +21,7 @@ def worker(q):
         data = requests.get(URL + str(page)).json()
         for pkg in data["results"]:
             PACKAGE_DB[pkg["pkgname"]] = pkg
-        print("Loaded page", page)
+        print("Loaded page", page, "Current loaded packages:", len(PACKAGE_DB))
         q.task_done()
 
 
