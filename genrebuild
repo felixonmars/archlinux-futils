@@ -4,34 +4,29 @@ import sys
 import json
 import toposort
 import logging
+from collections import defaultdict
 
 logging.basicConfig() #format="%(message)s", level=logging.INFO)
 pkglist = set(sys.argv[1:])
-reverse_deps = {}
+reverse_deps = defaultdict(set)
+deps = defaultdict(set)
 
 with open(os.path.join(sys.path[0], "package.db"), "r") as f:
     package_db = json.load(f)
 
 
-def cached_get_reverse_dep(pkg, resolve_circular=False):
-    if resolve_circular or pkg not in reverse_deps:
-        reverse_deps[pkg] = set()
+def cached_get_reverse_dep(pkg):
+    if pkg not in reverse_deps:
         if not ({"ghc", "ghc-libs"} & set(package_db[pkg]["depends"])):
            return reverse_deps[pkg]
 
         for _pkg in package_db:
             if not ({"ghc", "ghc-libs"} & set(package_db[_pkg]["depends"])):
                 continue
-            if resolve_circular and "make" in resolve_circular:
-                if pkg in package_db[_pkg]["depends"]:
-                    reverse_deps[pkg].add(_pkg)
-            elif resolve_circular and "check" in resolve_circular:
-                if pkg in package_db[_pkg]["depends"] or pkg in package_db[_pkg]["makedepends"]:
-                    reverse_deps[pkg].add(_pkg)
-            else:
-                if pkg in package_db[_pkg]["depends"] or pkg in package_db[_pkg]["makedepends"] or \
-                   pkg in package_db[_pkg]["checkdepends"]:
-                    reverse_deps[pkg].add(_pkg)
+            if pkg in package_db[_pkg]["depends"] or pkg in package_db[_pkg]["makedepends"] or \
+               pkg in package_db[_pkg]["checkdepends"]:
+                reverse_deps[pkg].add(_pkg)
+                deps[_pkg].add(pkg)
 
     return reverse_deps[pkg]
 
@@ -46,24 +41,26 @@ while len(pkglist) != len(reverse_deps):
 
 
 # Resolve circular dependencies
-try:
-    toposort.toposort_flatten(reverse_deps)
-except toposort.CircularDependencyError as e:
-    logging.info("Resolving circular dependency by ignoring checkdepends:", e.data)
-    for pkg in e.data:
-        cached_get_reverse_dep(pkg, resolve_circular=("check"))
+while True:
     try:
-        toposort.toposort_flatten(reverse_deps)
+        list(toposort.toposort(deps))
+        break
     except toposort.CircularDependencyError as e:
-        logging.info("Resolving circular dependency by ignoring also makedepends:", e.data)
-        for pkg in e.data:
-            cached_get_reverse_dep(pkg, resolve_circular=("make", "check"))
-
-
+        logging.info("Resolving circular dependency by removing one link:", e.data)
+        remove_link = list(e.data.keys())[0]
+        for i in range(1, len(e.data)):
+            try:
+                remove_link_target = list(e.data.keys())[i]
+                deps[remove_link].remove(remove_link_target)
+                break
+            except KeyError:
+                pass
 
 # Do sorting
-# for pkgs in list(toposort.toposort(reverse_deps))[::-1]:
-#     logging.info(" ".join(pkgs))
+for pkgs in list(toposort.toposort(deps)):
+    print(" ".join(pkgs), end=" ")
 
-logging.info(">>> Rebuild list:")
-print(" ".join(toposort.toposort_flatten(reverse_deps)[::-1]))
+print()
+
+# logging.info(">>> Rebuild list:")
+# print(" ".join(toposort.toposort_flatten(deps)[::-1]))
