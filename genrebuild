@@ -2,14 +2,14 @@
 import os
 import sys
 import json
-import toposort
+import networkx as nx
 import logging
 from collections import defaultdict
 
-logging.basicConfig() #format="%(message)s", level=logging.INFO)
+logging.basicConfig(format="%(message)s", level=logging.INFO)
 pkglist = set(sys.argv[1:])
 reverse_deps = defaultdict(set)
-deps = defaultdict(set)
+G = nx.DiGraph()
 
 with open(os.path.join(sys.path[0], "package.db"), "r") as f:
     package_db = json.load(f)
@@ -26,7 +26,6 @@ def cached_get_reverse_dep(pkg):
             if pkg in package_db[_pkg]["depends"] or pkg in package_db[_pkg]["makedepends"] or \
                pkg in package_db[_pkg]["checkdepends"]:
                 reverse_deps[pkg].add(_pkg)
-                deps[_pkg].add(pkg)
 
     return reverse_deps[pkg]
 
@@ -35,32 +34,24 @@ def cached_get_reverse_dep(pkg):
 while len(pkglist) != len(reverse_deps):
     for pkg in list(pkglist):
         if pkg not in reverse_deps:
-            logging.info("Expanding", pkg)
             pkglist |= cached_get_reverse_dep(pkg)
-            logging.info("Expanded pkglist to", pkglist)
 
 
-# Resolve circular dependencies
+G.add_nodes_from(reverse_deps.keys())
+for dep, pkgs in reverse_deps.items():
+    for pkg in pkgs:
+        G.add_edge(dep, pkg)
+
+
 while True:
     try:
-        list(toposort.toposort(deps))
-        break
-    except toposort.CircularDependencyError as e:
-        logging.info("Resolving circular dependency by removing one link:", e.data)
-        remove_link = list(e.data.keys())[0]
-        for i in range(1, len(e.data)):
-            try:
-                remove_link_target = list(e.data.keys())[i]
-                deps[remove_link].remove(remove_link_target)
+        cycle = nx.find_cycle(G)
+        for edge in cycle:
+            if edge[0] not in package_db[edge[1]]["depends"]:
+                logging.info("Removing a dependency to solve circular dependency: " + "<-".join(edge))
+                G.remove_edge(*edge)
                 break
-            except KeyError:
-                pass
+    except nx.exception.NetworkXNoCycle:
+        break
 
-# Do sorting
-for pkgs in list(toposort.toposort(deps)):
-    print(" ".join(pkgs), end=" ")
-
-print()
-
-# logging.info(">>> Rebuild list:")
-# print(" ".join(toposort.toposort_flatten(deps)[::-1]))
+print(" ".join(nx.lexicographical_topological_sort(G)))
