@@ -14,6 +14,11 @@ G = nx.DiGraph()
 with open(os.path.join(sys.path[0], "package.db"), "r") as f:
     package_db = json.load(f)
 
+for pkg in package_db:
+    package_db[pkg]["depends"] = [dep.split("=")[0].split(">")[0].split("<")[0] for dep in package_db[pkg]["depends"]]
+    package_db[pkg]["makedepends"] = [dep.split("=")[0].split(">")[0].split("<")[0] for dep in package_db[pkg]["makedepends"]]
+    package_db[pkg]["checkdepends"] = [dep.split("=")[0].split(">")[0].split("<")[0] for dep in package_db[pkg]["checkdepends"]]
+
 
 def cached_get_reverse_dep(pkg):
     if pkg not in reverse_deps:
