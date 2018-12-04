@@ -177,18 +177,24 @@ def gen_hackage_csv(repo):
 
 def submit_hackage(repo):
     csv_body = gen_hackage_csv(repo)
+    headers={"Content-Type": "text/csv"}
     if "HACKAGE_USERNAME" in os.environ and "HACKAGE_PASSWORD" in os.environ:
-        URL = "https://hackage.haskell.org/distro/Arch/packages"
-        r = requests.put(
-            URL,
-            data=csv_body,
-            auth=(os.environ["HACKAGE_USERNAME"], os.environ["HACKAGE_PASSWORD"]),
-            headers={"Content-Type": "text/csv"},
-        )
-        print("Upload:", r.status_code, r.text)
-
+        auth = (os.environ["HACKAGE_USERNAME"], os.environ["HACKAGE_PASSWORD"])
+    elif "HACKAGE_API_TOKEN" in os.environ:
+        auth = None
+        headers["Authorization"] = "X-ApiKey " + os.environ["HACKAGE_API_TOKEN"]
     else:
         print("Please make sure you have HACKAGE_USERNAME and HACKAGE_PASSWORD set to upload the package list.")
+        return
+
+    URL = "https://hackage.haskell.org/distro/Arch/packages"
+    r = requests.put(
+        URL,
+        data=csv_body,
+        auth=auth,
+        headers=headers,
+    )
+    print("Upload:", r.status_code, r.text)        
 
 
 def gen_cblrepo(repo):
