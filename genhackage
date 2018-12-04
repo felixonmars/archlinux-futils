@@ -184,7 +184,7 @@ def submit_hackage(repo):
         auth = None
         headers["Authorization"] = "X-ApiKey " + os.environ["HACKAGE_API_TOKEN"]
     else:
-        print("Please make sure you have HACKAGE_USERNAME and HACKAGE_PASSWORD set to upload the package list.")
+        print("Please make sure you have HACKAGE_API_TOKEN or HACKAGE_USERNAME and HACKAGE_PASSWORD set to upload the package list.")
         return
 
     URL = "https://hackage.haskell.org/distro/Arch/packages"
@@ -194,7 +194,7 @@ def submit_hackage(repo):
         auth=auth,
         headers=headers,
     )
-    print("Upload:", r.status_code, r.text)        
+    print("Upload:", r.status_code, r.text)
 
 
 def gen_cblrepo(repo):
