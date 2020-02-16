@@ -7,7 +7,8 @@ import logging
 from collections import defaultdict
 
 logging.basicConfig(format="%(message)s", level=logging.INFO)
-pkglist = set(sys.argv[1:])
+rebuild_list = set(sys.argv[1:])
+pkglist = rebuild_list.copy()
 reverse_deps = defaultdict(set)
 G = nx.DiGraph()
 
@@ -51,11 +52,27 @@ for dep, pkgs in reverse_deps.items():
 while True:
     try:
         cycle = nx.find_cycle(G)
+        cycle_pkgs = set()
         for edge in cycle:
-            if edge[0] not in package_db[edge[1]]["depends"]:
-                logging.info("Removing a dependency to solve circular dependency: " + "<-".join(edge))
-                G.remove_edge(*edge)
-                break
+            cycle_pkgs |= {edge[0], edge[1]}
+        logging.info("Found circular dependency: " + "<->".join(cycle_pkgs))
+        if rebuild_list & set(" ".join(cycle_pkgs).split()):
+            new_pkg = ""
+            rebuild_pkgs = set()
+            for pkg in cycle_pkgs:
+                if rebuild_list & set(pkg.split()):
+                    new_pkg += pkg + " "
+                    rebuild_pkgs.add(pkg)
+            new_pkg += " ".join(cycle_pkgs - rebuild_pkgs)
+        else:
+            new_pkg = " ".join(cycle_pkgs)
+        for edge in list(G.edges):
+            if edge[0] in cycle_pkgs:
+                G.add_edge(new_pkg, edge[1])
+            if edge[1] in cycle_pkgs:
+                G.add_edge(edge[0], new_pkg)
+        G.remove_nodes_from(cycle_pkgs)
+
     except nx.exception.NetworkXNoCycle:
         break
 
