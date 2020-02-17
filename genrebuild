@@ -95,6 +95,7 @@ for pkg in nx.lexicographical_topological_sort(G):
                 cycle = nx.find_cycle(NG)
                 for edge in cycle:
                     if edge[0] not in package_db[edge[1]]["depends"]:
+                        logging.info("Removing soft dep to solve circular dependency: " + "<-".join(edge))
                         NG.remove_edge(*edge)
                         break
             except nx.exception.NetworkXNoCycle:
