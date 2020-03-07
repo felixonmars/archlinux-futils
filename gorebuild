@@ -1,0 +1,111 @@
+#!/usr/bin/python
+import os
+import sys
+import json
+import networkx as nx
+import logging
+from collections import defaultdict
+
+logging.basicConfig(format="%(message)s", level=logging.INFO)
+rebuild_list = set(sys.argv[1:])
+pkglist = rebuild_list.copy()
+reverse_deps = defaultdict(set)
+G = nx.DiGraph()
+
+with open(os.path.join(sys.path[0], "package.db"), "r") as f:
+    package_db = json.load(f)
+
+for pkg in package_db:
+    package_db[pkg]["depends"] = {dep.split("=")[0].split(">")[0].split("<")[0] for dep in package_db[pkg]["depends"]}
+    package_db[pkg]["makedepends"] = {dep.split("=")[0].split(">")[0].split("<")[0] for dep in package_db[pkg]["makedepends"]}
+    package_db[pkg]["checkdepends"] = {dep.split("=")[0].split(">")[0].split("<")[0] for dep in package_db[pkg]["checkdepends"]}
+
+
+def cached_get_reverse_dep(pkg):
+    if pkg not in reverse_deps:
+        if not ({"go", "go-pie"} & (set(package_db[pkg]["depends"]) | set(package_db[pkg]["makedepends"]))):
+            print(package_db[pkg]["makedepends"])
+            return reverse_deps[pkg]
+
+        for _pkg in package_db:
+            if not ({"go", "go-pie"} & (set(package_db[_pkg]["depends"]) | set(package_db[_pkg]["makedepends"]))):
+                continue
+            if pkg in package_db[_pkg]["depends"] or pkg in package_db[_pkg]["makedepends"]:
+                reverse_deps[pkg].add(_pkg)
+
+    return reverse_deps[pkg]
+
+
+# Expand reverse dependencies
+while len(pkglist) != len(reverse_deps):
+    for pkg in list(pkglist):
+        if pkg not in reverse_deps:
+            pkglist |= cached_get_reverse_dep(pkg)
+
+
+G.add_nodes_from(reverse_deps.keys())
+for dep, pkgs in reverse_deps.items():
+    for pkg in pkgs:
+        G.add_edge(dep, pkg)
+
+
+# Remove source only packages
+for dep, pkgs in reverse_deps.items():
+    if package_db[dep]["arch"] == "any":
+        G.remove_node(dep)
+
+
+while True:
+    try:
+        cycle = nx.find_cycle(G)
+        cycle_pkgs = set()
+        cycle_pkgs_flatten = set()
+        for edge in cycle:
+            cycle_pkgs |= set(edge)
+            for pkg in edge:
+                if " " not in pkg:
+                    cycle_pkgs_flatten.add(pkg)
+                else:
+                    cycle_pkgs_flatten |= set(pkg.split())
+        logging.info("Found circular dependency: " + "<->".join(cycle_pkgs_flatten))
+        new_pkg = " ".join(cycle_pkgs_flatten)
+        package_db[new_pkg] = dict(depends=set())
+        for pkg in cycle_pkgs:
+            package_db[new_pkg]["depends"] |= package_db[pkg]["depends"]
+            for _pkg in package_db:
+                if pkg in package_db[_pkg]["depends"]:
+                    package_db[_pkg]["depends"].add(new_pkg)
+
+        for edge in list(G.edges):
+            if edge[0] in cycle_pkgs:
+                G.add_edge(new_pkg, edge[1])
+            if edge[1] in cycle_pkgs:
+                G.add_edge(edge[0], new_pkg)
+        G.remove_nodes_from(cycle_pkgs)
+
+    except nx.exception.NetworkXNoCycle:
+        break
+
+for pkg in nx.lexicographical_topological_sort(G):
+    if " " not in pkg:
+        print(pkg, end=' ')
+    else:
+        NG = nx.DiGraph()
+        NG.add_nodes_from(pkg.split())
+        for dep, pkgs in reverse_deps.items():
+            for _pkg in pkgs:
+                if _pkg in pkg and dep in pkg:
+                    NG.add_edge(dep, _pkg)
+        while True:
+            try:
+                cycle = nx.find_cycle(NG)
+                for edge in cycle:
+                    if edge[0] not in package_db[edge[1]]["depends"]:
+                        logging.info("Removing soft dep to solve circular dependency: " + "<-".join(edge))
+                        NG.remove_edge(*edge)
+                        break
+            except nx.exception.NetworkXNoCycle:
+                break
+        print(" ".join(nx.lexicographical_topological_sort(NG)), end=' ')
+
+print()
