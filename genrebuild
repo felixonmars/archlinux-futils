@@ -23,11 +23,11 @@ for pkg in package_db:
 
 def cached_get_reverse_dep(pkg):
     if pkg not in reverse_deps:
-        if not ({"ghc", "ghc-libs"} & set(package_db[pkg]["depends"])):
+        if not ({"ghc", "ghc-libs"} & set(package_db[pkg]["depends"]) or package_db[pkg]["arch"] == "any"):
            return reverse_deps[pkg]
 
         for _pkg in package_db:
-            if not ({"ghc", "ghc-libs"} & set(package_db[_pkg]["depends"])):
+            if not ({"ghc", "ghc-libs"} & set(package_db[_pkg]["depends"]) or package_db[pkg]["arch"] == "any"):
                 continue
             if pkg in package_db[_pkg]["depends"] or pkg in package_db[_pkg]["makedepends"] or \
                pkg in package_db[_pkg]["checkdepends"]:
