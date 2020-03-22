@@ -14,30 +14,25 @@ PRESET_PACKAGES = {
     "c2hs": "c2hs",
     "cabal-install": "cabal-install",
     "cabal-helper": "cabal-helper",
-    "cblrepo": "cblrepo",
     "cgrep": "cgrep",
     "cryptol": "cryptol",
     "darcs": "darcs",
     "dhall": "dhall",
     "dhall-bash": "dhall-bash",
     "dhall-json": "dhall-json",
-    "ghc-mod": "ghc-mod",
     "git-annex": "git-annex",
     "git-repair": "git-repair",
     "gtk2hs-buildtools": "gtk2hs-buildtools",
-    "haddock": "haddock",
     "happy": "happy",
     "hledger": "hledger",
     "hledger-api": "hledger-api",
     "hledger-ui": "hledger-ui",
     "hledger-web": "hledger-web",
     "hlint": "hlint",
-    "haskell-cabal": "Cabal",
     "haskell-chasingbottoms": "ChasingBottoms",
     "haskell-configfile": "ConfigFile",
     "haskell-cracknum": "crackNum",
     "haskell-dav": "DAV",
-    "haskell-dbus0.10": False,
     "haskell-decimal": "Decimal",
     "haskell-diff": "Diff",
     "haskell-edisonapi": "EdisonAPI",
@@ -57,6 +52,7 @@ PRESET_PACKAGES = {
     "haskell-missingh": "MissingH",
     "haskell-monadlib": "monadLib",
     "haskell-monadrandom": "MonadRandom",
+    "haskell-network2.8": False,
     "haskell-only": "Only",
     "haskell-puremd5": "pureMD5",
     "haskell-quickcheck": "QuickCheck",
@@ -73,7 +69,6 @@ PRESET_PACKAGES = {
     "haskell-x11": "X11",
     "haskell-x11-xft": "X11-xft",
     "hasktags": "hasktags",
-    "hindent": "hindent",
     "hoogle": "hoogle",
     "hopenpgp-tools": "hopenpgp-tools",
     "idris": "idris",
@@ -200,25 +195,6 @@ def submit_hackage(repo):
     print("Upload:", r.status_code, r.text)
 
 
-def gen_cblrepo(repo):
-    version_mapping, _, base_packages = gen_hackage_mapping(repo)
-    result_cblrepo = "cblrepo add"
-
-    for package in base_packages:
-        version = version_mapping[package]
-        result_cblrepo += " -g " + package + "," + version
-
-    result_cblrepo += "\ncblrepo add"
-
-    for package, version in version_mapping.items():
-        if package in base_packages:
-            continue
-
-        result_cblrepo += " " + package + "," + version
-
-    return result_cblrepo
-
-
 def convert_to_archpkg(repo):
     _, arch_package_mapping, _ = gen_hackage_mapping(repo, quiet=True)
     try:
@@ -237,11 +213,6 @@ if __name__ == "__main__":
         help="Generate and submit latest package versions to hackage"
     )
     parser.add_argument(
-        '--cblrepo',
-        action="store_true",
-        help="Generate cblrepo initialization commands"
-    )
-    parser.add_argument(
         '--to-archpkg',
         action="store_true",
         help="Convert stdin from hackage package names to Arch package names"
@@ -256,9 +227,6 @@ if __name__ == "__main__":
 
     if options.hackage:
         submit_hackage(options.repo)
-
-    if options.cblrepo:
-        print(gen_cblrepo(options.repo))
 
     if options.to_archpkg:
         convert_to_archpkg(options.repo)
