@@ -13,7 +13,6 @@ PRESET_PACKAGES = {
     "alex": "alex",
     "c2hs": "c2hs",
     "cabal-install": "cabal-install",
-    "cabal-helper": "cabal-helper",
     "cgrep": "cgrep",
     "cryptol": "cryptol",
     "darcs": "darcs",
@@ -80,6 +79,7 @@ PRESET_PACKAGES = {
     "stack": "stack",
     "stylish-haskell": "stylish-haskell",
     "tamarin-prover": "tamarin-prover",
+    "tidalcycles": "tidal",
     "xmobar": "xmobar",
     "xmonad": "xmonad",
     "xmonad-contrib": "xmonad-contrib",
@@ -87,7 +87,6 @@ PRESET_PACKAGES = {
 }
 
 VERSION_SUBSTITUTION = {
-    "0.3.0.0beta3a": "0.3.0.0"
 }
 
 URL_PATTERN = "https://www.archlinux.org/packages/%(repo)s/x86_64/%(pkgname)s"
@@ -98,7 +97,6 @@ def gen_hackage_mapping(repo, quiet=False):
 
     version_mapping = {}
     arch_package_mapping = {}
-    base_packages = set()
 
     for item in expac("-S", "%P", repo + "/ghc", repo + "/ghc-libs").split():
         # Fetch package and version
@@ -120,7 +118,6 @@ def gen_hackage_mapping(repo, quiet=False):
 
             version_mapping[package] = version
             arch_package_mapping[package] = "ghc"
-            base_packages.add(package)
 
             counter += 1
 
@@ -153,11 +150,11 @@ def gen_hackage_mapping(repo, quiet=False):
     if not quiet:
         print(counter, "packages found.")
 
-    return version_mapping, arch_package_mapping, base_packages
+    return version_mapping, arch_package_mapping
 
 
 def gen_hackage_csv(repo):
-    version_mapping, arch_package_mapping, _ = gen_hackage_mapping(repo)
+    version_mapping, arch_package_mapping = gen_hackage_mapping(repo)
     result_fd = StringIO()
     result_csv = csv.writer(result_fd, quoting=csv.QUOTE_ALL)
 
@@ -196,7 +193,7 @@ def submit_hackage(repo):
 
 
 def convert_to_archpkg(repo):
-    _, arch_package_mapping, _ = gen_hackage_mapping(repo, quiet=True)
+    _, arch_package_mapping = gen_hackage_mapping(repo, quiet=True)
     try:
         while True:
             package = input()
@@ -208,7 +205,7 @@ def convert_to_archpkg(repo):
 if __name__ == "__main__":
     parser = ArgumentParser(description="Arch Linux hackage generator")
     parser.add_argument(
-        '--hackage',
+        '--submit-hackage',
         action="store_true",
         help="Generate and submit latest package versions to hackage"
     )
@@ -220,12 +217,12 @@ if __name__ == "__main__":
     parser.add_argument(
         '--repo',
         default="community",
-        help="Specify Arch repository to consider"
+        help="Specify Arch repository to scan"
     )
 
     options = parser.parse_args()
 
-    if options.hackage:
+    if options.submit_hackage:
         submit_hackage(options.repo)
 
     if options.to_archpkg:
