@@ -6,6 +6,10 @@ import networkx as nx
 import logging
 from collections import defaultdict
 
+DO_NOT_EXPAND = {
+    'arch-hs'
+}
+
 logging.basicConfig(format="%(message)s", level=logging.INFO)
 rebuild_list = set(sys.argv[1:])
 pkglist = rebuild_list.copy()
@@ -27,7 +31,7 @@ def cached_get_reverse_dep(pkg):
            return reverse_deps[pkg]
 
         for _pkg in package_db:
-            if not ({"ghc", "ghc-libs"} & set(package_db[_pkg]["depends"]) and package_db[_pkg]["arch"] != "any"):
+            if not ({"ghc", "ghc-libs"} & set(package_db[_pkg]["depends"]) and package_db[_pkg]["arch"] != "any") or _pkg in DO_NOT_EXPAND:
                 continue
             if pkg in package_db[_pkg]["depends"] or pkg in package_db[_pkg]["makedepends"] or \
                pkg in package_db[_pkg]["checkdepends"]:
