@@ -1,0 +1,98 @@
+#!/usr/bin/env python
+
+import pyalpm
+import argparse
+from nvchecker import core as nvchecker_core
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Check or update nvchecker oldver db from local pacman db')
+    parser.add_argument('--update', action="store_true",
+                        help='Actually update nvchecker db after printing the difference')
+    parser.add_argument('--db', nargs="*", default=["testing", "core", "extra", "community-testing",
+                                                    "community", "multilib-testing", "multilib"],
+                        help='Pacman sync db to consider. Defaulting to all with testing and multilib enabled')
+    parser.add_argument("-n", "--newer", action="store_true",
+                        help='Only consider entry when pacman version is not newer than newver (useful when Arch bumped to an alpha, etc)')
+    args = parser.parse_args()
+
+    nvchecker_config = nvchecker_core.get_default_config()
+    nvchecker_entries, nvchecker_options = nvchecker_core.load_file(nvchecker_config, use_keymanager=False)
+
+    oldvers = nvchecker_core.read_verfile(nvchecker_options.ver_files[0])
+    newvers = nvchecker_core.read_verfile(nvchecker_options.ver_files[1])
+
+    handle = pyalpm.Handle(".", "/var/lib/pacman")
+
+    archvers = {}
+    for db in args.db:
+        db_handle = handle.register_syncdb(db, 0)
+        for package in db_handle.search(""):
+            if package.name in archvers:
+                continue
+            archvers[package.name] = package.version.split("-")[0]
+            if ":" in archvers[package.name]:
+                archvers[package.name] = archvers[package.name].split(":")[1]
+
+    for entry_name in newvers:
+        pkgname = entry_name
+
+        if nvchecker_entries[pkgname]["source"] == "pypi":
+            pkgname = "python-" + pkgname.lower()
+        elif nvchecker_entries[pkgname]["source"] == "cpan":
+            pkgname = "perl-" + pkgname.lower()
+        elif nvchecker_entries[pkgname]["source"] == "hackage":
+            pkgname = "haskell-" + pkgname.lower()
+        elif nvchecker_entries[pkgname]["source"] == "gems":
+            pkgname = "ruby-" + pkgname.lower()
+        elif nvchecker_entries[pkgname]["source"] == "npm":
+            pkgname = "nodejs-" + pkgname.lower()
+
+        if pkgname not in archvers and "_" in pkgname:
+            pkgname = pkgname.replace("_", "-")
+
+        if pkgname not in archvers and pkgname != entry_name:
+            pkgname = entry_name
+
+        if pkgname not in archvers:
+            continue
+
+        if archvers[pkgname] != oldvers[entry_name]:
+            if archvers[pkgname].startswith("0.0.0."):
+                archver = archvers[pkgname][6:]
+                oldver = oldvers[entry_name].split(".")[0]
+
+                # Timezone compatibility
+                if archver == oldver or abs(int(oldver) - int(archver)) <= 1:
+                    continue
+
+            if "-" in oldvers[entry_name] and archvers[pkgname] in oldvers[entry_name].split("-"):
+                continue
+
+            if "_" in oldvers[entry_name] and archvers[pkgname] in oldvers[entry_name].split("_"):
+                continue
+
+            if oldvers[entry_name] + ".0" == archvers[pkgname] or archvers[pkgname] + ".0" == oldvers[entry_name]:
+                continue
+
+            tmpv1, tmpv2 = [v.replace("-", ".").replace("_", ".") for v in (oldvers[entry_name], archvers[pkgname])]
+            if tmpv1 == tmpv2:
+                continue
+
+            for prefix in ("v", "Release", "ver", "ver."):
+                if prefix + archvers[pkgname] == oldvers[entry_name]:
+                    break
+            else:
+                if args.newer:
+                    if pyalpm.vercmp(archvers[pkgname], newvers[entry_name]) > 0:
+                        continue
+
+                print(pkgname, oldvers[entry_name], "->", archvers[pkgname])
+                oldvers[entry_name] = archvers[pkgname]
+
+    if args.update:
+        nvchecker_core.write_verfile(nvchecker_options.ver_files[0], oldvers)
+
+
+if __name__ == '__main__':
+    main()
