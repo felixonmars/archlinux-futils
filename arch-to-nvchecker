@@ -6,8 +6,8 @@ from nvchecker import core as nvchecker_core
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Check or update nvchecker oldver db from local pacman db')
-    parser.add_argument('--update', action="store_true",
+    parser = argparse.ArgumentParser(description='Check or update nvchecker oldver db from pacman sync db')
+    parser.add_argument('-u', '--update', action="store_true",
                         help='Actually update nvchecker db after printing the difference')
     parser.add_argument('--db', nargs="*", default=["testing", "core", "extra", "community-testing",
                                                     "community", "multilib-testing", "multilib"],
@@ -36,6 +36,10 @@ def main():
 
     for entry_name in newvers:
         pkgname = entry_name
+
+        if pkgname not in nvchecker_entries:
+            # Entry recently removed
+            continue
 
         if nvchecker_entries[pkgname]["source"] == "pypi":
             pkgname = "python-" + pkgname.lower()
