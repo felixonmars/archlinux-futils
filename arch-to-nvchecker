@@ -41,6 +41,9 @@ def main():
             # Entry recently removed
             continue
 
+        if nvchecker_entries[pkgname].get("arch_ignored", False):
+            continue
+
         if nvchecker_entries[pkgname]["source"] == "pypi":
             pkgname = "python-" + pkgname.lower()
         elif nvchecker_entries[pkgname]["source"] == "cpan":
@@ -61,38 +64,41 @@ def main():
         if pkgname not in archvers:
             continue
 
-        if archvers[pkgname] != oldvers[entry_name]:
-            if archvers[pkgname].startswith("0.0.0."):
-                archver = archvers[pkgname][6:]
-                oldver = oldvers[entry_name].split(".")[0]
+        archver = archvers[pkgname]
+        oldver = oldvers.get(entry_name, None)
+        if archver != oldver:
+            if oldver is not None:
+                if archver.startswith("0.0.0."):
+                    _archver = archver[6:]
+                    _oldver = oldver.split(".")[0]
 
-                # Timezone compatibility
-                if archver == oldver or abs(int(oldver) - int(archver)) <= 1:
+                    # Timezone compatibility
+                    if _archver == _oldver or abs(int(_oldver) - int(_archver)) <= 1:
+                        continue
+
+                if "-" in oldver and archver in oldver.split("-"):
                     continue
 
-            if "-" in oldvers[entry_name] and archvers[pkgname] in oldvers[entry_name].split("-"):
-                continue
+                if "_" in oldver and archver in oldver.split("_"):
+                    continue
 
-            if "_" in oldvers[entry_name] and archvers[pkgname] in oldvers[entry_name].split("_"):
-                continue
+                if oldver + ".0" == archver or archver + ".0" == oldver:
+                    continue
 
-            if oldvers[entry_name] + ".0" == archvers[pkgname] or archvers[pkgname] + ".0" == oldvers[entry_name]:
-                continue
-
-            tmpv1, tmpv2 = [v.replace("-", ".").replace("_", ".") for v in (oldvers[entry_name], archvers[pkgname])]
-            if tmpv1 == tmpv2:
-                continue
+                tmpv1, tmpv2 = [v.replace("-", ".").replace("_", ".") for v in (oldver, archver)]
+                if tmpv1 == tmpv2:
+                    continue
 
             for prefix in ("v", "Release", "ver", "ver."):
-                if prefix + archvers[pkgname] == oldvers[entry_name]:
+                if prefix + archver == oldver:
                     break
             else:
                 if args.newer:
-                    if pyalpm.vercmp(archvers[pkgname], newvers[entry_name]) > 0:
+                    if pyalpm.vercmp(archver, newvers[entry_name]) > 0:
                         continue
 
-                print(pkgname, oldvers[entry_name], "->", archvers[pkgname])
-                oldvers[entry_name] = archvers[pkgname]
+                print(pkgname, oldver, "->", archver)
+                oldvers[entry_name] = archver
 
     if args.update:
         nvchecker_core.write_verfile(nvchecker_options.ver_files[0], oldvers)
