@@ -76,6 +76,7 @@ PRESET_PACKAGES = {
     "hoogle": "hoogle",
     "hopenpgp-tools": "hopenpgp-tools",
     "idris": "idris",
+    "misfortune": "misfortune",
     "pandoc": "pandoc",
     "pandoc-citeproc": "pandoc-citeproc",
     "pandoc-crossref": "pandoc-crossref",
