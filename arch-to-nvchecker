@@ -4,6 +4,14 @@ import pyalpm
 import argparse
 from nvchecker import core as nvchecker_core
 
+PREFIX_MAP = {
+    "pypi": "python-",
+    "cpan": "perl-",
+    "hackage": "haskell-",
+    "gems": "ruby-",
+    "npm": "nodejs-",
+}
+
 
 def main():
     parser = argparse.ArgumentParser(description='Check or update nvchecker oldver db from pacman sync db')
@@ -41,25 +49,24 @@ def main():
             # Entry recently removed
             continue
 
-        if nvchecker_entries[pkgname].get("arch_ignored", False):
+        entry = nvchecker_entries[pkgname]
+
+        if entry.get("arch_ignored"):
             continue
 
-        if nvchecker_entries[pkgname]["source"] == "pypi":
-            pkgname = "python-" + pkgname.lower()
-        elif nvchecker_entries[pkgname]["source"] == "cpan":
-            pkgname = "perl-" + pkgname.lower()
-        elif nvchecker_entries[pkgname]["source"] == "hackage":
-            pkgname = "haskell-" + pkgname.lower()
-        elif nvchecker_entries[pkgname]["source"] == "gems":
-            pkgname = "ruby-" + pkgname.lower()
-        elif nvchecker_entries[pkgname]["source"] == "npm":
-            pkgname = "nodejs-" + pkgname.lower()
+        if _pkgname := entry.get("arch_pkgname"):
+            pkgname = _pkgname
+        else:
+            pkgname = PREFIX_MAP.get(entry["source"], "") + pkgname.lower()
 
-        if pkgname not in archvers and "_" in pkgname:
-            pkgname = pkgname.replace("_", "-")
+            if pkgname not in archvers and "_" in pkgname:
+                pkgname = pkgname.replace("_", "-")
 
-        if pkgname not in archvers and pkgname != entry_name:
-            pkgname = entry_name
+            if pkgname not in archvers and "." in pkgname:
+                pkgname = pkgname.replace(".", "-")
+
+            if pkgname not in archvers and pkgname != entry_name:
+                pkgname = entry_name
 
         if pkgname not in archvers:
             continue
