@@ -1,7 +1,5 @@
 #!/usr/bin/python
-import os
-import sys
-import json
+import argparse
 import logging
 from collections import defaultdict
 import networkx as nx
@@ -11,8 +9,25 @@ DO_NOT_EXPAND = {
     'uusi'
 }
 
+parser = argparse.ArgumentParser(description='Rebuild generator and orderer, generates all haskell reverse deps too')
+parser.add_argument('-H', '--haskell-check', action="store_true",
+                                             help='Filter results for haskell-only rebuilds, also implies --expand, --expand-make, --expand-check')
+parser.add_argument('-e', '--expand', action="store_true",
+                                      help='Expand all reverse deps')
+parser.add_argument('-m', '--expand-make', action="store_true",
+                                           help='Expand all reverse make deps')
+parser.add_argument('-c', '--expand-check', action="store_true",
+                                            help='Expand all reverse check deps')
+parser.add_argument('package', nargs='+', help='Packages to rebuild')
+args = parser.parse_args()
+
+if args.haskell_check:
+    args.expand = True
+    args.expand_make = True
+    args.expand_check = True
+
 logging.basicConfig(format="%(message)s", level=logging.INFO)
-rebuild_list = set(sys.argv[1:])
+rebuild_list = set(args.package)
 
 package_db = defaultdict(dict)
 pkglist = rebuild_list.copy()
@@ -20,7 +35,7 @@ reverse_deps = defaultdict(set)
 G = nx.DiGraph()
 handle = pyalpm.Handle(".", "/var/lib/pacman")
 
-for db in ["community"]:
+for db in ["core", "extra", "community", "multilib"]:
     db_handle = handle.register_syncdb(db, 0)
     for package in db_handle.search(""):
         for field in ("depends", "makedepends", "checkdepends", "arch"):
@@ -32,32 +47,42 @@ for pkg in package_db:
     package_db[pkg]["checkdepends"] = {dep.split("=")[0].split(">")[0].split("<")[0] for dep in package_db[pkg]["checkdepends"]}
 
 
-def cached_get_reverse_dep(pkg):
+def resolve_pkg(pkg):
+    newpkgs = set()
     if pkg not in reverse_deps:
-        if not ({"ghc", "ghc-libs"} & set(package_db[pkg]["depends"]) and package_db[pkg]["arch"] != "any") or pkg in DO_NOT_EXPAND:
+        if args.haskell_check and not ({"ghc", "ghc-libs"} & set(package_db[pkg]["depends"]) and package_db[pkg]["arch"] != "any") or pkg in DO_NOT_EXPAND:
            return reverse_deps[pkg]
 
         for _pkg in package_db:
-            if not ({"ghc", "ghc-libs"} & set(package_db[_pkg]["depends"]) and package_db[_pkg]["arch"] != "any"):
+            if args.haskell_check and not ({"ghc", "ghc-libs"} & set(package_db[_pkg]["depends"]) and package_db[_pkg]["arch"] != "any"):
                 continue
             if pkg in package_db[_pkg]["depends"] or pkg in package_db[_pkg]["makedepends"] or \
                pkg in package_db[_pkg]["checkdepends"]:
                 reverse_deps[pkg].add(_pkg)
+                if args.expand and pkg in package_db[_pkg]["depends"]:
+                    newpkgs.add(_pkg)
+                if args.expand_make and pkg in package_db[_pkg]["makedepends"]:
+                    newpkgs.add(_pkg)
+                if args.expand_check and pkg in package_db[_pkg]["checkdepends"]:
+                    newpkgs.add(_pkg)
 
-    return reverse_deps[pkg]
+    # Handle empty gracefully
+    reverse_deps[pkg]
+    return newpkgs
 
 
 # Expand reverse dependencies
 while len(pkglist) != len(reverse_deps):
     for pkg in list(pkglist):
         if pkg not in reverse_deps:
-            pkglist |= cached_get_reverse_dep(pkg)
+            pkglist |= resolve_pkg(pkg)
 
 
 G.add_nodes_from(reverse_deps.keys())
 for dep, pkgs in reverse_deps.items():
     for pkg in pkgs:
-        G.add_edge(dep, pkg)
+        if pkg in pkglist:
+            G.add_edge(dep, pkg)
 
 
 while True:
@@ -105,6 +130,9 @@ def finalize(pkg):
                         logging.info("Removing soft dep to solve circular dependency: " + "<-".join(edge))
                         NG.remove_edge(*edge)
                         break
+                else:
+                    logging.warning("WARNING!!! Removing HARD dep to solve circular dependency: " + "<-".join(edge))
+                    NG.remove_edge(*edge)
             except nx.exception.NetworkXNoCycle:
                 break
         for _pkg in nx.topological_sort(NG):
