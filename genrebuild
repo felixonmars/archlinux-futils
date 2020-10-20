@@ -2,9 +2,10 @@
 import os
 import sys
 import json
-import networkx as nx
 import logging
 from collections import defaultdict
+import networkx as nx
+import pyalpm
 
 DO_NOT_EXPAND = {
     'uusi'
@@ -12,12 +13,18 @@ DO_NOT_EXPAND = {
 
 logging.basicConfig(format="%(message)s", level=logging.INFO)
 rebuild_list = set(sys.argv[1:])
+
+package_db = defaultdict(dict)
 pkglist = rebuild_list.copy()
 reverse_deps = defaultdict(set)
 G = nx.DiGraph()
+handle = pyalpm.Handle(".", "/var/lib/pacman")
 
-with open(os.path.join(sys.path[0], "package.db"), "r") as f:
-    package_db = json.load(f)
+for db in ["community"]:
+    db_handle = handle.register_syncdb(db, 0)
+    for package in db_handle.search(""):
+        for field in ("depends", "makedepends", "checkdepends", "arch"):
+            package_db[package.name][field] = getattr(package, field)
 
 for pkg in package_db:
     package_db[pkg]["depends"] = {dep.split("=")[0].split(">")[0].split("<")[0] for dep in package_db[pkg]["depends"]}
