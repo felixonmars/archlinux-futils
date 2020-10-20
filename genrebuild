@@ -64,16 +64,10 @@ while True:
     try:
         cycle = nx.find_cycle(G)
         cycle_pkgs = set()
-        cycle_pkgs_flatten = set()
         for edge in cycle:
             cycle_pkgs |= set(edge)
-            for pkg in edge:
-                if " " not in pkg:
-                    cycle_pkgs_flatten.add(pkg)
-                else:
-                    cycle_pkgs_flatten |= set(pkg.split())
-        logging.info("Found circular dependency: " + "<->".join(cycle_pkgs_flatten))
-        new_pkg = " ".join(cycle_pkgs_flatten)
+        logging.info("Found circular dependency: " + str(cycle_pkgs))
+        new_pkg = frozenset(cycle_pkgs)
         package_db[new_pkg] = dict(depends=set())
         for pkg in cycle_pkgs:
             package_db[new_pkg]["depends"] |= package_db[pkg]["depends"]
@@ -91,12 +85,14 @@ while True:
     except nx.exception.NetworkXNoCycle:
         break
 
-for pkg in nx.lexicographical_topological_sort(G):
-    if " " not in pkg:
-        print(pkg, end=' ')
+result = []
+
+def finalize(pkg):
+    if isinstance(pkg, str):
+        result.append(pkg)
     else:
         NG = nx.DiGraph()
-        NG.add_nodes_from(pkg.split())
+        NG.add_nodes_from(pkg)
         for dep, pkgs in reverse_deps.items():
             for _pkg in pkgs:
                 if _pkg in pkg and dep in pkg:
@@ -111,6 +107,10 @@ for pkg in nx.lexicographical_topological_sort(G):
                         break
             except nx.exception.NetworkXNoCycle:
                 break
-        print(" ".join(nx.lexicographical_topological_sort(NG)), end=' ')
+        for _pkg in nx.topological_sort(NG):
+            finalize(_pkg)
 
-print()
+for pkg in nx.topological_sort(G):
+    finalize(pkg)
+
+print(" ".join(result))
