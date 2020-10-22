@@ -5,8 +5,20 @@ from collections import defaultdict
 import networkx as nx
 import pyalpm
 
-DO_NOT_EXPAND = {
-    'uusi'
+# TODO: Automate this. The packages listed here depend on ghc/ghc-libs but don't have .so files.
+HASKELL_DO_NOT_EXPAND = {
+    'alex',
+    'c2hs',
+    'cabal-install',
+    'cgrep',
+    'git-annex',
+    'git-repair',
+    'happy',
+    'hedgewars',
+    'hopenpgp-tools',
+    'tamarin-prover',
+    'uusi',
+    'xmonad-utils',
 }
 
 parser = argparse.ArgumentParser(description='Rebuild generator and orderer, generates all haskell reverse deps too')
@@ -50,7 +62,7 @@ for pkg in package_db:
 def resolve_pkg(pkg):
     newpkgs = set()
     if pkg not in reverse_deps:
-        if args.haskell_check and not ({"ghc", "ghc-libs"} & set(package_db[pkg]["depends"]) and package_db[pkg]["arch"] != "any") or pkg in DO_NOT_EXPAND:
+        if args.haskell_check and (not ({"ghc", "ghc-libs"} & set(package_db[pkg]["depends"]) and package_db[pkg]["arch"] != "any") or pkg in HASKELL_DO_NOT_EXPAND):
            return reverse_deps[pkg]
 
         for _pkg in package_db:
