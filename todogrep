@@ -1,0 +1,55 @@
+#!/usr/bin/python
+
+import aiohttp
+import argparse
+import asyncio
+import logging
+import re
+
+logging.basicConfig(format="%(message)s", level=logging.INFO)
+
+async def get_todo(url, session, callback):
+    logging.info("Fetching " + url)
+    full_url = 'https://www.archlinux.org' + url + 'json'
+    async with session.get(full_url) as resp:
+        todo = await resp.json()
+        todo["url"] = url
+        await callback(todo)
+        return todo
+
+async def get_all_todos(callback):
+    logging.info("Fetching todo lists")
+    async with aiohttp.ClientSession() as session:
+        async with session.get('https://www.archlinux.org/todo') as resp:
+            todolist_page = await resp.text()
+            todolist = re.findall('(/todo/.*?)"', todolist_page)
+            completelist = re.findall('span class="(complete|incomplete)"', todolist_page)
+
+            tasks = []
+            for url, iscomplete in zip(todolist, completelist):
+                if iscomplete == "incomplete":
+                    task = asyncio.ensure_future(get_todo(url, session, callback))
+                    tasks.append(task)
+
+            responses = await asyncio.gather(*tasks)
+            return responses
+
+async def main():
+    parser = argparse.ArgumentParser(description='Grep for packages in ongoing todos')
+    parser.add_argument('-b', '--pkgbase', action='store_true', help='Look for pkgbases instead of pkgnames')
+    parser.add_argument('package', nargs='+', help='Packages to look for')
+    args = parser.parse_args()
+
+    async def find_package(todo):
+        for p in args.package:
+            for package in todo["packages"]:
+                if package is None:
+                    # Package was removed
+                    continue
+                if args.pkgbase and package["pkgbase"] == p or package["pkgname"] == p:
+                    print(p, "overlaps with", todo["url"], todo["name"])
+
+    await get_all_todos(find_package)
+
+loop = asyncio.get_event_loop()
+loop.run_until_complete(main())
