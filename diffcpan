@@ -3,12 +3,12 @@ cpanname=$1
 ver1=$2
 ver2=$3
 
-author=$(curl https://fastapi.metacpan.org/release/$cpanname | jq -r .author)
+#author=$(curl https://fastapi.metacpan.org/release/$cpanname | jq -r .author)
 
-# TODO: how to fetch old author?
-oldauthor=$4
-
-[[ -z "$oldauthor" ]] && oldauthor=author
+# TODO: Is there an API for this?
+_page=$(curl https://metacpan.org/release/$cpanname)
+oldauthor=$(echo $_page | grep -oP "(?<=value=\"/release/)\w+(?=/$cpanname-$ver1\")")
+author=$(echo $_page | grep -oP "(?<=value=\"/release/)\w+(?=/$cpanname-$ver2\")")
 
 test -f /tmp/$cpanname.json.$ver1 || curl https://fastapi.metacpan.org/release/$oldauthor/$cpanname-$ver1 | jq -S '.release.dependency | sort | .[] | .module, .phase' > /tmp/$cpanname.json.$ver1
 test -f /tmp/$cpanname.json.$ver2 || curl https://fastapi.metacpan.org/release/$author/$cpanname-$ver2 | jq -S '.release.dependency | sort | .[] | .module, .phase' > /tmp/$cpanname.json.$ver2
