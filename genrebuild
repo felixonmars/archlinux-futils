@@ -62,7 +62,7 @@ for pkg in package_db:
 def resolve_pkg(pkg):
     newpkgs = set()
     if pkg not in reverse_deps:
-        if args.haskell_check and (not ({"ghc", "ghc-libs"} & set(package_db[pkg]["depends"]) and package_db[pkg]["arch"] != "any") or pkg in HASKELL_DO_NOT_EXPAND):
+        if args.haskell_check and (not ({"ghc", "ghc-libs"} & set(package_db[pkg]["depends"]) and package_db[pkg]["arch"] != "any")):
            return reverse_deps[pkg]
 
         for _pkg in package_db:
@@ -71,12 +71,15 @@ def resolve_pkg(pkg):
             if pkg in package_db[_pkg]["depends"] or pkg in package_db[_pkg]["makedepends"] or \
                pkg in package_db[_pkg]["checkdepends"]:
                 reverse_deps[pkg].add(_pkg)
-                if args.expand and pkg in package_db[_pkg]["depends"]:
-                    newpkgs.add(_pkg)
-                if args.expand_make and pkg in package_db[_pkg]["makedepends"]:
-                    newpkgs.add(_pkg)
-                if args.expand_check and pkg in package_db[_pkg]["checkdepends"]:
-                    newpkgs.add(_pkg)
+                if args.haskell_check and pkg in HASKELL_DO_NOT_EXPAND:
+                    pass
+                else:
+                    if args.expand and pkg in package_db[_pkg]["depends"]:
+                        newpkgs.add(_pkg)
+                    if args.expand_make and pkg in package_db[_pkg]["makedepends"]:
+                        newpkgs.add(_pkg)
+                    if args.expand_check and pkg in package_db[_pkg]["checkdepends"]:
+                        newpkgs.add(_pkg)
 
     # Handle empty gracefully
     reverse_deps[pkg]
