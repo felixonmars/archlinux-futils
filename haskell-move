@@ -1,0 +1,10 @@
+#!/bin/bash
+_pkgs=
+for _pkg in "$@"; do
+  if [[ "$_pkg" == *:nocheck ]]; then
+    :
+  else
+    _pkgs="$_pkgs $_pkg"
+  fi
+done 
+ssh repos.archlinux.org /community/db-move community-staging community "$_pkgs"
