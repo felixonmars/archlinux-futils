@@ -176,7 +176,7 @@ for pkg in nx.topological_sort(G):
             else:
                 pass1.append(_pkg)
         result.extend(pass1)
-        logger.debug("HG Solver pass1: " + " ".join(pass1))
+        logger.debug("Cycle Solver pass1: " + " ".join(pass1))
 
         # Rebuild hard dep tree (in NG) of nocheck_pkg
         def harddep_extend(dep):
@@ -194,6 +194,6 @@ for pkg in nx.topological_sort(G):
             if _pkg in nocheck_pkg:
                 pass2.append(_pkg)
         result.extend(pass2)
-        logger.debug("HG Solver pass2: " + " ".join(pass2))
+        logger.debug("Cycle Solver pass2: " + " ".join(pass2))
 
 print(" ".join(result))
