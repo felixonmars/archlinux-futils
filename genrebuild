@@ -1,6 +1,6 @@
 #!/usr/bin/python
 import argparse
-import logging
+import colorlog
 from collections import defaultdict
 import networkx as nx
 import pyalpm
@@ -38,7 +38,13 @@ if args.haskell_check:
     args.expand_make = True
     args.expand_check = True
 
-logging.basicConfig(format="%(message)s", level=logging.INFO)
+logger = colorlog.getLogger()
+logger.setLevel(colorlog.colorlog.logging.DEBUG)
+
+handler = colorlog.StreamHandler()
+handler.setFormatter(colorlog.ColoredFormatter())
+logger.addHandler(handler)
+
 rebuild_list = set(args.package)
 
 package_db = defaultdict(dict)
@@ -100,14 +106,24 @@ for dep, pkgs in reverse_deps.items():
             G.add_edge(dep, pkg)
 
 
+def flatten_frozenset(nodes):
+    new_set = set()
+    for node in nodes:
+        if isinstance(node, (set, frozenset)):
+            new_set |= node
+        else:
+            new_set.add(node)
+    return frozenset(new_set)
+
+
 while True:
     try:
         cycle = nx.find_cycle(G)
         cycle_pkgs = set()
         for edge in cycle:
             cycle_pkgs |= set(edge)
-        logging.info("Found circular dependency: " + str(cycle_pkgs))
-        new_pkg = frozenset(cycle_pkgs)
+        logger.info("Found circular dependency: " + str(cycle_pkgs))
+        new_pkg = flatten_frozenset(cycle_pkgs)
         package_db[new_pkg] = dict(depends=set())
         for pkg in cycle_pkgs:
             package_db[new_pkg]["depends"] |= package_db[pkg]["depends"]
@@ -126,8 +142,7 @@ while True:
         break
 
 result = []
-
-def finalize(pkg):
+for pkg in nx.topological_sort(G):
     if isinstance(pkg, str):
         result.append(pkg)
     else:
@@ -137,23 +152,48 @@ def finalize(pkg):
             for _pkg in pkgs:
                 if _pkg in pkg and dep in pkg:
                     NG.add_edge(dep, _pkg)
+        nocheck_pkg = []
         while True:
             try:
                 cycle = nx.find_cycle(NG)
                 for edge in cycle:
                     if edge[0] not in package_db[edge[1]]["depends"]:
-                        logging.info("Removing soft dep to solve circular dependency: " + "<-".join(edge))
+                        logger.warning("Removing soft dep to solve circular dependency: " + "<-".join(edge))
                         NG.remove_edge(*edge)
+                        nocheck_pkg.append(edge[1])
                         break
                 else:
-                    logging.warning("WARNING!!! Removing HARD dep to solve circular dependency: " + "<-".join(edge))
+                    logger.error("Removing HARD dep to solve circular dependency: " + "<-".join(edge))
+                    nocheck_pkg.append(edge[1])
                     NG.remove_edge(*edge)
             except nx.exception.NetworkXNoCycle:
                 break
-        for _pkg in nx.topological_sort(NG):
-            finalize(_pkg)
 
-for pkg in nx.topological_sort(G):
-    finalize(pkg)
+        pass1 = []
+        for _pkg in nx.topological_sort(NG):
+            if _pkg in nocheck_pkg:
+                pass1.append(_pkg + ":nocheck")
+            else:
+                pass1.append(_pkg)
+        result.extend(pass1)
+        logger.debug("HG Solver pass1: " + " ".join(pass1))
+
+        # Rebuild hard dep tree (in NG) of nocheck_pkg
+        def harddep_extend(dep):
+            if dep not in pkg:
+                return
+            for _pkg in reverse_deps[dep]:
+                if _pkg in pkg and dep in package_db[_pkg]["depends"] and _pkg not in nocheck_pkg:
+                    nocheck_pkg.append(_pkg)
+                    harddep_extend(_pkg)
+
+        for _pkg in nocheck_pkg.copy():
+            harddep_extend(_pkg)
+        pass2 = []
+        for _pkg in nx.topological_sort(NG):
+            if _pkg in nocheck_pkg:
+                pass2.append(_pkg)
+        result.extend(pass2)
+        logger.debug("HG Solver pass2: " + " ".join(pass2))
 
 print(" ".join(result))
