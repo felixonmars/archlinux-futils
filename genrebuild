@@ -100,20 +100,6 @@ for dep, pkgs in reverse_deps.items():
             G.add_edge(dep, pkg)
 
 
-def decycle(nocheck_pkg, cycle):
-    # A <=> B, decycle (A <= B), result: B:nocheck <= A <= B
-    # Create B:nocheck, Remove B <= A, Add B:nocheck <= A
-    new_pkg = nocheck_pkg + ":nocheck"
-    package_db[new_pkg] = package_db[nocheck_pkg]
-    for dep in package_db[new_pkg]["depends"]:
-        if dep in pkglist:
-            G.add_edge(dep, new_pkg)
-    for edge in cycle:
-        if edge[0] == nocheck_pkg:
-            G.remove_edge(nocheck_pkg, edge[1])
-            G.add_edge(new_pkg, edge[1])
-
-
 while True:
     try:
         cycle = nx.find_cycle(G)
@@ -121,16 +107,53 @@ while True:
         for edge in cycle:
             cycle_pkgs |= set(edge)
         logging.info("Found circular dependency: " + str(cycle_pkgs))
-        for edge in cycle:
-            if edge[0] not in package_db[edge[1]]["depends"] and not edge[0].endswith(":nocheck"):
-                logging.info("Removing soft dep to solve circular dependency: " + "<-".join(edge))
-                decycle(edge[1], cycle)
-                break
-        else:
-            logging.info("!!! Removing HARD dep to solve circular dependency: " + "<-".join(edge))
-            G.remove_edge(*edge)
+        new_pkg = frozenset(cycle_pkgs)
+        package_db[new_pkg] = dict(depends=set())
+        for pkg in cycle_pkgs:
+            package_db[new_pkg]["depends"] |= package_db[pkg]["depends"]
+            for _pkg in package_db:
+                if pkg in package_db[_pkg]["depends"]:
+                    package_db[_pkg]["depends"].add(new_pkg)
+
+        for edge in list(G.edges):
+            if edge[0] in cycle_pkgs:
+                G.add_edge(new_pkg, edge[1])
+            if edge[1] in cycle_pkgs:
+                G.add_edge(edge[0], new_pkg)
+        G.remove_nodes_from(cycle_pkgs)
 
     except nx.exception.NetworkXNoCycle:
         break
 
-print(" ".join(nx.lexicographical_topological_sort(G)))
+result = []
+
+def finalize(pkg):
+    if isinstance(pkg, str):
+        result.append(pkg)
+    else:
+        NG = nx.DiGraph()
+        NG.add_nodes_from(pkg)
+        for dep, pkgs in reverse_deps.items():
+            for _pkg in pkgs:
+                if _pkg in pkg and dep in pkg:
+                    NG.add_edge(dep, _pkg)
+        while True:
+            try:
+                cycle = nx.find_cycle(NG)
+                for edge in cycle:
+                    if edge[0] not in package_db[edge[1]]["depends"]:
+                        logging.info("Removing soft dep to solve circular dependency: " + "<-".join(edge))
+                        NG.remove_edge(*edge)
+                        break
+                else:
+                    logging.warning("WARNING!!! Removing HARD dep to solve circular dependency: " + "<-".join(edge))
+                    NG.remove_edge(*edge)
+            except nx.exception.NetworkXNoCycle:
+                break
+        for _pkg in nx.topological_sort(NG):
+            finalize(_pkg)
+
+for pkg in nx.topological_sort(G):
+    finalize(pkg)
+
+print(" ".join(result))
