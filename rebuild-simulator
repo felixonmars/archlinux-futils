@@ -1,0 +1,62 @@
+#!/usr/bin/python
+import argparse
+from collections import defaultdict
+import colorlog
+import pyalpm
+import sys
+
+logger = colorlog.getLogger()
+logger.setLevel(colorlog.colorlog.logging.DEBUG)
+
+handler = colorlog.StreamHandler()
+handler.setFormatter(colorlog.ColoredFormatter())
+logger.addHandler(handler)
+
+package_db = defaultdict(dict)
+handle = pyalpm.Handle(".", "/var/lib/pacman")
+
+for db in ["core", "extra", "community", "multilib"]:
+    db_handle = handle.register_syncdb(db, 0)
+    for package in db_handle.search(""):
+        for field in ("depends", "makedepends", "checkdepends"):
+            package_db[package.name][field] = getattr(package, field)
+
+
+parser = argparse.ArgumentParser(description='Rebuild simulator, simulates a rebuild and yell out when broken')
+parser.add_argument('package', nargs='+', help='Packages to rebuild')
+args = parser.parse_args()
+
+rebuild_list = {pkg for pkg in args.package if not pkg.endswith(":nocheck")}
+package_broken = {package: False for package in rebuild_list}
+
+logger.info("Starting rebuild")
+for package in args.package:
+    logger.info(f"Rebuilding {package}")
+    if package.endswith(":nocheck"):
+        package = package[:-8]
+    else:
+        for d in package_db[package]["checkdepends"]:
+            if d in rebuild_list:
+                if package_broken[d]:
+                    logger.critical(f"Package {d} is broken, cannot rebuild {package}!")
+                    sys.exit(1)
+
+    for d in package_db[package]["depends"] + package_db[package]["makedepends"]:
+        if d in rebuild_list:
+            if package_broken[d]:
+                logger.critical(f"Package {d} is broken, cannot rebuild {package}!")
+                sys.exit(1)
+
+    package_broken[package] = False
+    for p in package_db:
+        if p in rebuild_list:
+            if package in package_db[p]["depends"]:
+                package_broken[p] = True
+                logger.warning(f"Package {p} is broken after rebuilding {package}")
+
+for package in package_broken:
+    if package_broken[package]:
+        logger.critical(f"Package {package} is still broken after rebuild finished!")
+        sys.exit(1)
+
+logger.info("Rebuild finished successfully.")
