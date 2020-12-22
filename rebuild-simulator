@@ -23,11 +23,31 @@ for db in ["core", "extra", "community", "multilib"]:
 
 
 parser = argparse.ArgumentParser(description='Rebuild simulator, simulates a rebuild and yell out when broken')
+parser.add_argument('-M', '--makedepends-are-checkdepends', action="store_true", help="Treat makedepends as checkdepends (ignore brokenness in nocheck builds)")
+parser.add_argument('-1', '--immediate-fail', action="store_true", help="Exit on first failure")
 parser.add_argument('package', nargs='+', help='Packages to rebuild')
 args = parser.parse_args()
 
 rebuild_list = {pkg for pkg in args.package if not pkg.endswith(":nocheck")}
 package_broken = {package: False for package in rebuild_list}
+
+
+def check_broken(pkgs):
+    for d in pkgs:
+        if d in rebuild_list:
+            if package_broken[d]:
+                logger.critical(f"Package {d} is broken, cannot rebuild {package}!")
+                if args.immediate_fail:
+                    sys.exit(1)
+
+def make_broken(pkg, rebuilt_package):
+    if not package_broken[pkg]:
+        package_broken[pkg] = True
+        logger.warning(f"Package {pkg} is broken after rebuilding {rebuilt_package}")
+    for p in package_db:
+        if p in rebuilt_package and p in package_db[p]["depends"] and not package_broken[p]:
+            make_broken(p, rebuilt_package)
+
 
 logger.info("Starting rebuild")
 for package in args.package:
@@ -35,28 +55,23 @@ for package in args.package:
     if package.endswith(":nocheck"):
         package = package[:-8]
     else:
-        for d in package_db[package]["checkdepends"]:
-            if d in rebuild_list:
-                if package_broken[d]:
-                    logger.critical(f"Package {d} is broken, cannot rebuild {package}!")
-                    sys.exit(1)
+        check_broken(package_db[package]["checkdepends"])
+        if args.makedepends_are_checkdepends:
+            check_broken(package_db[package]["makedepends"])
 
-    for d in package_db[package]["depends"] + package_db[package]["makedepends"]:
-        if d in rebuild_list:
-            if package_broken[d]:
-                logger.critical(f"Package {d} is broken, cannot rebuild {package}!")
-                sys.exit(1)
+    check_broken(package_db[package]["depends"])
+    if not args.makedepends_are_checkdepends:
+        check_broken(package_db[package]["makedepends"])
 
     package_broken[package] = False
     for p in package_db:
         if p in rebuild_list:
             if package in package_db[p]["depends"]:
-                package_broken[p] = True
-                logger.warning(f"Package {p} is broken after rebuilding {package}")
+                make_broken(p, package)
 
 for package in package_broken:
     if package_broken[package]:
         logger.critical(f"Package {package} is still broken after rebuild finished!")
-        sys.exit(1)
-
-logger.info("Rebuild finished successfully.")
+        break
+else:
+    logger.info("Rebuild finished successfully.")
