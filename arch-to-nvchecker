@@ -67,6 +67,8 @@ def main():
 
             if pkgname not in archvers and pkgname != entry_name:
                 pkgname = entry_name
+                if pkgname not in archvers:
+                    pkgname = pkgname.lower()
 
         if pkgname not in archvers:
             continue
