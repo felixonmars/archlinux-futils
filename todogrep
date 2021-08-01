@@ -82,7 +82,7 @@ async def main():
             db_handle = handle.register_syncdb(db, 0)
             for package in db_handle.search(""):
                 for p in args.package:
-                    if args.pkgbase and package.pkgbase == p or package.name == p:
+                    if args.pkgbase and package.base == p or package.name == p:
                         logger.error(f"{p} is already in [{db}]")
 
     await analyze_overlaps(check_todo, check_db)
