@@ -12,7 +12,7 @@ import tempfile
 MIRROR = "https://mirror.pkgbuild.com/"
 
 logger = colorlog.getLogger()
-logger.setLevel(colorlog.colorlog.logging.DEBUG)
+logger.setLevel(colorlog.colorlog.logging.INFO)
 
 handler = colorlog.StreamHandler()
 handler.setFormatter(colorlog.ColoredFormatter())
@@ -57,8 +57,12 @@ async def analyze_overlaps(todo_callback, db_callback):
 async def main():
     parser = argparse.ArgumentParser(description='Grep for packages in ongoing todos')
     parser.add_argument('-b', '--pkgbase', action='store_true', help='Look for pkgbases instead of pkgnames')
+    parser.add_argument('-d', '--debug', action='store_true', help='Enable debug logging')
     parser.add_argument('package', nargs='+', help='Packages to look for')
     args = parser.parse_args()
+
+    if args.debug:
+        logger.setLevel(colorlog.colorlog.logging.DEBUG)
 
     async def check_todo(todo):
         for p in args.package:
