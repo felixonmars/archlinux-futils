@@ -3,32 +3,52 @@
 import aiohttp
 import argparse
 import asyncio
-import logging
+import colorlog
+import os
+import pyalpm
 import re
+import tempfile
 
-logging.basicConfig(format="%(message)s", level=logging.INFO)
+MIRROR = "https://mirror.pkgbuild.com/"
 
-async def get_todo(url, session, callback):
-    logging.info("Fetching " + url)
-    full_url = 'https://www.archlinux.org' + url + 'json'
+logger = colorlog.getLogger()
+logger.setLevel(colorlog.colorlog.logging.DEBUG)
+
+handler = colorlog.StreamHandler()
+handler.setFormatter(colorlog.ColoredFormatter())
+logger.addHandler(handler)
+
+async def get_db(db, session, callback):
+    full_url = f"{MIRROR}{db}/os/x86_64/{db}.db"
+    logger.debug(f"Fetching {full_url}")
+    async with session.get(full_url) as resp:
+        db_content = await resp.read()
+        await callback(db, db_content)
+
+async def get_todo(todo_url, session, callback):
+    logger.debug(f"Fetching {todo_url}")
+    full_url = f'https://www.archlinux.org{todo_url}json'
     async with session.get(full_url) as resp:
         todo = await resp.json()
-        todo["url"] = url
+        todo["url"] = todo_url
         await callback(todo)
-        return todo
 
-async def get_all_todos(callback):
-    logging.info("Fetching todo lists")
+async def analyze_overlaps(todo_callback, db_callback):
+    tasks = []
+    logger.debug("Fetching todo lists")
     async with aiohttp.ClientSession() as session:
+        for db in ("staging", "community-staging", "multilib-staging"):
+            task = asyncio.ensure_future(get_db(db, session, db_callback))
+            tasks.append(task)
+
         async with session.get('https://www.archlinux.org/todo') as resp:
             todolist_page = await resp.text()
             todolist = re.findall('(/todo/.*?)"', todolist_page)
             completelist = re.findall('span class="(complete|incomplete)"', todolist_page)
 
-            tasks = []
-            for url, iscomplete in zip(todolist, completelist):
+            for todo_url, iscomplete in zip(todolist, completelist):
                 if iscomplete == "incomplete":
-                    task = asyncio.ensure_future(get_todo(url, session, callback))
+                    task = asyncio.ensure_future(get_todo(todo_url, session, todo_callback))
                     tasks.append(task)
 
             responses = await asyncio.gather(*tasks)
@@ -40,16 +60,32 @@ async def main():
     parser.add_argument('package', nargs='+', help='Packages to look for')
     args = parser.parse_args()
 
-    async def find_package(todo):
+    async def check_todo(todo):
         for p in args.package:
             for package in todo["packages"]:
                 if package is None:
                     # Package was removed
                     continue
                 if args.pkgbase and package["pkgbase"] == p or package["pkgname"] == p:
-                    print(p, "overlaps with", todo["url"], todo["name"])
+                    if todo["kind"] == "Rebuild":
+                        logger.error(f"{p} overlaps with {todo['url']}: {todo['name']}")
+                    else:
+                        logger.warning(f"{p} overlaps with {todo['url']}: {todo['name']}")
 
-    await get_all_todos(find_package)
+    async def check_db(db, db_content):
+        with tempfile.TemporaryDirectory() as tmpdirname:
+            os.mkdir(f'{tmpdirname}/sync')
+            with open(f"{tmpdirname}/sync/{db}.db", "wb") as f:
+                f.write(db_content)
+
+            handle = pyalpm.Handle(".", tmpdirname)
+            db_handle = handle.register_syncdb(db, 0)
+            for package in db_handle.search(""):
+                for p in args.package:
+                    if args.pkgbase and package.pkgbase == p or package.name == p:
+                        logger.error(f"{p} is already in [{db}]")
+
+    await analyze_overlaps(check_todo, check_db)
 
 loop = asyncio.get_event_loop()
 loop.run_until_complete(main())
