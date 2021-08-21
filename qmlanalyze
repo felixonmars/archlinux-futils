@@ -28,7 +28,7 @@ for file in find("." if len(sys.argv) < 2 else sys.argv[1], "-name", "*.qml"):
     print(f"Analyzing {file}...")
     with open(file) as f:
         for line in f:
-            if "import " in line:
+            if line.startswith("import "):
                 try:
                     module, version = line.split("import ")[1].split()[:2]
                 except ValueError:
