@@ -1,0 +1,53 @@
+#!/usr/bin/python
+import sys
+from sh import find, pacman
+
+qmlmap = {}
+package = None
+for line in pacman("-F", "qmldir"):
+    # pacman outputs ANSI escape sequences
+    if line.startswith("\x1b[?25l"):
+        line = line[6:]
+    line = line.strip()
+    if line.endswith("/qmldir"):
+        if line.startswith("usr/lib/qt/qml/"):
+            module = line[len("usr/lib/qt/qml/"):-len("/qmldir")].replace("/", ".")
+            qmlmap[module] = package
+    else:
+        package = line.split()[0]
+
+for m in qmlmap.copy():
+    if "." in m and m.split(".")[-1].isnumeric():
+        new_m = ".".join(m.split(".")[:-1])
+        if new_m not in qmlmap:
+            qmlmap[new_m] = qmlmap[m]
+
+packages = set()
+for file in find("." if len(sys.argv) < 2 else sys.argv[1], "-name", "*.qml"):
+    file = file.strip()
+    print(f"Analyzing {file}...")
+    with open(file) as f:
+        for line in f:
+            if "import " in line:
+                try:
+                    module, version = line.split("import ")[1].split()[:2]
+                except ValueError:
+                    # skip directory imports
+                    continue
+                version = " " + version
+                while True:
+                    module_name = (module + version).replace(" ", ".")
+                    if module_name in qmlmap:
+                        print(f"{module_name} found in {qmlmap[module_name]}")
+                        packages.add(qmlmap[module_name])
+                        break
+                    elif "." in version:
+                        version = ".".join(version.split(".")[:-1])
+                    elif version:
+                        version = ""
+                    else:
+                        print(f"Unknown module: {module}")
+                        break
+
+print("\nFound dependencies:")
+print("\n".join(packages))
