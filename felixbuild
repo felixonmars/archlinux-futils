@@ -1,0 +1,66 @@
+#!/bin/bash
+
+_buildserver=$1
+
+_server=${_buildserver//[0-9]/}
+_login=${_buildserver//[a-zA-Z]/}
+
+while read -r abbr addr; do
+  if [[ "$_server" == "$abbr" ]]; then
+    BUILDHOST=$addr
+    shift
+    break
+  fi
+done < <(cat /etc/felixbuild.d/*)
+
+if [[ -z $BUILDHOST ]]; then
+  BUILDHOST=build.archlinux.org
+fi
+
+if [[ -z "$_login" ]]; then
+  _cmd="$@"
+else
+  _cmd=
+  _login="-l $USER$_login"
+  _mark=
+  for _part in "$@"; do
+    _cmd="$_cmd $_part"
+    if [[ -z "$_mark" && "$_part" == "--" ]]; then
+      _cmd="$_cmd $_login"
+      _mark=1
+    fi
+  done
+  if [[ -z "$_mark" ]]; then
+    _cmd="$_cmd -- $_login"
+  fi
+fi
+
+# Prefer to use rsync here because it's much faster than source packages
+rm -f *.src.tar.gz *.src.tar.gz.sig
+# makepkg -Sf --skipchecksums --skippgpcheck || exit 1
+# SRCPKG=$(ls *.src.tar.gz)
+PKGNAME=$(source PKGBUILD; [[ -z $pkgbase ]] && echo $pkgname || echo $pkgbase)
+ARCH=$(source PKGBUILD; echo $arch)
+ssh $BUILDHOST "mkdir -p packages; test -e .makepkg.conf" || exit 1
+rsync -avzzP ./ $BUILDHOST:packages/$PKGNAME/ --exclude=*.pkg.tar* --exclude=src/ --exclude=pkg/
+if [[ -t 2 ]]; then
+    _T="-t"
+else
+    _T=""
+fi
+
+if [[ "$1" =~ riscv ]]; then
+  . /usr/local/bin/riscvenv
+  if [[ -d "$RVPATCHREPO/$PKGNAME" ]]; then
+    rsync -avzzP $RVPATCHREPO/$PKGNAME/ $BUILDHOST:packages/$PKGNAME/
+    [[ -e "$RVPATCHREPO/$PKGNAME/riscv64.patch" ]] && ssh $_T $BUILDHOST "cd packages/$PKGNAME && patch -p0 -i riscv64.patch" || exit 1
+  fi
+  if [[ ! "$ARCH" =~ any ]]; then
+    echo 'Patching arch to riscv64...'
+    ssh $_T $BUILDHOST "cd packages/$PKGNAME && setconf PKGBUILD arch '(\"riscv64\")'" || exit 1
+  fi
+fi
+
+# ssh $_T $BUILDHOST "cd packages && rm -rf $PKGNAME/*.pkg.tar.*; bsdtar xvf ./$SRCPKG && cd $PKGNAME && flock ../build.lock $@" || exit 1
+ssh $_T $BUILDHOST "cd packages/$PKGNAME && rm -f *.pkg.tar.*; $_cmd" || exit 1
+scp $BUILDHOST:packages/$PKGNAME/*.pkg.tar.* ./ || exit 1
