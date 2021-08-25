@@ -53,7 +53,9 @@ if [[ "$1" =~ riscv ]]; then
   . /usr/local/bin/riscvenv
   if [[ -d "$RVPATCHREPO/$PKGNAME" ]]; then
     rsync -avzzP $RVPATCHREPO/$PKGNAME/ $BUILDHOST:packages/$PKGNAME/
-    [[ -e "$RVPATCHREPO/$PKGNAME/riscv64.patch" ]] && ssh $_T $BUILDHOST "cd packages/$PKGNAME && patch -p0 -i riscv64.patch" || exit 1
+    if [[ -e "$RVPATCHREPO/$PKGNAME/riscv64.patch" ]]; then
+      ssh $_T $BUILDHOST "cd packages/$PKGNAME && patch -p0 -i riscv64.patch" || exit 1
+    fi
   fi
   if [[ ! "$ARCH" =~ any ]]; then
     echo 'Patching arch to riscv64...'
