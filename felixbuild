@@ -1,5 +1,9 @@
 #!/bin/bash
 
+source /usr/share/makepkg/util/message.sh
+colorize
+
+# === Handle server aliases ===
 _buildserver=$1
 
 _server=${_buildserver//[0-9]/}
@@ -7,6 +11,7 @@ _login=${_buildserver//[a-zA-Z]/}
 
 while read -r abbr addr; do
   if [[ "$_server" == "$abbr" ]]; then
+    msg "Building on $abbr"
     BUILDHOST=$addr
     shift
     break
@@ -15,8 +20,10 @@ done < <(cat /etc/felixbuild.d/*)
 
 if [[ -z $BUILDHOST ]]; then
   BUILDHOST=build.archlinux.org
+  msg "Building on default $BUILDHOST"
 fi
 
+# === Deal with multiple logins (for parallel building) ===
 if [[ -z "$_login" ]]; then
   _cmd="$@"
 else
@@ -35,34 +42,49 @@ else
   fi
 fi
 
+# === Sync package to remote host ===
 # Prefer to use rsync here because it's much faster than source packages
-rm -f *.src.tar.gz *.src.tar.gz.sig
 # makepkg -Sf --skipchecksums --skippgpcheck || exit 1
 # SRCPKG=$(ls *.src.tar.gz)
 PKGNAME=$(source PKGBUILD; [[ -z $pkgbase ]] && echo $pkgname || echo $pkgbase)
 ARCH=$(source PKGBUILD; echo $arch)
+msg "Checking for remote environment..."
 ssh $BUILDHOST "mkdir -p packages; test -e .makepkg.conf" || exit 1
-rsync -avzzP ./ $BUILDHOST:packages/$PKGNAME/ --exclude=*.pkg.tar* --exclude=src/ --exclude=pkg/
+msg "Syncing package to remote host..."
+rsync -avzzP ./ $BUILDHOST:packages/$PKGNAME/ --exclude=*.src.tar* --exclude=*.pkg.tar* --exclude=src/ --exclude=pkg/
+
+# === Handle validpgpkeys ===
+msg "Ensuring required PGP keys are present..."
+for _key in $(source PKGBUILD; echo "${validpgpkeys[@]}" 2>/dev/null); do
+  msg "Checking for $_key..."
+  ssh $BUILDHOST "gpg --fingerprint $_key >/dev/null 2>&1 || gpg --recv-keys $_key" || exit 1
+done
+
+# === Handle riscv64 patches ===
+if [[ "$1" =~ riscv ]]; then
+  . /usr/local/bin/riscvenv
+  if [[ -d "$RVPATCHREPO/$PKGNAME" ]]; then
+    msg "Applying RISC-V patches..."
+    rsync -avzzP $RVPATCHREPO/$PKGNAME/ $BUILDHOST:packages/$PKGNAME/
+    if [[ -e "$RVPATCHREPO/$PKGNAME/riscv64.patch" ]]; then
+      ssh $BUILDHOST "cd packages/$PKGNAME && patch -p0 -i riscv64.patch" || exit 1
+    fi
+  fi
+  if [[ ! "$ARCH" =~ any ]]; then
+    msg 'Patching arch to riscv64...'
+    ssh $BUILDHOST "cd packages/$PKGNAME && setconf PKGBUILD arch '(\"riscv64\")'" || exit 1
+  fi
+fi
+
+# === Build the package ===
 if [[ -t 2 ]]; then
     _T="-t"
 else
     _T=""
 fi
-
-if [[ "$1" =~ riscv ]]; then
-  . /usr/local/bin/riscvenv
-  if [[ -d "$RVPATCHREPO/$PKGNAME" ]]; then
-    rsync -avzzP $RVPATCHREPO/$PKGNAME/ $BUILDHOST:packages/$PKGNAME/
-    if [[ -e "$RVPATCHREPO/$PKGNAME/riscv64.patch" ]]; then
-      ssh $_T $BUILDHOST "cd packages/$PKGNAME && patch -p0 -i riscv64.patch" || exit 1
-    fi
-  fi
-  if [[ ! "$ARCH" =~ any ]]; then
-    echo 'Patching arch to riscv64...'
-    ssh $_T $BUILDHOST "cd packages/$PKGNAME && setconf PKGBUILD arch '(\"riscv64\")'" || exit 1
-  fi
-fi
-
 # ssh $_T $BUILDHOST "cd packages && rm -rf $PKGNAME/*.pkg.tar.*; bsdtar xvf ./$SRCPKG && cd $PKGNAME && flock ../build.lock $@" || exit 1
 ssh $_T $BUILDHOST "cd packages/$PKGNAME && rm -f *.pkg.tar.*; $_cmd" || exit 1
+
+# === Sync back artifacts ===
+msg "Syncing back built packages..."
 scp $BUILDHOST:packages/$PKGNAME/*.pkg.tar.* ./ || exit 1
