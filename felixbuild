@@ -56,7 +56,7 @@ rsync -avzzP ./ $BUILDHOST:packages/$PKGNAME/ --exclude=*.src.tar* --exclude=*.p
 # === Handle validpgpkeys ===
 msg "Ensuring required PGP keys are present..."
 for _key in $(source PKGBUILD; echo "${validpgpkeys[@]}" 2>/dev/null); do
-  msg "Checking for $_key..."
+  msg2 "Checking for $_key..."
   ssh $BUILDHOST "gpg --fingerprint $_key >/dev/null 2>&1 || gpg --recv-keys $_key" || exit 1
 done
 
