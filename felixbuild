@@ -42,6 +42,21 @@ else
   fi
 fi
 
+# === Handle pkgver() ===
+if (. PKGBUILD; type pkgver &>/dev/null); then
+  msg "Attempt to run pkgver()..."
+  makepkg -o
+fi
+
+# === Handle validpgpkeys ===
+if [[ -n "$(. PKGBUILD; echo $validpgpkeys)" ]]; then
+  msg "Ensuring required PGP keys are present..."
+  for _key in $(source PKGBUILD; echo "${validpgpkeys[@]}" 2>/dev/null); do
+    msg2 "Checking for $_key..."
+    ssh $BUILDHOST "gpg --fingerprint $_key >/dev/null 2>&1 || gpg --recv-keys $_key" || exit 1
+  done
+fi
+
 # === Sync package to remote host ===
 # Prefer to use rsync here because it's much faster than source packages
 # makepkg -Sf --skipchecksums --skippgpcheck || exit 1
@@ -52,13 +67,6 @@ msg "Checking for remote environment..."
 ssh $BUILDHOST "mkdir -p packages; test -e .makepkg.conf" || exit 1
 msg "Syncing package to remote host..."
 rsync -avzzP ./ $BUILDHOST:packages/$PKGNAME/ --exclude=*.src.tar* --exclude=*.pkg.tar* --exclude=src/ --exclude=pkg/
-
-# === Handle validpgpkeys ===
-msg "Ensuring required PGP keys are present..."
-for _key in $(source PKGBUILD; echo "${validpgpkeys[@]}" 2>/dev/null); do
-  msg2 "Checking for $_key..."
-  ssh $BUILDHOST "gpg --fingerprint $_key >/dev/null 2>&1 || gpg --recv-keys $_key" || exit 1
-done
 
 # === Handle riscv64 patches ===
 if [[ "$1" =~ riscv ]]; then
@@ -82,6 +90,7 @@ if [[ -t 2 ]]; then
 else
     _T=""
 fi
+msg "Running$_cmd on remote host..."
 # ssh $_T $BUILDHOST "cd packages && rm -rf $PKGNAME/*.pkg.tar.*; bsdtar xvf ./$SRCPKG && cd $PKGNAME && flock ../build.lock $@" || exit 1
 ssh $_T $BUILDHOST "cd packages/$PKGNAME && rm -f *.pkg.tar.*; $_cmd" || exit 1
 
