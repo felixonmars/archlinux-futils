@@ -76,6 +76,7 @@ if [[ "$1" =~ riscv ]]; then
     rsync -avzzP $RVPATCHREPO/$PKGNAME/ $BUILDHOST:packages/$PKGNAME/
     if [[ -e "$RVPATCHREPO/$PKGNAME/riscv64.patch" ]]; then
       ssh $BUILDHOST "cd packages/$PKGNAME && patch -p0 -i riscv64.patch" || exit 1
+      ARCH=$(ssh $BUILDHOST "cd packages/$PKGNAME; source PKGBUILD; echo \$arch")
     fi
   fi
   if [[ ! "$ARCH" =~ any ]]; then
