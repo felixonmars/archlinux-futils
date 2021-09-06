@@ -49,7 +49,7 @@ if (. PKGBUILD; type pkgver &>/dev/null); then
 fi
 
 # === Handle validpgpkeys ===
-if [[ -n "$(. PKGBUILD; echo $validpgpkeys)" ]]; then
+if [[ -n "$(. PKGBUILD; echo $validpgpkeys)" && ! "$_cmd" == *"--skippgpcheck"* ]]; then
   msg "Ensuring required PGP keys are present..."
   for _key in $(source PKGBUILD; echo "${validpgpkeys[@]}" 2>/dev/null); do
     msg2 "Checking for $_key..."
