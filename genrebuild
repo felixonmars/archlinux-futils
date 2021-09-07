@@ -41,7 +41,7 @@ if args.haskell_check:
     args.expand_check = True
 
 logger = colorlog.getLogger()
-logger.setLevel(colorlog.colorlog.logging.DEBUG)
+logger.setLevel(colorlog.DEBUG)
 
 handler = colorlog.StreamHandler()
 handler.setFormatter(colorlog.ColoredFormatter())
