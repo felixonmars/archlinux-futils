@@ -1,0 +1,99 @@
+#!/usr/bin/python
+
+from collections import defaultdict
+import os
+import pyalpm
+import sys
+
+RVDBDIR = sys.argv[1]
+REPOROOT = sys.argv[2]
+
+x86_handle = pyalpm.Handle(".", "/var/lib/pacman")
+rv_handle = pyalpm.Handle(".", f"{RVDBDIR}")
+
+rv_packages = {}
+x86_package_db = defaultdict(dict)
+pkgbase_map = defaultdict(set)
+
+version_mismatch = set()
+db_mismatch = set()
+
+for db in ["core", "extra", "community"]:
+    x86_db_handle = x86_handle.register_syncdb(db, 0)
+    for package in x86_db_handle.search(""):
+        for field in ("depends", "makedepends", "checkdepends", "provides", "arch", "base", "version"):
+            x86_package_db[package.name][field] = getattr(package, field)
+        x86_package_db[package.name]["db"] = db
+        pkgbase_map[x86_package_db[package.name]["base"]].add(package.name)
+
+    rv_db_handle = rv_handle.register_syncdb(db, 0)
+    for package in rv_db_handle.search(""):
+        rvver = rv_packages[package.name] = package.version
+
+        if "." in rvver.split("-")[1]:
+            rvver = "-".join((rvver.split("-")[0], rvver.split("-")[1].split(".")[0]))
+
+        if package.name in x86_package_db:
+            if rvver != x86_package_db[package.name]["version"]:
+                version_mismatch.add(package.name)
+
+        for _package in package.provides:
+            rv_packages[_package.split("=")[0]] = package.version
+
+print("""
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@4.4.1/dist/css/bootstrap.min.css" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/jquery@3.4.1/dist/jquery.min.js"></script>
+<div class="table-responsive-sm"><table class="table table-sm">
+<thead><tr><th scope="col">DB</th><th scope="col">Package</th><th scope="col">Status</th></tr></thead><tbody>
+""")
+
+def x86_history_link(package):
+    if package in x86_package_db:
+        repo = 'community' if x86_package_db[package]["db"] == 'community' else 'packages'
+    else:
+        repo = 'unsupported'
+    return f"https://github.com/archlinux/svntogit-{repo}/commits/packages/{package}/trunk"
+
+broken_pkgs = set()
+for pkgname, package in x86_package_db.items():
+    if pkgname in broken_pkgs:
+        continue
+    if os.path.exists(f"{REPOROOT}/.status/logs/{package['base']}.log"):
+        if pkgname in rv_packages:
+            rvver = rv_packages[pkgname]
+            if "." in rvver.split("-")[1]:
+                rvver = "-".join((rvver.split("-")[0], rvver.split("-")[1].split(".")[0]))
+            if rvver == package["version"]:
+                print(f"<tr><td>{package['db']}</td><td>{package['base']}</td><td><font color=yellow>Please delete obsolete log file!</font> <a href='logs/{package['base']}.log'>Log</a></td></tr>")
+                continue
+        broken_pkgs |= pkgbase_map[package['base']]
+        print(f"<tr><td>{package['db']}</td><td>{package['base']}</td><td><font color=red>FTBFS</font> <a href='logs/{package['base']}.log'>Log</a></td></tr>")
+
+for package in sorted(version_mismatch):
+    if package in broken_pkgs:
+        continue
+    rvver = rv_packages[package]
+    x86ver = x86_package_db[package]['version']
+    cmp = pyalpm.vercmp(rvver, x86ver)
+    if cmp < 0:
+        verstr = f"<font color=green>{rvver} -> {x86ver}</font>"
+    elif cmp > 0:
+        verstr = f"<font color=yellow>{rvver} <- {x86ver}</font>"
+
+    print(f"<tr><td>{x86_package_db[package]['db']}</td><td>{package}</td><td>{verstr} <a href={x86_history_link(x86_package_db[package]['base'])}>Changes</a></td></tr>")
+
+for pkgname, package in x86_package_db.items():
+    if pkgname in rv_packages or pkgname in broken_pkgs:
+        continue
+    check_pkgs = set()
+    for _pkgname in pkgbase_map[package['base']]:
+        _package = x86_package_db[_pkgname]
+        check_pkgs |= set(_package["depends"] + _package["makedepends"] + _package["checkdepends"])
+    for dep in check_pkgs:
+        if dep not in rv_packages:
+            break
+    else:
+        print(f"<tr><td>{package['db']}</td><td>{pkgname}</td><td>Leaf package, port it!</td></tr>")
+
+print('</tbody></table></div>')
