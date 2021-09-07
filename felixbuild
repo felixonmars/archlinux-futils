@@ -66,7 +66,7 @@ ARCH=$(source PKGBUILD; echo $arch)
 msg "Checking for remote environment..."
 ssh $BUILDHOST "mkdir -p packages; test -e .makepkg.conf" || exit 1
 msg "Syncing package to remote host..."
-rsync -avzzP ./ $BUILDHOST:packages/$PKGNAME/ --exclude=*.src.tar* --exclude=*.pkg.tar* --exclude=src/ --exclude=pkg/
+rsync -avzzP ./ $BUILDHOST:packages/$PKGNAME/ --exclude=*.src.tar* --exclude=*.pkg.tar* --exclude=src/ --exclude=pkg/ --exclude=.git/
 
 # === Handle riscv64 patches ===
 if [[ "$1" =~ riscv ]]; then
