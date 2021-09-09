@@ -85,10 +85,10 @@ if [[ "$1" =~ riscv ]]; then
   fi
 
   # Handle cachedir
-  ssh $BUILDHOST "mkdir -p $HOME/packages/riscv64-pkg-cache"
+  _HOME="$(ssh $BUILDHOST 'mkdir -p $HOME/packages/riscv64-pkg-cache; echo $HOME')"
   _oldcmd="$_cmd"
   _cmd=
-  _cachedir="-d $HOME/packages/riscv64-pkg-cache:/var/cache/pacman/pkg"
+  _cachedir="-d $_HOME/packages/riscv64-pkg-cache:/var/cache/pacman/pkg"
   _mark=
   for _part in $_oldcmd; do
     _cmd="$_cmd $_part"
