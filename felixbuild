@@ -83,6 +83,23 @@ if [[ "$1" =~ riscv ]]; then
     msg 'Patching arch to riscv64...'
     ssh $BUILDHOST "cd packages/$PKGNAME && setconf PKGBUILD arch '(\"riscv64\")'" || exit 1
   fi
+
+  # Handle cachedir
+  ssh $BUILDHOST "mkdir -p $HOME/packages/riscv64-pkg-cache"
+  _oldcmd="$_cmd"
+  _cmd=
+  _cachedir="-d $HOME/packages/riscv64-pkg-cache:/var/cache/pacman/pkg"
+  _mark=
+  for _part in $_oldcmd; do
+    _cmd="$_cmd $_part"
+    if [[ -z "$_mark" && "$_part" == "--" ]]; then
+      _cmd="$_cmd $_cachedir"
+      _mark=1
+    fi
+  done
+  if [[ -z "$_mark" ]]; then
+    _cmd="$_cmd -- $_cachedir"
+  fi
 fi
 
 # === Build the package ===
@@ -91,7 +108,7 @@ if [[ -t 2 ]]; then
 else
     _T=""
 fi
-msg "Running$_cmd on remote host..."
+msg "Running $_cmd on remote host..."
 # ssh $_T $BUILDHOST "cd packages && rm -rf $PKGNAME/*.pkg.tar.*; bsdtar xvf ./$SRCPKG && cd $PKGNAME && flock ../build.lock $@" || exit 1
 ssh $_T $BUILDHOST "cd packages/$PKGNAME && rm -f *.pkg.tar.*; $_cmd" || exit 1
 
