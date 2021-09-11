@@ -91,6 +91,8 @@ for pkgname, package in x86_package_db.items():
         _package = x86_package_db[_pkgname]
         check_pkgs |= set(_package["depends"] + _package["makedepends"] + _package["checkdepends"])
     for dep in check_pkgs:
+        for _c in "<", ">", "=":
+            dep = dep.split(_c)[0]
         if dep not in rv_packages:
             break
     else:
