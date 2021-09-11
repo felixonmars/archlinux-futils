@@ -38,7 +38,7 @@ for db in ["core", "extra", "community"]:
                 version_mismatch.add(package.name)
 
         for _package in package.provides:
-            rv_packages[_package.split("=")[0]] = package.version
+            rv_packages.setdefault(_package.split("=")[0], package.version)
 
 print("""
 <meta name="viewport" content="width=device-width, initial-scale=1">
