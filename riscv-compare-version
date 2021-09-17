@@ -93,7 +93,8 @@ for pkgname, package in x86_package_db.items():
     for dep in check_pkgs:
         for _c in "<", ">", "=":
             dep = dep.split(_c)[0]
-        if dep not in rv_packages:
+        if dep not in rv_packages and dep not in pkgbase_map[package['base']]:
+            print(f"<tr><td>{package['db']}</td><td>{pkgname}</td><td><font color=red>Dependency '{dep}' not satisfied.</font></td></tr>")
             break
     else:
         print(f"<tr><td>{package['db']}</td><td>{pkgname}</td><td>Leaf package, port it!</td></tr>")
