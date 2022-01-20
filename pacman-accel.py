@@ -1,3 +1,18 @@
+#!/usr/bin/python
+#
+# A simple local redirector for pacman, to get you the latest packages and
+# utilize available mirrors.
+#
+# Usage:
+# - Set multiple mirrors in /etc/pacman.d/mirrorlist-accel with ordering:
+# https://fastest-mirror-but-updates-once-a-day/archlinux/
+# https://relatively-slower-mirror-that-updates-more-frequently/archlinux/
+# ...
+# https://pkgbuild-dot-com-or-another-mirror-that-gives-you-the-latest-packages/
+#
+# - Set /etc/pacman.d/mirrorlist to this redirector:
+# Server = http://127.0.0.1:5000/$repo/os/$arch
+
 import logging
 import requests
 from flask import Flask, redirect
