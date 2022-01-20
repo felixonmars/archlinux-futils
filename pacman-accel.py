@@ -19,10 +19,13 @@ def download_302(path):
 
     if not path.endswith('.db'):
         # Find a faster mirror with the requested file present
-        for mirror in mirrors[:-1]:
-            response = requests.head(mirror + path)
+        for _mirror in mirrors[:-1]:
+            response = requests.head(_mirror + path)
             if response.status_code == 200:
+                mirror = _mirror
                 break
+            else:
+                app.logger.info('skipping %s for %s, code: %d', _mirror, path, response.status_code)
 
     app.logger.info('redirecting to %s', mirror + path)
     return redirect(mirror + path, code=302)
