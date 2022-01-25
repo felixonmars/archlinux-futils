@@ -1,6 +1,7 @@
 #!/usr/bin/python
 
 from collections import defaultdict
+import glob
 import os
 import pyalpm
 import sys
@@ -59,6 +60,22 @@ broken_pkgs = set()
 for pkgname, package in x86_package_db.items():
     if pkgname in broken_pkgs:
         continue
+
+    if os.path.exists(f"{REPOROOT}/.status/logs/{package['base']}"):
+        if pkgname in rv_packages:
+            rvver = rv_packages[pkgname]
+            if "." in rvver.split("-")[1]:
+                rvver = "-".join((rvver.split("-")[0], rvver.split("-")[1].split(".")[0]))
+            if rvver == package["version"]:
+                continue
+            elif not glob.glob(f"{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}-*.log"):
+                print(f"<tr><td>{package['db']}</td><td>{package['base']}</td><td><font color=yellow>FTBFS</font> <a href='logs/{package['base']}/'>Logs (potentially outdated)</a></td></tr>")
+                continue
+
+        print(f"<tr><td>{package['db']}</td><td>{package['base']}</td><td><font color=red>FTBFS</font> <a href='logs/{package['base']}/'>Logs</a></td></tr>")
+        broken_pkgs |= pkgbase_map[package['base']]
+
+    # Legacy logs
     if os.path.exists(f"{REPOROOT}/.status/logs/{package['base']}.log"):
         if pkgname in rv_packages:
             rvver = rv_packages[pkgname]
@@ -68,7 +85,7 @@ for pkgname, package in x86_package_db.items():
                 print(f"<tr><td>{package['db']}</td><td>{package['base']}</td><td><font color=yellow>Please delete obsolete log file!</font> <a href='logs/{package['base']}.log'>Log</a></td></tr>")
                 continue
         broken_pkgs |= pkgbase_map[package['base']]
-        print(f"<tr><td>{package['db']}</td><td>{package['base']}</td><td><font color=red>FTBFS</font> <a href='logs/{package['base']}.log'>Log</a></td></tr>")
+        print(f"<tr><td>{package['db']}</td><td>{package['base']}</td><td><font color=red>FTBFS</font> <a href='logs/{package['base']}.log'>Log (legacy)</a></td></tr>")
 
 for package in sorted(version_mismatch):
     if package in broken_pkgs:
