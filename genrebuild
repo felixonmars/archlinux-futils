@@ -20,6 +20,12 @@ HASKELL_DO_NOT_EXPAND = {
     'uusi',
     'xmonad-utils',
 }
+# The packages listed here are always required on build time, not check()
+HASKELL_REAL_MAKEDEPEND = {
+    'alex',
+    'happy',
+    'uusi',
+}
 
 parser = argparse.ArgumentParser(description='Rebuild generator and orderer, generates all haskell reverse deps too')
 parser.add_argument('-H', '--haskell-check', action="store_true",
@@ -118,30 +124,25 @@ def flatten_frozenset(nodes):
     return frozenset(new_set)
 
 
-while True:
-    try:
-        cycle = nx.find_cycle(G)
-        cycle_pkgs = set()
-        for edge in cycle:
-            cycle_pkgs |= set(edge)
-        logger.info("Found circular dependency: " + str(cycle_pkgs))
-        new_pkg = flatten_frozenset(cycle_pkgs)
-        package_db[new_pkg] = dict(depends=set())
-        for pkg in cycle_pkgs:
-            package_db[new_pkg]["depends"] |= package_db[pkg]["depends"]
-            for _pkg in package_db:
-                if pkg in package_db[_pkg]["depends"]:
-                    package_db[_pkg]["depends"].add(new_pkg)
+for cycle in list(nx.algorithms.components.strongly_connected_components(G)):
+    if len(cycle) == 1:
+        continue
+    logger.info("Found circular dependency: " + str(cycle))
+    new_pkg = flatten_frozenset(cycle)
+    package_db[new_pkg] = dict(depends=set())
+    for pkg in cycle:
+        package_db[new_pkg]["depends"] |= package_db[pkg]["depends"]
+        for _pkg in package_db:
+            if pkg in package_db[_pkg]["depends"]:
+                package_db[_pkg]["depends"].add(new_pkg)
 
-        for edge in list(G.edges):
-            if edge[0] in cycle_pkgs:
-                G.add_edge(new_pkg, edge[1])
-            if edge[1] in cycle_pkgs:
-                G.add_edge(edge[0], new_pkg)
-        G.remove_nodes_from(cycle_pkgs)
+    for edge in list(G.edges):
+        if edge[0] in cycle:
+            G.add_edge(new_pkg, edge[1])
+        if edge[1] in cycle:
+            G.add_edge(edge[0], new_pkg)
+    G.remove_nodes_from(cycle)
 
-    except nx.exception.NetworkXNoCycle:
-        break
 
 result = []
 for pkg in nx.topological_sort(G):
@@ -154,22 +155,28 @@ for pkg in nx.topological_sort(G):
             for _pkg in pkgs:
                 if _pkg in pkg and dep in pkg:
                     NG.add_edge(dep, _pkg)
-        nocheck_pkg = []
-        while True:
-            try:
-                cycle = nx.find_cycle(NG)
-                for edge in cycle:
-                    if edge[0] not in package_db[edge[1]]["depends"]:
-                        logger.warning("Removing soft dep to solve circular dependency: " + "<-".join(edge))
-                        NG.remove_edge(*edge)
-                        nocheck_pkg.append(edge[1])
+        nocheck_pkg = set()
+
+        while nx.algorithms.components.number_strongly_connected_components(NG) != len(NG):
+            found = False
+            for node in NG:
+                if node in HASKELL_REAL_MAKEDEPEND:
+                    continue
+                for rdep in list(NG.successors(node)):
+                    if node not in package_db[rdep]["depends"]:
+                        logger.warning(f"Removing soft dep to solve circular dependency: {node} <- {rdep}")
+                        NG.remove_edge(node, rdep)
+                        nocheck_pkg.add(rdep)
+                        found = True
                         break
-                else:
-                    logger.error("Removing HARD dep to solve circular dependency: " + "<-".join(edge))
-                    nocheck_pkg.append(edge[1])
-                    NG.remove_edge(*edge)
-            except nx.exception.NetworkXNoCycle:
-                break
+
+                if found:
+                    break
+
+            if not found:
+                logger.error(f"Removing HARD dep to solve circular dependency:  {node} <- {rdep}")
+                NG.remove_edge(node, rdep)
+                nocheck_pkg.add(rdep)
 
         pass1 = []
         for _pkg in nx.topological_sort(NG):
@@ -180,21 +187,35 @@ for pkg in nx.topological_sort(G):
         result.extend(pass1)
         logger.debug("Cycle Solver pass1: " + " ".join(pass1))
 
-        # Rebuild hard dep tree (in NG) of nocheck_pkg
-        def harddep_extend(dep):
-            if dep not in pkg:
-                return
-            for _pkg in reverse_deps[dep]:
-                if _pkg in pkg and dep in package_db[_pkg]["depends"] and _pkg not in nocheck_pkg:
-                    nocheck_pkg.append(_pkg)
-                    harddep_extend(_pkg)
-
-        for _pkg in nocheck_pkg.copy():
-            harddep_extend(_pkg)
         pass2 = []
-        for _pkg in nx.topological_sort(NG):
-            if _pkg in nocheck_pkg:
-                pass2.append(_pkg)
+        broken_set = set()
+        nocheck_pkg_bak = nocheck_pkg
+        while nocheck_pkg | broken_set:
+            for pkg in nocheck_pkg | broken_set:
+                if not (package_db[pkg]["depends"] | package_db[pkg]["makedepends"] | package_db[pkg]["checkdepends"]) & broken_set:
+                    to_break = set([rdep for rdep in reverse_deps[pkg] if pkg in package_db[rdep]["depends"] and rdep in NG])
+                    last_to_break = False
+                    while to_break != last_to_break:
+                        last_to_break = to_break
+                        for _pkg in set(to_break):
+                            to_break = to_break | set([rdep for rdep in reverse_deps[_pkg] if _pkg in package_db[rdep]["depends"] and rdep in NG])
+                    logger.debug(f"building {pkg} breaks {to_break}")
+                    # if not to_break <= (nocheck_pkg | broken_set):
+                    #     continue
+                    pass2.append(pkg)
+                    broken_set |= to_break
+                    if pkg in broken_set:
+                        broken_set.remove(pkg)
+                    if pkg in nocheck_pkg:
+                        nocheck_pkg.remove(pkg)
+                    break
+            else:
+                # Deadend. Start over.
+                logger.warning("Cycle Solver pass2 loop detected. Starting over...")
+                pass2 = []
+                broken_set = set()
+                nocheck_pkg = nocheck_pkg_bak
+
         result.extend(pass2)
         logger.debug("Cycle Solver pass2: " + " ".join(pass2))
 
