@@ -12,7 +12,7 @@ import tempfile
 MIRROR = "https://mirror.pkgbuild.com/"
 
 logger = colorlog.getLogger()
-logger.setLevel(colorlog.colorlog.logging.INFO)
+logger.setLevel(colorlog.INFO)
 
 handler = colorlog.StreamHandler()
 handler.setFormatter(colorlog.ColoredFormatter())
