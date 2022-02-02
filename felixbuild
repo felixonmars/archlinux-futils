@@ -68,6 +68,13 @@ ssh $BUILDHOST "mkdir -p packages; test -e .makepkg.conf" || exit 1
 msg "Syncing package to remote host..."
 rsync -avzzP ./ $BUILDHOST:packages/$PKGNAME/ --exclude=*.src.tar* --exclude=*.pkg.tar* --exclude=src/ --exclude=pkg/ --exclude=.git/
 
+# Try to fetch logs
+PKGPREFIX=$(source PKGBUILD; echo $PKGNAME-$epoch${epoch:+:}$pkgver-$pkgrel)
+fetch_logs() {
+  rsync -avzz $BUILDHOST:packages/$PKGNAME/$PKGPREFIX-*.log ./
+}
+trap fetch_logs EXIT
+
 # === Handle riscv64 patches ===
 if [[ "$1" =~ riscv ]]; then
   . /usr/local/bin/riscvenv
@@ -75,7 +82,7 @@ if [[ "$1" =~ riscv ]]; then
     msg "Applying RISC-V patches..."
     rsync -avzzP $RVPATCHREPO/$PKGNAME/ $BUILDHOST:packages/$PKGNAME/
     if [[ -e "$RVPATCHREPO/$PKGNAME/riscv64.patch" ]]; then
-      ssh $BUILDHOST "cd packages/$PKGNAME && patch -p0 -i riscv64.patch" || exit 1
+      ssh $BUILDHOST "cd packages/$PKGNAME && patch -p0 -i riscv64.patch > $PKGPREFIX-riscv64-patch.log 2>&1" || exit 1
       ARCH=$(ssh $BUILDHOST "cd packages/$PKGNAME; source PKGBUILD; echo \$arch")
     fi
   fi
