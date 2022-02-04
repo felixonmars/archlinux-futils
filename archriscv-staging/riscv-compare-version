@@ -57,6 +57,7 @@ def x86_history_link(package):
     return f"https://github.com/archlinux/svntogit-{repo}/commits/packages/{package}/trunk"
 
 broken_pkgs = set()
+outdated_logs = set()
 for pkgname, package in x86_package_db.items():
     if pkgname in broken_pkgs:
         continue
@@ -69,10 +70,10 @@ for pkgname, package in x86_package_db.items():
             if rvver == package["version"]:
                 continue
             elif not glob.glob(f"{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}-*.log"):
-                print(f"<tr><td>{package['db']}</td><td>{package['base']}</td><td><font color=yellow>FTBFS</font> <a href='logs/{package['base']}/'>Logs (potentially outdated)</a></td></tr>")
+                outdated_logs |= pkgbase_map[package['base']]
                 continue
 
-        print(f"<tr><td>{package['db']}</td><td>{package['base']}</td><td><font color=red>FTBFS</font> <a href='logs/{package['base']}/'>Logs</a></td></tr>")
+        print(f"<tr><td>{package['db']}</td><td>{package['base']}</td><td><a href='logs/{package['base']}/'><font color=red>FTBFS</font></a></td></tr>")
         broken_pkgs |= pkgbase_map[package['base']]
 
     # Legacy logs
@@ -82,10 +83,10 @@ for pkgname, package in x86_package_db.items():
             if "." in rvver.split("-")[1]:
                 rvver = "-".join((rvver.split("-")[0], rvver.split("-")[1].split(".")[0]))
             if rvver == package["version"]:
-                print(f"<tr><td>{package['db']}</td><td>{package['base']}</td><td><font color=yellow>Please delete obsolete log file!</font> <a href='logs/{package['base']}.log'>Log</a></td></tr>")
+                print(f"<tr><td>{package['db']}</td><td>{package['base']}</td><td><font color=yellow>Please delete obsolete <a href='logs/{package['base']}.log'>log file</a>!</font></td></tr>")
                 continue
         broken_pkgs |= pkgbase_map[package['base']]
-        print(f"<tr><td>{package['db']}</td><td>{package['base']}</td><td><font color=red>FTBFS</font> <a href='logs/{package['base']}.log'>Log (legacy)</a></td></tr>")
+        print(f"<tr><td>{package['db']}</td><td>{package['base']}</td><td><a href='logs/{package['base']}.log'><font color=red>FTBFS</a></font> (legacy)</a></td></tr>")
 
 for package in sorted(version_mismatch):
     if package in broken_pkgs:
@@ -97,6 +98,9 @@ for package in sorted(version_mismatch):
         verstr = f"<font color=green>{rvver} -> {x86ver}</font>"
     elif cmp > 0:
         verstr = f"<font color=yellow>{rvver} <- {x86ver}</font>"
+
+    if package in outdated_logs:
+        verstr += f" <a href='logs/{x86_package_db[package]['base']}/'><font color=yellow>(Outdated FTBFS Logs)</font></a>"
 
     print(f"<tr><td>{x86_package_db[package]['db']}</td><td>{package}</td><td>{verstr} <a href={x86_history_link(x86_package_db[package]['base'])}>Changes</a></td></tr>")
 
