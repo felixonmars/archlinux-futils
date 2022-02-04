@@ -88,9 +88,23 @@ for pkgname, package in x86_package_db.items():
         broken_pkgs |= pkgbase_map[package['base']]
         print(f"<tr><td>{package['db']}</td><td>{package['base']}</td><td><a href='logs/{package['base']}.log'><font color=red>FTBFS</a></font> (legacy)</a></td></tr>")
 
+def missing_dep(pkgbase):
+    check_pkgs = set()
+    for pkgname in pkgbase_map[pkgbase]:
+        package = x86_package_db[pkgname]
+        check_pkgs |= set(package["depends"] + package["makedepends"] + package["checkdepends"])
+    for dep in check_pkgs:
+        for _c in "<", ">", "=":
+            dep = dep.split(_c)[0]
+        if dep not in rv_packages and dep not in pkgbase_map[pkgbase]:
+            return dep
+
+    return False
+
 for package in sorted(version_mismatch):
     if package in broken_pkgs:
         continue
+    pkgbase = x86_package_db[package]['base']
     rvver = rv_packages[package]
     x86ver = x86_package_db[package]['version']
     cmp = pyalpm.vercmp(rvver, x86ver)
@@ -98,25 +112,23 @@ for package in sorted(version_mismatch):
         verstr = f"<font color=green>{rvver} -> {x86ver}</font>"
     elif cmp > 0:
         verstr = f"<font color=yellow>{rvver} <- {x86ver}</font>"
+    verstr += f" <a href={x86_history_link(pkgbase)}>Changes</a>"
+
+    dep = missing_dep(pkgbase)
+    if dep:
+        verstr += f" <font color=red>Dependency '{dep}' not satisfied.</font>"
 
     if package in outdated_logs:
-        verstr += f" <a href='logs/{x86_package_db[package]['base']}/'><font color=yellow>(Outdated FTBFS Logs)</font></a>"
+        verstr += f" <a href='logs/{pkgbase}/'><font color=yellow>(Outdated FTBFS Logs)</font></a>"
 
-    print(f"<tr><td>{x86_package_db[package]['db']}</td><td>{package}</td><td>{verstr} <a href={x86_history_link(x86_package_db[package]['base'])}>Changes</a></td></tr>")
+    print(f"<tr><td>{x86_package_db[package]['db']}</td><td>{package}</td><td>{verstr}</td></tr>")
 
 for pkgname, package in x86_package_db.items():
     if pkgname in rv_packages or pkgname in broken_pkgs:
         continue
-    check_pkgs = set()
-    for _pkgname in pkgbase_map[package['base']]:
-        _package = x86_package_db[_pkgname]
-        check_pkgs |= set(_package["depends"] + _package["makedepends"] + _package["checkdepends"])
-    for dep in check_pkgs:
-        for _c in "<", ">", "=":
-            dep = dep.split(_c)[0]
-        if dep not in rv_packages and dep not in pkgbase_map[package['base']]:
-            print(f"<tr><td>{package['db']}</td><td>{pkgname}</td><td><font color=red>Dependency '{dep}' not satisfied.</font></td></tr>")
-            break
+    dep = missing_dep(package['base'])
+    if dep:
+        print(f"<tr><td>{package['db']}</td><td>{pkgname}</td><td><font color=red>Dependency '{dep}' not satisfied.</font></td></tr>")
     else:
         print(f"<tr><td>{package['db']}</td><td>{pkgname}</td><td>Leaf package, port it!</td></tr>")
 
