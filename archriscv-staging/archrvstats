@@ -17,7 +17,8 @@ for _db in core extra community; do
   echo "[$_db] $RV / $ARCH ($PERCENT%)" >> $_tmpfile
 done
 
-riscv-compare-version $_tmpdir $REPOROOT > $REPOROOT/.status/status.htm
+riscv-compare-version $_tmpdir $REPOROOT > $REPOROOT/.status/status.htm.new
+mv $REPOROOT/.status/status.htm{.new,}
 
 chmod 644 $_tmpfile
 mv $_tmpfile $REPOROOT/.status/status.txt
@@ -25,3 +26,4 @@ rm -r $_tmpdir
 
 cd $REPOROOT
 find . -name '*.tar.zst' -type f -printf "%T@ %AF %TT %p\n" | sort -k1nr | head -n 10 | cut -d " " -f 2-4 > .status/lastupdate.txt
+find . -name '*.log' -type f -printf "%T@ %AF %TT %p\n" | sort -k1nr | head -n 50 | cut -d " " -f 2-4 > .status/latestlogs.txt
