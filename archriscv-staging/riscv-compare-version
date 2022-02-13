@@ -79,7 +79,8 @@ for pkgname, package in x86_packages.items():
                 rvver = "-".join((rvver.split("-")[0], rvver.split("-")[1].split(".")[0]))
             if rvver == package["version"]:
                 continue
-            elif not glob.glob(f"{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}-*.log"):
+            elif not os.path.isfile(f"{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}.log") and \
+                 not glob.glob(f"{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}-*.log"):
                 outdated_logs |= pkgbase_map[package['base']]
                 continue
 
