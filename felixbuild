@@ -82,7 +82,7 @@ if [[ "$1" =~ riscv ]]; then
     msg "Applying RISC-V patches..."
     rsync -avzzP $RVPATCHREPO/$PKGNAME/ $BUILDHOST:packages/$PKGNAME/
     if [[ -e "$RVPATCHREPO/$PKGNAME/riscv64.patch" ]]; then
-      ssh $BUILDHOST "cd packages/$PKGNAME && patch -p0 -i riscv64.patch > $PKGPREFIX-riscv64-patch.log 2>&1" || exit 1
+      ssh $BUILDHOST "cd packages/$PKGNAME && patch -p0 -i riscv64.patch" || exit 1
       ARCH=$(ssh $BUILDHOST "cd packages/$PKGNAME; source PKGBUILD; echo \$arch")
     fi
   fi
@@ -117,8 +117,8 @@ else
 fi
 msg "Running $_cmd on remote host..."
 # ssh $_T $BUILDHOST "cd packages && rm -rf $PKGNAME/*.pkg.tar.*; bsdtar xvf ./$SRCPKG && cd $PKGNAME && flock ../build.lock $@" || exit 1
-ssh $_T $BUILDHOST "cd packages/$PKGNAME && rm -f *.pkg.tar.*; $_cmd" || exit 1
+stdoutisatty ssh $_T $BUILDHOST "cd packages/$PKGNAME && rm -f *.pkg.tar.*; $_cmd" || exit 1
 
 # === Sync back artifacts ===
 msg "Syncing back built packages..."
-scp $BUILDHOST:packages/$PKGNAME/*.pkg.tar.* ./ || exit 1
+rsync -avzzP $BUILDHOST:packages/$PKGNAME/*.pkg.tar.* ./ || exit 1
