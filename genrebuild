@@ -4,6 +4,7 @@ import colorlog
 from collections import defaultdict
 import networkx as nx
 import pyalpm
+import random
 
 # TODO: Automate this. The packages listed here depend on ghc/ghc-libs but don't have .so files.
 HASKELL_DO_NOT_EXPAND = {
@@ -144,52 +145,55 @@ for cycle in list(nx.algorithms.components.strongly_connected_components(G)):
     G.remove_nodes_from(cycle)
 
 
-result = []
-for pkg in nx.topological_sort(G):
-    if isinstance(pkg, str):
-        result.append(pkg)
-    else:
-        NG = nx.DiGraph()
-        NG.add_nodes_from(pkg)
-        for dep, pkgs in reverse_deps.items():
-            for _pkg in pkgs:
-                if _pkg in pkg and dep in pkg:
-                    NG.add_edge(dep, _pkg)
-        nocheck_pkg = set()
+def pass1(pkg):
+    NG = nx.DiGraph()
+    NG.add_nodes_from(pkg)
+    for dep, pkgs in reverse_deps.items():
+        for _pkg in pkgs:
+            if _pkg in pkg and dep in pkg:
+                NG.add_edge(dep, _pkg)
+    nocheck_pkg = set()
 
-        while nx.algorithms.components.number_strongly_connected_components(NG) != len(NG):
-            found = False
-            for node in NG:
-                if node in HASKELL_REAL_MAKEDEPEND:
-                    continue
-                for rdep in list(NG.successors(node)):
-                    if node not in package_db[rdep]["depends"]:
-                        logger.warning(f"Removing soft dep to solve circular dependency: {node} <- {rdep}")
-                        NG.remove_edge(node, rdep)
-                        nocheck_pkg.add(rdep)
-                        found = True
-                        break
-
-                if found:
+    while nx.algorithms.components.number_strongly_connected_components(NG) != len(NG):
+        found = False
+        while True:
+            node = random.choice(list(NG))
+            if node in HASKELL_REAL_MAKEDEPEND:
+                continue
+            for rdep in list(NG.successors(node)):
+                if node not in package_db[rdep]["depends"]:
+                    logger.warning(f"Removing soft dep to solve circular dependency: {node} <- {rdep}")
+                    NG.remove_edge(node, rdep)
+                    nocheck_pkg.add(rdep)
+                    found = True
                     break
 
-            if not found:
-                logger.error(f"Removing HARD dep to solve circular dependency:  {node} <- {rdep}")
-                NG.remove_edge(node, rdep)
-                nocheck_pkg.add(rdep)
+            if found:
+                break
 
-        pass1 = []
-        for _pkg in nx.topological_sort(NG):
-            if _pkg in nocheck_pkg:
-                pass1.append(_pkg + ":nocheck")
-            else:
-                pass1.append(_pkg)
-        result.extend(pass1)
-        logger.debug("Cycle Solver pass1: " + " ".join(pass1))
+        if not found:
+            logger.error(f"Removing HARD dep to solve circular dependency:  {node} <- {rdep}")
+            NG.remove_edge(node, rdep)
+            nocheck_pkg.add(rdep)
 
-        pass2 = []
-        broken_set = set()
-        nocheck_pkg_bak = nocheck_pkg
+    pass1 = []
+    for _pkg in nx.topological_sort(NG):
+        if _pkg in nocheck_pkg:
+            pass1.append(_pkg + ":nocheck")
+        else:
+            pass1.append(_pkg)
+    logger.debug("Cycle Solver pass1: " + " ".join(pass1))
+    return pass1, NG, nocheck_pkg
+
+def pass2(NG, nocheck_pkg):
+    best_pass2 = False
+    nocheck_pkg_bak = nocheck_pkg.copy()
+    # Try 3 times, use the most optimal result
+    pass2 = []
+    broken_set = set()
+    nocheck_pkg = nocheck_pkg_bak.copy()
+    for _ in range(3):
+        counter = 0
         while nocheck_pkg | broken_set:
             for pkg in nocheck_pkg | broken_set:
                 if not (package_db[pkg]["depends"] | package_db[pkg]["makedepends"] | package_db[pkg]["checkdepends"]) & broken_set:
@@ -199,7 +203,6 @@ for pkg in nx.topological_sort(G):
                         last_to_break = to_break
                         for _pkg in set(to_break):
                             to_break = to_break | set([rdep for rdep in reverse_deps[_pkg] if _pkg in package_db[rdep]["depends"] and rdep in NG])
-                    logger.debug(f"building {pkg} breaks {to_break}")
                     # if not to_break <= (nocheck_pkg | broken_set):
                     #     continue
                     pass2.append(pkg)
@@ -211,12 +214,34 @@ for pkg in nx.topological_sort(G):
                     break
             else:
                 # Deadend. Start over.
+                counter += 1
+                if counter > 20:
+                    logger.error("Cycle Solver pass2 unresolvable loop.")
+                    raise RuntimeError
                 logger.warning("Cycle Solver pass2 loop detected. Starting over...")
                 pass2 = []
                 broken_set = set()
-                nocheck_pkg = nocheck_pkg_bak
+                nocheck_pkg = nocheck_pkg_bak.copy()
 
-        result.extend(pass2)
-        logger.debug("Cycle Solver pass2: " + " ".join(pass2))
+        if best_pass2 is False or len(pass2) < len(best_pass2):
+            best_pass2 = pass2.copy()
+
+    logger.debug("Cycle Solver pass2: " + " ".join(best_pass2))
+    return best_pass2
+
+result = []
+for pkg in nx.topological_sort(G):
+    if isinstance(pkg, str):
+        result.append(pkg)
+    else:
+        while True:
+            _pass1, NG, nocheck_pkg = pass1(pkg)
+            try:
+                _pass2 = pass2(NG, nocheck_pkg)
+            except RuntimeError:
+                logger.warning("Cycle Solver retrying from pass1...")
+                continue
+            result.extend(_pass1 + _pass2)
+            break
 
 print(" ".join(result))
