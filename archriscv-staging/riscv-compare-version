@@ -87,18 +87,6 @@ for pkgname, package in x86_packages.items():
         print(f"<tr><td>{package['db']}</td><td>{package['base']}</td><td><a href='logs/{package['base']}/'><font color=red>FTBFS</font></a></td></tr>")
         broken_pkgs |= pkgbase_map[package['base']]
 
-    # Legacy logs
-    if os.path.exists(f"{REPOROOT}/.status/logs/{package['base']}.log"):
-        if pkgname in rv_packages:
-            rvver = rv_packages[pkgname]["version"]
-            if "." in rvver.split("-")[1]:
-                rvver = "-".join((rvver.split("-")[0], rvver.split("-")[1].split(".")[0]))
-            if rvver == package["version"]:
-                print(f"<tr><td>{package['db']}</td><td>{package['base']}</td><td><font color=yellow>Please delete obsolete <a href='logs/{package['base']}.log'>log file</a>!</font></td></tr>")
-                continue
-        broken_pkgs |= pkgbase_map[package['base']]
-        print(f"<tr><td>{package['db']}</td><td>{package['base']}</td><td><a href='logs/{package['base']}.log'><font color=red>FTBFS</a></font> (legacy)</a></td></tr>")
-
 def missing_dep(pkgbase):
     check_pkgs = set()
     for pkgname in pkgbase_map[pkgbase]:
