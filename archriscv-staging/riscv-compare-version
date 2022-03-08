@@ -84,8 +84,8 @@ for pkgname, package in x86_packages.items():
                 outdated_logs |= pkgbase_map[package['base']]
                 continue
 
-        print(f"<tr><td>{package['db']}</td><td>{package['base']}</td><td><a href='logs/{package['base']}/'><font color=red>FTBFS</font></a></td></tr>")
-        broken_pkgs |= pkgbase_map[package['base']]
+            print(f"<tr><td>{package['db']}</td><td>{package['base']}</td><td><a href='logs/{package['base']}/'><font color=red>FTBFS</font></a></td></tr>")
+            broken_pkgs |= pkgbase_map[package['base']]
 
 def missing_dep(pkgbase):
     check_pkgs = set()
