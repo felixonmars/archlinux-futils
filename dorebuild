@@ -1,0 +1,108 @@
+#!/usr/bin/python
+import argparse
+import asyncio
+import colorlog
+from collections import defaultdict
+import pyalpm
+
+parser = argparse.ArgumentParser(description='A simple rebuild scheduler')
+parser.add_argument('-d', '--db', nargs='*', default=["core", "extra", "community", "multilib"],
+                    help='Pacman sync db to consider. Defaulting to all stable dbs.')
+parser.add_argument('-m', '--mock', nargs='?', default=None,
+                    help='Mock build, do not actually run builds. set to a threshold (0-1, chance to succeed).')
+parser.add_argument('comment', nargs=1, help='Commit message')
+parser.add_argument('package', nargs='+', help='Packages to rebuild')
+args = parser.parse_args()
+
+logger = colorlog.getLogger()
+logger.setLevel(colorlog.DEBUG)
+
+handler = colorlog.StreamHandler()
+handler.setFormatter(colorlog.ColoredFormatter())
+logger.addHandler(handler)
+
+package_db = defaultdict(dict)
+handle = pyalpm.Handle(".", "/var/lib/pacman")
+
+for db in args.db:
+    db_handle = handle.register_syncdb(db, 0)
+    for package in db_handle.search(""):
+        for field in ("depends", "makedepends", "checkdepends", "arch"):
+            package_db[package.name][field] = getattr(package, field)
+
+for pkg in package_db:
+    package_db[pkg]["depends"] = {dep.split("=")[0].split(">")[0].split("<")[0] for dep in package_db[pkg]["depends"]}
+    package_db[pkg]["makedepends"] = {dep.split("=")[0].split(">")[0].split("<")[0] for dep in package_db[pkg]["makedepends"]}
+    package_db[pkg]["checkdepends"] = {dep.split("=")[0].split(">")[0].split("<")[0] for dep in package_db[pkg]["checkdepends"]}
+
+
+async def main():
+    ongoing_pkgs = set()
+    loop = asyncio.get_event_loop()
+    main.broken = False
+    main.next_try = []
+
+    async def run(*cmd):
+        if args.mock:
+            import random
+            await asyncio.sleep(random.random() * 3)
+            return random.random() > float(args.mock)
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT)
+        while True:
+            line = await proc.stdout.readline()
+            if line:
+                print(f'{cmd[-1]}:', line.decode("utf-8", "ignore"), end='')
+            else:
+                break
+        return await proc.wait()
+
+    async def rebuild_single(pkg):
+        if not main.broken:
+            logger.debug(f"Starting rebuild of {pkg}")
+            ret = await run("rebuild-one", args.comment[0], pkg)
+            if ret != 0:
+                logger.error(f"Failed rebuild of {pkg}! (ret: {ret})")
+                if main.broken is False:
+                    main.broken = [pkg]
+                else:
+                    main.broken.append(pkg)
+                main.next_try.append(pkg)
+            else:
+                logger.info(f"Finished rebuild of {pkg}")
+        else:
+            main.next_try.append(pkg)
+        ongoing_pkgs.remove(pkg)
+
+    for pkg in args.package:
+        pending = True
+        while pending:
+            for _pkg in ongoing_pkgs:
+                pkg_ = pkg
+                if pkg_.endswith(":nocheck"):
+                    pkg_ = pkg_[:-8]
+                if _pkg.endswith(":nocheck"):
+                    _pkg = _pkg[:-8]
+                if _pkg in package_db[pkg_]["depends"] | package_db[pkg_]["makedepends"] | package_db[pkg_]["checkdepends"] or \
+                   pkg_ in package_db[_pkg]["depends"] | package_db[_pkg]["makedepends"] | package_db[_pkg]["checkdepends"] or \
+                   _pkg == pkg_:
+                    break
+            else:
+                pending = False
+                ongoing_pkgs.add(pkg)
+                loop.create_task(rebuild_single(pkg))
+            if pending:
+                await asyncio.sleep(0.01)
+
+    while ongoing_pkgs:
+        await asyncio.sleep(0.1)
+
+    if main.broken:
+        logger.warning("Broken: " + " ".join(main.broken))
+        logger.warning("Next try: " + " ".join(main.next_try))
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
