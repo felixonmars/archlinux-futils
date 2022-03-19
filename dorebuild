@@ -10,6 +10,8 @@ parser.add_argument('-d', '--db', nargs='*', default=["core", "extra", "communit
                     help='Pacman sync db to consider. Defaulting to all stable dbs.')
 parser.add_argument('-m', '--mock', nargs='?', default=None,
                     help='Mock build, do not actually run builds. set to a threshold (0-1, chance to succeed).')
+parser.add_argument('-r', '--retry', action='store_true',
+                    help='Retry on failure. Note: will do svn revert!')
 parser.add_argument('comment', nargs=1, help='Commit message')
 parser.add_argument('package', nargs='+', help='Packages to rebuild')
 args = parser.parse_args()
@@ -65,11 +67,18 @@ async def main():
             ret = await run("rebuild-one", args.comment[0], pkg)
             if ret != 0:
                 logger.error(f"Failed rebuild of {pkg}! (ret: {ret})")
-                if main.broken is False:
-                    main.broken = [pkg]
+                if args.retry:
+                    retry_count = 0
+                    while await run("rebuild-one", "-r", args.comment[0], pkg):
+                        retry_count += 1
+                        logger.error(f"Failed rebuild of {pkg}! (ret: {ret}) retry: {retry_count}")
+                    logger.info(f"Finished rebuild of {pkg} retried: {retry_count}")
                 else:
-                    main.broken.append(pkg)
-                main.next_try.append(pkg)
+                    if main.broken is False:
+                        main.broken = [pkg]
+                    else:
+                        main.broken.append(pkg)
+                    main.next_try.append(pkg)
             else:
                 logger.info(f"Finished rebuild of {pkg}")
         else:
