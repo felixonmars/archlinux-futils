@@ -3,6 +3,7 @@ import argparse
 import asyncio
 import colorlog
 from collections import defaultdict
+import logging
 import pyalpm
 
 parser = argparse.ArgumentParser(description='A simple rebuild scheduler')
@@ -10,8 +11,10 @@ parser.add_argument('-d', '--db', nargs='*', default=["core", "extra", "communit
                     help='Pacman sync db to consider. Defaulting to all stable dbs.')
 parser.add_argument('-m', '--mock', nargs='?', default=None,
                     help='Mock build, do not actually run builds. set to a threshold (0-1, chance to succeed).')
-parser.add_argument('-r', '--retry', action='store_true',
-                    help='Retry on failure. Note: will do svn revert!')
+parser.add_argument('-r', '--retry', nargs='?', default=5,
+                    help='Maximum retry on failure (not implemented yet, set to 0 to disable retry). Default: 5')
+parser.add_argument('-l', '--log', nargs='?', default="dorebuild.log",
+                    help="Log filename. Default: dorebuild.log")
 parser.add_argument('comment', nargs=1, help='Commit message')
 parser.add_argument('package', nargs='+', help='Packages to rebuild')
 args = parser.parse_args()
@@ -19,9 +22,15 @@ args = parser.parse_args()
 logger = colorlog.getLogger()
 logger.setLevel(colorlog.DEBUG)
 
+formatter = colorlog.ColoredFormatter()
 handler = colorlog.StreamHandler()
-handler.setFormatter(colorlog.ColoredFormatter())
+handler.setFormatter(formatter)
 logger.addHandler(handler)
+
+if args.log:
+    fh = logging.FileHandler(args.log)
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
 
 package_db = defaultdict(dict)
 handle = pyalpm.Handle(".", "/var/lib/pacman")
@@ -44,7 +53,15 @@ async def main():
     main.broken = False
     main.next_try = []
 
+    async def status_report():
+        while True:
+            await asyncio.sleep(60)
+            logger.debug(f"ongoing_pkgs: {ongoing_pkgs}")
+
+    loop.create_task(status_report())
+
     async def run(*cmd):
+        _BUFFER_SIZE = 2 * 2 ** 20  # 2 MiB buffer!
         if args.mock:
             import random
             await asyncio.sleep(random.random() * 3)
@@ -52,11 +69,16 @@ async def main():
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT)
+            stderr=asyncio.subprocess.STDOUT,
+            limit=_BUFFER_SIZE)
         while True:
-            line = await proc.stdout.readline()
+            try:
+                line = await proc.stdout.readline()
+            except ValueError:
+                # Underlying asyncio.exceptions.LimitOverrunError
+                line = await proc.stdout.read(_BUFFER_SIZE)
             if line:
-                print(f'{cmd[-1]}:', line.decode("utf-8", "ignore"), end='')
+                logger.debug(f'{cmd[-1]}: ' + line.decode("utf-8", "ignore").rstrip('\n'))
             else:
                 break
         return await proc.wait()
