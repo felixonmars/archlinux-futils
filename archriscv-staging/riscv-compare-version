@@ -79,13 +79,13 @@ for pkgname, package in x86_packages.items():
                 rvver = "-".join((rvver.split("-")[0], rvver.split("-")[1].split(".")[0]))
             if rvver == package["version"]:
                 continue
-            elif not os.path.isfile(f"{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}.log") and \
-                 not glob.glob(f"{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}-*.log"):
-                outdated_logs |= pkgbase_map[package['base']]
-                continue
+        if not os.path.isfile(f"{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}.log") and \
+           not glob.glob(f"{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}-*.log"):
+            outdated_logs |= pkgbase_map[package['base']]
+            continue
 
-            print(f"<tr><td>{package['db']}</td><td>{package['base']}</td><td><a href='logs/{package['base']}/'><font color=red>FTBFS</font></a></td></tr>")
-            broken_pkgs |= pkgbase_map[package['base']]
+        print(f"<tr><td>{package['db']}</td><td>{package['base']}</td><td><a href='logs/{package['base']}/'><font color=red>FTBFS</font></a></td></tr>")
+        broken_pkgs |= pkgbase_map[package['base']]
 
 def missing_dep(pkgbase):
     check_pkgs = set()
@@ -129,7 +129,10 @@ for pkgname, package in x86_packages.items():
     if dep:
         print(f"<tr><td>{package['db']}</td><td>{pkgname}</td><td><font color=red>Dependency '{dep}' not satisfied.</font></td></tr>")
     else:
-        print(f"<tr><td>{package['db']}</td><td>{pkgname}</td><td>Leaf package, port it!</td></tr>")
+        verstr = "Leaf package, port it!"
+        if pkgname in outdated_logs:
+            verstr += f" <a href='logs/{package['base']}/'><font color=yellow>(Outdated FTBFS Logs)</font></a>"
+        print(f"<tr><td>{package['db']}</td><td>{pkgname}</td><td>{verstr}</td></tr>")
 
 for pkgname, package in rv_packages.items():
     if pkgname not in x86_packages:
