@@ -1,0 +1,22 @@
+#!/usr/bin/python
+import os
+import pyalpm
+import sys
+import tempfile
+
+
+db_fullpath = sys.argv[1]
+db_filename = db_fullpath.split("/")[-1]
+db = db_filename.split('.')[0]
+
+package = sys.argv[2]
+
+field = sys.argv[3]
+
+
+with tempfile.TemporaryDirectory() as d:
+    os.mkdir(d + "/sync")
+    os.symlink(db_fullpath, f"{d}/sync/{db_filename}")
+    handle = pyalpm.Handle(".", d)
+    db_handle = handle.register_syncdb(db, 0)
+    print(getattr(db_handle.get_pkg(package), field))
