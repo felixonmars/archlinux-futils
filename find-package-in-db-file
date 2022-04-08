@@ -16,7 +16,7 @@ field = sys.argv[3]
 
 with tempfile.TemporaryDirectory() as d:
     os.mkdir(d + "/sync")
-    os.symlink(db_fullpath, f"{d}/sync/{db_filename}")
+    os.symlink(os.path.abspath(db_fullpath), f"{d}/sync/{db_filename}")
     handle = pyalpm.Handle(".", d)
     db_handle = handle.register_syncdb(db, 0)
     print(getattr(db_handle.get_pkg(package), field))
