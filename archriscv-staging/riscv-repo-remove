@@ -1,0 +1,19 @@
+#!/bin/bash
+
+. /usr/local/bin/riscvenv
+
+cd $RVREPO/$1/
+
+VERSION=$(find-package-in-db-file $1.db $2 version)
+
+flock ../$1.lck repo-remove $1.db.tar.gz $2
+
+if [[ -e "$2-$VERSION-riscv64.pkg.tar.zst" ]]; then
+    rm -v "$2-$VERSION-riscv64.pkg.tar.zst"{,.sig}
+elif [[ -e "$2-$VERSION-any.pkg.tar.zst" ]]; then
+    rm -v "$2-$VERSION-any.pkg.tar.zst"{,.sig}
+else
+    echo "Failed to clean up package file. Do it manually!"
+fi
+
+flock ../$1.lck rsync -avP --delete $RVREPO/$1/ $TIER0SERVER/repo/$1/

@@ -1,0 +1,10 @@
+#!/bin/bash
+
+. /usr/local/bin/riscvenv
+
+cp $2 $RVREPO/$1/
+cd $RVREPO/$1/
+[[ -e $2.sig ]] && rm $2.sig
+gpg --detach-sign $2
+flock ../$1.lck repo-add -R $1.db.tar.gz $2
+flock ../$1.lck rsync -avP --delete $RVREPO/$1/ $TIER0SERVER/repo/$1/
