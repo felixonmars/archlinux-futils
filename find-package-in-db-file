@@ -19,4 +19,7 @@ with tempfile.TemporaryDirectory() as d:
     os.symlink(os.path.abspath(db_fullpath), f"{d}/sync/{db_filename}")
     handle = pyalpm.Handle(".", d)
     db_handle = handle.register_syncdb(db, 0)
-    print(getattr(db_handle.get_pkg(package), field))
+    pkg = db_handle.get_pkg(package)
+    if pkg is None:
+        sys.exit("Package not found in repo.")
+    print(getattr(pkg, field))
