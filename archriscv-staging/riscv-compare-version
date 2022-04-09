@@ -69,9 +69,6 @@ def x86_history_link(package):
 broken_pkgs = set()
 outdated_logs = set()
 for pkgname, package in x86_packages.items():
-    if pkgname in broken_pkgs:
-        continue
-
     if os.path.exists(f"{REPOROOT}/.status/logs/{package['base']}"):
         if pkgname in rv_packages:
             rvver = rv_packages[pkgname]["version"]
@@ -79,13 +76,23 @@ for pkgname, package in x86_packages.items():
                 rvver = "-".join((rvver.split("-")[0], rvver.split("-")[1].split(".")[0]))
             if rvver == package["version"]:
                 continue
-        if not os.path.isfile(f"{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}.log") and \
-           not glob.glob(f"{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}-*.log"):
+
+        ftbfs_link = f"logs/{package['base']}/"
+        if os.path.isfile(f"{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}.log"):
+            ftbfs_link = f"logs/{package['base']}/{package['base']}-{package['version']}.log"
+        elif glob.glob(f"{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}-*.log"):
+            # TODO: mark outdated
+            pass
+        else:
             outdated_logs |= pkgbase_map[package['base']]
             continue
 
-        print(f"<tr><td>{package['db']}</td><td>{package['base']}</td><td><a href='logs/{package['base']}/'><font color=red>FTBFS</font></a></td></tr>")
-        broken_pkgs |= pkgbase_map[package['base']]
+        pkgname_str = pkgname
+        if pkgname != package['base']:
+            pkgname_str += f" ({package['base']})"
+
+        print(f"<tr><td>{package['db']}</td><td>{pkgname_str}</td><td><a href='{ftbfs_link}'><font color=red>FTBFS</font></a></td></tr>")
+        broken_pkgs.add(pkgname)
 
 def missing_dep(pkgbase):
     check_pkgs = set()
@@ -100,12 +107,12 @@ def missing_dep(pkgbase):
 
     return False
 
-for package in sorted(version_mismatch):
-    if package in broken_pkgs:
+for pkgname in sorted(version_mismatch):
+    if pkgname in broken_pkgs:
         continue
-    pkgbase = x86_packages[package]['base']
-    rvver = rv_packages[package]["version"]
-    x86ver = x86_packages[package]['version']
+    pkgbase = x86_packages[pkgname]['base']
+    rvver = rv_packages[pkgname]["version"]
+    x86ver = x86_packages[pkgname]['version']
     cmp = pyalpm.vercmp(rvver, x86ver)
     if cmp < 0:
         verstr = f"<font color=green>{rvver} -> {x86ver}</font>"
@@ -117,22 +124,31 @@ for package in sorted(version_mismatch):
     if dep:
         verstr += f" <font color=red>Dependency '{dep}' not satisfied.</font>"
 
-    if package in outdated_logs:
+    if pkgname in outdated_logs:
         verstr += f" <a href='logs/{pkgbase}/'><font color=yellow>(Outdated FTBFS Logs)</font></a>"
 
-    print(f"<tr><td>{x86_packages[package]['db']}</td><td>{package}</td><td>{verstr}</td></tr>")
+    pkgname_str = pkgname
+    if pkgname != pkgbase:
+        pkgname_str += f" ({pkgbase})"
+
+    print(f"<tr><td>{x86_packages[pkgname]['db']}</td><td>{pkgname_str}</td><td>{verstr}</td></tr>")
 
 for pkgname, package in x86_packages.items():
     if pkgname in rv_packages or pkgname in broken_pkgs:
         continue
+
+    pkgname_str = pkgname
+    if pkgname != package['base']:
+        pkgname_str += f" ({package['base']})"
+
     dep = missing_dep(package['base'])
     if dep:
-        print(f"<tr><td>{package['db']}</td><td>{pkgname}</td><td><font color=red>Dependency '{dep}' not satisfied.</font></td></tr>")
+        print(f"<tr><td>{package['db']}</td><td>{pkgname_str}</td><td><font color=red>Dependency '{dep}' not satisfied.</font></td></tr>")
     else:
         verstr = "Leaf package, port it!"
         if pkgname in outdated_logs:
             verstr += f" <a href='logs/{package['base']}/'><font color=yellow>(Outdated FTBFS Logs)</font></a>"
-        print(f"<tr><td>{package['db']}</td><td>{pkgname}</td><td>{verstr}</td></tr>")
+        print(f"<tr><td>{package['db']}</td><td>{pkgname_str}</td><td>{verstr}</td></tr>")
 
 for pkgname, package in rv_packages.items():
     if pkgname not in x86_packages:
