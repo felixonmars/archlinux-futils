@@ -59,9 +59,11 @@ for pkgname, package in rv_packages.copy().items():
     for _package in package["provides"]:
         rv_provides.add(_package.split("=")[0])
 
-def x86_history_link(package):
-    if package in x86_packages:
-        repo = 'community' if x86_packages[package]["db"] == 'community' else 'packages'
+def x86_history_link(package, db):
+    if db in ["community"]:
+        repo = 'community'
+    elif db in ["core", "extra"]:
+        repo = 'packages'
     else:
         repo = 'unsupported'
     return f"https://github.com/archlinux/svntogit-{repo}/commits/packages/{package}/trunk"
@@ -110,6 +112,7 @@ def missing_dep(pkgbase):
 for pkgname in sorted(version_mismatch):
     if pkgname in broken_pkgs:
         continue
+    db = x86_packages[pkgname]['db']
     pkgbase = x86_packages[pkgname]['base']
     rvver = rv_packages[pkgname]["version"]
     x86ver = x86_packages[pkgname]['version']
@@ -118,7 +121,7 @@ for pkgname in sorted(version_mismatch):
         verstr = f"<font color=green>{rvver} -> {x86ver}</font>"
     elif cmp > 0:
         verstr = f"<font color=yellow>{rvver} <- {x86ver}</font>"
-    verstr += f" <a href={x86_history_link(pkgbase)}>Changes</a>"
+    verstr += f" <a href={x86_history_link(pkgbase, db)}>Changes</a>"
 
     dep = missing_dep(pkgbase)
     if dep:
@@ -131,7 +134,7 @@ for pkgname in sorted(version_mismatch):
     if pkgname != pkgbase:
         pkgname_str += f" ({pkgbase})"
 
-    print(f"<tr><td>{x86_packages[pkgname]['db']}</td><td>{pkgname_str}</td><td>{verstr}</td></tr>")
+    print(f"<tr><td>{db}</td><td>{pkgname_str}</td><td>{verstr}</td></tr>")
 
 for pkgname, package in x86_packages.items():
     if pkgname in rv_packages or pkgname in broken_pkgs:
