@@ -1,6 +1,7 @@
 #!/bin/bash
 
 REPOROOT=/var/www/archlinuxriscv
+PATCHREPO=/var/www/archriscv-packages
 
 _tmpfile=$(mktemp)
 _tmpdir=$(mktemp -d)
@@ -17,7 +18,7 @@ for _db in core extra community; do
   echo "[$_db] $RV / $ARCH ($PERCENT%)" >> $_tmpfile
 done
 
-riscv-compare-version $_tmpdir $REPOROOT > $REPOROOT/.status/status.htm.new
+riscv-compare-version $_tmpdir $REPOROOT $PATCHREPO > $REPOROOT/.status/status.htm.new
 mv $REPOROOT/.status/status.htm{.new,}
 
 chmod 644 $_tmpfile

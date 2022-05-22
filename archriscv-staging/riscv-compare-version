@@ -8,6 +8,7 @@ import sys
 
 RVDBDIR = sys.argv[1]
 REPOROOT = sys.argv[2]
+PATCHREPO = sys.argv[3]
 
 x86_handle = pyalpm.Handle(".", "/var/lib/pacman")
 rv_handle = pyalpm.Handle(".", f"{RVDBDIR}")
@@ -20,6 +21,15 @@ rv_provides = set()
 
 version_mismatch = set()
 db_mismatch = set()
+
+blacklist = set()
+
+with open(PATCHREPO + "/blacklist.txt") as f:
+    for pkg in f:
+        pkg = pkg.rstrip("\n")
+        if pkg.startswith("#") or not pkg:
+            continue
+        blacklist.add(pkg)
 
 print("""
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -137,7 +147,7 @@ for pkgname in sorted(version_mismatch):
     print(f"<tr><td>{db}</td><td>{pkgname_str}</td><td>{verstr}</td></tr>")
 
 for pkgname, package in x86_packages.items():
-    if pkgname in rv_packages or pkgname in broken_pkgs:
+    if pkgname in rv_packages or pkgname in broken_pkgs or pkgname in blacklist:
         continue
 
     pkgname_str = pkgname
