@@ -5,6 +5,7 @@ import glob
 import os
 import pyalpm
 import sys
+import time
 
 RVDBDIR = sys.argv[1]
 REPOROOT = sys.argv[2]
@@ -80,6 +81,7 @@ def x86_history_link(package, db):
 
 broken_pkgs = set()
 outdated_logs = set()
+old_log_threshold = time.time() - 30 * 24 * 60 * 60
 for pkgname, package in x86_packages.items():
     if os.path.exists(f"{REPOROOT}/.status/logs/{package['base']}"):
         if pkgname in rv_packages:
@@ -90,11 +92,13 @@ for pkgname, package in x86_packages.items():
                 continue
 
         ftbfs_link = f"logs/{package['base']}/"
+        old_log_mark = ""
         if os.path.isfile(f"{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}.log"):
             ftbfs_link = f"logs/{package['base']}/{package['base']}-{package['version']}.log"
+            if os.path.getmtime(f"{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}.log") < old_log_threshold:
+                old_log_mark = " <small>(old)</small>"
         elif glob.glob(f"{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}-*.log"):
-            # TODO: mark outdated
-            pass
+            old_log_mark = " <small>(old format)</small>"
         else:
             outdated_logs |= pkgbase_map[package['base']]
             continue
@@ -103,7 +107,7 @@ for pkgname, package in x86_packages.items():
         if pkgname != package['base']:
             pkgname_str += f" ({package['base']})"
 
-        print(f"<tr><td>{package['db']}</td><td>{pkgname_str}</td><td><a href='{ftbfs_link}'><font color=red>FTBFS</font></a></td></tr>")
+        print(f"<tr><td>{package['db']}</td><td>{pkgname_str}</td><td><a href='{ftbfs_link}'><font color=red>FTBFS</font></a>{old_log_mark}</td></tr>")
         broken_pkgs.add(pkgname)
 
 def missing_dep(pkgbase):
