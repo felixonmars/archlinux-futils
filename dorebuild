@@ -15,6 +15,8 @@ parser.add_argument('-r', '--retry', nargs='?', default=5,
                     help='Maximum retry on failure (not implemented yet, set to 0 to disable retry). Default: 5')
 parser.add_argument('-l', '--log', nargs='?', default="dorebuild.log",
                     help="Log filename. Default: dorebuild.log")
+parser.add_argument('-c', '--command', nargs='?', default="rebuild-one",
+                    help='Build command to use. Default: rebuild-one')
 parser.add_argument('comment', nargs=1, help='Commit message')
 parser.add_argument('package', nargs='+', help='Packages to rebuild')
 args = parser.parse_args()
@@ -86,12 +88,12 @@ async def main():
     async def rebuild_single(pkg):
         if not main.broken:
             logger.debug(f"Starting rebuild of {pkg}")
-            ret = await run("rebuild-one", args.comment[0], pkg)
+            ret = await run(args.command, args.comment[0], pkg)
             if ret != 0:
                 logger.error(f"Failed rebuild of {pkg}! (ret: {ret})")
                 if args.retry:
                     retry_count = 0
-                    while await run("rebuild-one", "-r", args.comment[0], pkg):
+                    while await run("env", "BUMP_PKGREL=0", args.command, args.comment[0], pkg):
                         retry_count += 1
                         logger.error(f"Failed rebuild of {pkg}! (ret: {ret}) retry: {retry_count}")
                     logger.info(f"Finished rebuild of {pkg} retried: {retry_count}")
@@ -116,6 +118,13 @@ async def main():
                     pkg_ = pkg_[:-8]
                 if _pkg.endswith(":nocheck"):
                     _pkg = _pkg[:-8]
+
+                # New package, no enough info to check dependencies
+                if pkg_ not in package_db:
+                    break
+                if _pkg not in package_db:
+                    break
+
                 if _pkg in package_db[pkg_]["depends"] | package_db[pkg_]["makedepends"] | package_db[pkg_]["checkdepends"] or \
                    pkg_ in package_db[_pkg]["depends"] | package_db[_pkg]["makedepends"] | package_db[_pkg]["checkdepends"] or \
                    _pkg == pkg_:
@@ -124,8 +133,8 @@ async def main():
                 pending = False
                 ongoing_pkgs.add(pkg)
                 loop.create_task(rebuild_single(pkg))
-            if pending:
-                await asyncio.sleep(0.01)
+
+            await asyncio.sleep(0.01)
 
     while ongoing_pkgs:
         await asyncio.sleep(0.1)
