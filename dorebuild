@@ -88,23 +88,24 @@ async def main():
     async def rebuild_single(pkg):
         if not main.broken:
             logger.debug(f"Starting rebuild of {pkg}")
-            ret = await run(args.command, args.comment[0], pkg)
-            if ret != 0:
-                logger.error(f"Failed rebuild of {pkg}! (ret: {ret})")
+            retry_count = 0
+            while ret := await run(args.command, args.comment[0], pkg):
                 if args.retry:
-                    retry_count = 0
-                    while await run("env", "BUMP_PKGREL=0", args.command, args.comment[0], pkg):
-                        retry_count += 1
-                        logger.error(f"Failed rebuild of {pkg}! (ret: {ret}) retry: {retry_count}")
-                    logger.info(f"Finished rebuild of {pkg} retried: {retry_count}")
+                    logger.error(f"Failed rebuild of {pkg}! (ret: {ret}) retry: {retry_count}")
+                    retry_count += 1
                 else:
+                    logger.error(f"Failed rebuild of {pkg}! (ret: {ret})")
                     if main.broken is False:
                         main.broken = [pkg]
                     else:
                         main.broken.append(pkg)
                     main.next_try.append(pkg)
+                    break
             else:
-                logger.info(f"Finished rebuild of {pkg}")
+                if retry_count:
+                    logger.info(f"Finished rebuild of {pkg} retried: {retry_count}")
+                else:
+                    logger.info(f"Finished rebuild of {pkg}")
         else:
             main.next_try.append(pkg)
         ongoing_pkgs.remove(pkg)
