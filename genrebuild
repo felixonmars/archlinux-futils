@@ -39,6 +39,8 @@ parser.add_argument('-c', '--expand-check', action="store_true",
                                             help='Expand all reverse check deps')
 parser.add_argument('-d', '--db', nargs='*', default=["core", "extra", "community", "multilib"],
                                              help='Pacman sync db to consider. Defaulting to all stable dbs.')
+parser.add_argument('--dbpath', nargs='?', default="/var/lib/pacman",
+                                           help='Pacman sync db location. Default: /var/lib/pacman')
 parser.add_argument('package', nargs='+', help='Packages to rebuild')
 args = parser.parse_args()
 
@@ -60,7 +62,7 @@ package_db = defaultdict(dict)
 pkglist = rebuild_list.copy()
 reverse_deps = defaultdict(set)
 G = nx.DiGraph()
-handle = pyalpm.Handle(".", "/var/lib/pacman")
+handle = pyalpm.Handle(".", args.dbpath)
 
 for db in args.db:
     db_handle = handle.register_syncdb(db, 0)
