@@ -2,9 +2,27 @@
 
 . /usr/local/bin/riscvenv
 
-cp $2 $RVREPO/$1/
-cd $RVREPO/$1/
-[[ -e $2.sig ]] && rm $2.sig
-gpg --detach-sign $2
-flock ../$1.lck repo-add -R $1.db.tar.gz $2
-flock ../$1.lck rsync -avP --delete $RVREPO/$1/ $TIER0SERVER/repo/$1/
+REPO=$1
+PKG=$2
+
+if [[ "$REPO" == *-debug ]]; then
+    _remote_path=$TIER0ARCHIVEPATH
+else
+    _remote_path=$TIER0PATH
+fi
+
+# cp $PKG $RVREPO/$REPO/
+# cd $RVREPO/$REPO/
+# [[ -e $PKG.sig ]] && rm $PKG.sig
+# gpg --detach-sign $PKG
+
+WORKDIR=$(mktemp -d)
+
+cp $PKG $WORKDIR/
+cd $WORKDIR
+[[ -e $PKG.sig ]] && rm $PKG.sig
+gpg --detach-sign $PKG
+
+rsync -avP ./$PKG{,.sig} $TIER0SERVER:$_remote_path/repo/$REPO/
+ssh -t $TIER0SERVER "cd $_remote_path/repo/$REPO/; flock /tmp/riscv-repo-$REPO.lck repo-add -R $REPO.db.tar.gz $PKG"
+# flock ../$REPO.lck rsync -avP --delete $RVREPO/$REPO/ $TIER0SERVER/repo/$REPO/

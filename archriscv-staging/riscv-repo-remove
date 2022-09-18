@@ -2,18 +2,19 @@
 
 . /usr/local/bin/riscvenv
 
-cd $RVREPO/$1/
+REPO=$1
+PKG=$2
 
-VERSION=$(find-package-in-db-file $1.db $2 version)
+VERSION=$(ssh $TIER0SERVER find-package-in-db-file $TIER0PATH/repo/$REPO/$REPO.db $PKG version)
 
-flock ../$1.lck repo-remove $1.db.tar.gz $2
+ssh -t $TIER0SERVER "cd $TIER0PATH/repo/$REPO/; flock /tmp/riscv-repo-$REPO.lck repo-remove $REPO.db.tar.gz $PKG"
 
-if [[ -e "$2-$VERSION-riscv64.pkg.tar.zst" ]]; then
-    rm -v "$2-$VERSION-riscv64.pkg.tar.zst"{,.sig}
-elif [[ -e "$2-$VERSION-any.pkg.tar.zst" ]]; then
-    rm -v "$2-$VERSION-any.pkg.tar.zst"{,.sig}
+if ssh $TIER0SERVER [[ -e "$TIER0PATH/repo/$REPO/$PKG-$VERSION-riscv64.pkg.tar.zst" ]]; then
+    ssh $TIER0SERVER rm -v "$TIER0PATH/repo/$REPO/$PKG-$VERSION-riscv64.pkg.tar.zst"{,.sig}
+elif ssh $TIER0SERVER [[ -e "$TIER0PATH/repo/$REPO/$PKG-$VERSION-any.pkg.tar.zst" ]]; then
+    ssh $TIER0SERVER rm -v "$TIER0PATH/repo/$REPO/$PKG-$VERSION-any.pkg.tar.zst"{,.sig}
 else
     echo "Failed to clean up package file. Do it manually!"
 fi
 
-flock ../$1.lck rsync -avP --delete $RVREPO/$1/ $TIER0SERVER/repo/$1/
+# flock ../$1.lck rsync -avP --delete $RVREPO/$1/ $TIER0SERVER/repo/$1/
