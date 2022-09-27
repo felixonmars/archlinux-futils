@@ -57,7 +57,7 @@ ARCH=$(source PKGBUILD; echo $arch)
 msg "Checking for remote environment..."
 ssh $BUILDHOST "mkdir -p packages; test -e .makepkg.conf" || exit 1
 msg "Syncing package to remote host..."
-rsync -avzzP ./ $BUILDHOST:packages/$PKGNAME/ --exclude=*.src.tar* --exclude=*.pkg.tar* --exclude=src/ --exclude=pkg/ --exclude=.git/
+rsync -avzzP ./ $BUILDHOST:packages/$PKGNAME/ --exclude=*.src.tar* --exclude=*.pkg.tar* --exclude=src/ --exclude=pkg/ --exclude=.git/ || exit 1
 
 # === Handle validpgpkeys ===
 if [[ -n "$(. PKGBUILD; echo $validpgpkeys)" && ! "$_cmd" == *"--skippgpcheck"* ]]; then
@@ -114,14 +114,8 @@ if [[ "$1" =~ riscv ]]; then
 fi
 
 # === Build the package ===
-if [[ -t 2 ]]; then
-    _T="-t"
-else
-    _T=""
-fi
 msg "Running $_cmd on remote host..."
-# ssh $_T $BUILDHOST "cd packages && rm -rf $PKGNAME/*.pkg.tar.*; bsdtar xvf ./$SRCPKG && cd $PKGNAME && flock ../build.lock $@" || exit 1
-stdoutisatty ssh $_T $BUILDHOST "cd packages/$PKGNAME && rm -f *.pkg.tar.*; $_cmd" || exit 1
+ssh -tt $BUILDHOST "cd packages/$PKGNAME && rm -f *.pkg.tar.*; $_cmd" || exit 1
 
 # === Sync back artifacts ===
 msg "Syncing back built packages..."
