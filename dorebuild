@@ -5,6 +5,8 @@ import colorlog
 from collections import defaultdict
 import logging
 import pyalpm
+import signal
+import sys
 
 parser = argparse.ArgumentParser(description='A simple rebuild scheduler')
 parser.add_argument('-d', '--db', nargs='*', default=["core", "extra", "community", "multilib"],
@@ -68,22 +70,30 @@ async def main():
             import random
             await asyncio.sleep(random.random() * 3)
             return random.random() > float(args.mock)
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            limit=_BUFFER_SIZE)
-        while True:
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                limit=_BUFFER_SIZE)
+            while True:
+                try:
+                    line = await proc.stdout.readline()
+                except ValueError:
+                    # Underlying asyncio.exceptions.LimitOverrunError
+                    line = await proc.stdout.read(_BUFFER_SIZE)
+                if line:
+                    logger.debug(f'{cmd[-1]}: ' + line.decode("utf-8", "ignore").rstrip('\n'))
+                else:
+                    break
+            return await proc.wait()
+        finally:
             try:
-                line = await proc.stdout.readline()
-            except ValueError:
-                # Underlying asyncio.exceptions.LimitOverrunError
-                line = await proc.stdout.read(_BUFFER_SIZE)
-            if line:
-                logger.debug(f'{cmd[-1]}: ' + line.decode("utf-8", "ignore").rstrip('\n'))
-            else:
-                break
-        return await proc.wait()
+                proc.terminate()
+            except:
+                pass
 
     async def rebuild_single(pkg):
         if not main.broken:
@@ -110,6 +120,13 @@ async def main():
             main.next_try.append(pkg)
         ongoing_pkgs.remove(pkg)
 
+    def handler(*args, **kwargs):
+        logger.error("Received SIGINT, exiting...")
+        logger.warning("Ongoing packages: " + ", ".join(ongoing_pkgs))
+        sys.exit(1)
+
+    signal.signal(signal.SIGINT, handler)
+
     for pkg in args.package:
         pending = True
         while pending:
@@ -132,6 +149,10 @@ async def main():
                     break
             else:
                 pending = False
+
+                while len(ongoing_pkgs) > 10:
+                    await asyncio.sleep(0.1)
+
                 ongoing_pkgs.add(pkg)
                 loop.create_task(rebuild_single(pkg))
 
@@ -143,7 +164,6 @@ async def main():
     if main.broken:
         logger.warning("Broken: " + " ".join(main.broken))
         logger.warning("Next try: " + " ".join(main.next_try))
-
 
 if __name__ == "__main__":
     asyncio.run(main())
