@@ -14,7 +14,7 @@ parser.add_argument('-d', '--db', nargs='*', default=["core", "extra", "communit
 parser.add_argument('-m', '--mock', nargs='?', default=None,
                     help='Mock build, do not actually run builds. set to a threshold (0-1, chance to succeed).')
 parser.add_argument('-r', '--retry', nargs='?', default=5,
-                    help='Maximum retry on failure (not implemented yet, set to 0 to disable retry). Default: 5')
+                    help='Maximum retry on failure, set to 0 to disable retry. Default: 5')
 parser.add_argument('-l', '--log', nargs='?', default="dorebuild.log",
                     help="Log filename. Default: dorebuild.log")
 parser.add_argument('-c', '--command', nargs='?', default="rebuild-one",
