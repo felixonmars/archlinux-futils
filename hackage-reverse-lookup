@@ -1,35 +1,40 @@
-#!/usr/bin/python
-import pyalpm
-import requests
-import sys
+#!/usr/bin/ruby
+require 'json'
+require 'open-uri'
+require 'pycall/import'
+require 'set'
 
-pkg = sys.argv[1]
-name_preset = requests.get("https://github.com/berberman/arch-hs/raw/master/data/NAME_PRESET.json").json()
-reversed_name_preset = {v: k for k, v in name_preset.items()}
+include PyCall::Import
 
-archpkg = reversed_name_preset[pkg] if pkg in reversed_name_preset else f"haskell-{pkg}"
+pyimport :pyalpm
 
-handle = pyalpm.Handle(".", "/var/lib/pacman")
+pkg = ARGV[0]
+name_preset = JSON.load(URI.open("https://github.com/berberman/arch-hs/raw/master/data/NAME_PRESET.json"))
 
-rdeps = set()
+archpkg = name_preset.key(pkg) || "haskell-#{pkg}"
 
-for db in ["community"]:
+handle = pyalpm.Handle.new(".", "/var/lib/pacman")
+
+rdeps = Set[]
+
+["community"].each { |db|
     db_handle = handle.register_syncdb(db, 0)
-    for package in db_handle.search(""):
-        for field in ("depends", "makedepends", "checkdepends"):
-            if archpkg in getattr(package, field):
-                rdeps.add((package.name, package.version.split("-")[0]))
+    db_handle.search("").each { |package|
+        ["depends", "makedepends", "checkdepends"].each { |field|
+            rdeps << [package.name, package.version.split("-")[0]] if package.send(field).include? archpkg
+        }
+    }
+}
 
-for rdep, ver in rdeps:
-    print(f"Extracting {rdep}...")
-    hackage_name = name_preset[rdep] if rdep in name_preset else rdep[8:]
-    cabal = requests.get(f"https://hackage.haskell.org/package/{hackage_name}-{ver}/revision/0.cabal").text
-    for line in cabal.splitlines():
-        if pkg in line:
-            print(line)
-        # if line.strip().startswith("build-depends:"):
-        #     for dep in line.split(":")[1].split(","):
-        #         dep = dep.strip()
-        #         if dep.startswith("base"):
-        #             continue
-        #         print(dep.split(" ")[0])
+rdeps.each { |rdep, ver|
+    puts "Extracting #{rdep}..."
+    hackage_name = name_preset[rdep] || rdep[8..-1]
+    begin
+        cabal = URI.open("https://hackage.haskell.org/package/#{hackage_name}-#{ver}/revision/0.cabal").readlines
+        cabal.each { |line|
+            puts line if line.include? pkg
+        }
+    rescue OpenURI::HTTPError
+        puts "Failed to fetch #{hackage_name}-#{ver}, ignoring..."
+    end
+}
