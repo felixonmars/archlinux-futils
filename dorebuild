@@ -19,6 +19,8 @@ parser.add_argument('-l', '--log', nargs='?', default="dorebuild.log",
                     help="Log filename. Default: dorebuild.log")
 parser.add_argument('-c', '--command', nargs='?', default="rebuild-one",
                     help='Build command to use. Default: rebuild-one')
+parser.add_argument('-j', '--jobs', nargs='?', default="10",
+                    help='Concurrent jobs limit. Default: 10')
 parser.add_argument('comment', nargs=1, help='Commit message')
 parser.add_argument('package', nargs='+', help='Packages to rebuild')
 args = parser.parse_args()
@@ -100,7 +102,7 @@ async def main():
             logger.debug(f"Starting rebuild of {pkg}")
             retry_count = 0
             while ret := await run(args.command, args.comment[0], pkg):
-                if args.retry:
+                if int(args.retry) and retry_count < int(args.retry):
                     logger.error(f"Failed rebuild of {pkg}! (ret: {ret}) retry: {retry_count}")
                     retry_count += 1
                 else:
@@ -150,7 +152,7 @@ async def main():
             else:
                 pending = False
 
-                while len(ongoing_pkgs) > 10:
+                while len(ongoing_pkgs) > int(args.jobs):
                     await asyncio.sleep(0.1)
 
                 ongoing_pkgs.add(pkg)
