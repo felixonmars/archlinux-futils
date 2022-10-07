@@ -31,6 +31,6 @@ rdeps.each { |rdep, ver|
     cabal = HTTP.get("https://hackage.haskell.org/package/#{hackage_name}-#{ver}/revision/0.cabal")
     puts "Failed to fetch #{hackage_name}-#{ver}, ignoring..." or next if !cabal.status.success?
     cabal.to_s.each_line { |line|
-        puts line if line.include? pkg
+        puts line if line =~ /[^\w\/\-`]#{pkg}[^\w\/\-`]/
     }
 }
