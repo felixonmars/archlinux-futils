@@ -13,7 +13,7 @@
 # - Set /etc/pacman.d/mirrorlist to this redirector:
 # Server = http://127.0.0.1:4567/$repo/os/$arch
 
-require 'faraday'
+require 'http'
 require 'sinatra'
 
 mirrors = File.readlines("/etc/pacman.d/mirrorlist-accel").filter_map { |line| line.strip if line && line[0] != "#" }
@@ -28,16 +28,16 @@ get '/*' do |path|
     if !path.end_with? '.db'
         # Find a faster mirror with the requested file present
         mirrors[..-2].each { |m|
-            response = Faraday.head(m + path)
+            response = HTTP.head(m + path)
             if response.status == 200
                 mirror = m
                 break
             else
-                puts "skipping #{m} for #{path}, code: #{response.status}"
+                logger.info "skipping #{m} for #{path}, code: #{response.status}"
             end
         }
     end
 
-    puts "redirecting to #{mirror + path}"
+    logger.info "redirecting to #{mirror + path}"
     redirect mirror + path, 302
 end

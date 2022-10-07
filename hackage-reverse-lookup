@@ -1,6 +1,5 @@
 #!/usr/bin/ruby
-require 'json'
-require 'open-uri'
+require 'http'
 require 'pycall/import'
 require 'set'
 
@@ -9,7 +8,7 @@ include PyCall::Import
 pyimport :pyalpm
 
 pkg = ARGV[0]
-name_preset = JSON.load(URI.open("https://github.com/berberman/arch-hs/raw/master/data/NAME_PRESET.json"))
+name_preset = HTTP.follow.get("https://github.com/berberman/arch-hs/raw/master/data/NAME_PRESET.json").parse(:json)
 
 archpkg = name_preset.key(pkg) || "haskell-#{pkg}"
 
@@ -29,12 +28,9 @@ rdeps = Set[]
 rdeps.each { |rdep, ver|
     puts "Extracting #{rdep}..."
     hackage_name = name_preset[rdep] || rdep[8..-1]
-    begin
-        cabal = URI.open("https://hackage.haskell.org/package/#{hackage_name}-#{ver}/revision/0.cabal").readlines
-        cabal.each { |line|
-            puts line if line.include? pkg
-        }
-    rescue OpenURI::HTTPError
-        puts "Failed to fetch #{hackage_name}-#{ver}, ignoring..."
-    end
+    cabal = HTTP.get("https://hackage.haskell.org/package/#{hackage_name}-#{ver}/revision/0.cabal")
+    puts "Failed to fetch #{hackage_name}-#{ver}, ignoring..." or next if !cabal.status.success?
+    cabal.to_s.each_line { |line|
+        puts line if line.include? pkg
+    }
 }
