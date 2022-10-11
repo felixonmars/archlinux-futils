@@ -56,7 +56,7 @@ handler = colorlog.StreamHandler()
 handler.setFormatter(colorlog.ColoredFormatter())
 logger.addHandler(handler)
 
-rebuild_list = set(args.package)
+rebuild_list = set(filter(lambda p: not p.endswith(":nocheck"), args.package))
 
 package_db = defaultdict(dict)
 pkglist = rebuild_list.copy()
@@ -79,9 +79,6 @@ for pkg in package_db:
 def resolve_pkg(pkg):
     newpkgs = set()
     if pkg not in reverse_deps:
-        if pkg.endswith(":nocheck"):
-            pkg = pkg[:-8]
-
         if pkg not in package_db:
             logger.error(f"Package {pkg} not found in any db")
             exit(1)
