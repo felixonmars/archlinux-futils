@@ -79,6 +79,13 @@ for pkg in package_db:
 def resolve_pkg(pkg):
     newpkgs = set()
     if pkg not in reverse_deps:
+        if pkg.endswith(":nocheck"):
+            pkg = pkg[:-8]
+
+        if pkg not in package_db:
+            logger.error(f"Package {pkg} not found in any db")
+            exit(1)
+
         if args.haskell_check and (not ({"ghc", "ghc-libs"} & set(package_db[pkg]["depends"]) and package_db[pkg]["arch"] != "any")):
            return reverse_deps[pkg]
 
