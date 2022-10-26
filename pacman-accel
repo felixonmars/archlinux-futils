@@ -41,3 +41,6 @@ get '/*' do |path|
     logger.info "redirecting to #{mirror + path}"
     redirect mirror + path, 302
 end
+
+set :bind, ENV.fetch("PACMEN_ACCEL_BIND", "127.0.0.1")
+set :port, ENV.fetch("PACMEN_ACCEL_PORT", "4567")
