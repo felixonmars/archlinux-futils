@@ -1,0 +1,9 @@
+[Unit]
+Description=Pacman Accelerator
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/pacman-accel
+
+[Install]
+WantedBy=multi-user.target
