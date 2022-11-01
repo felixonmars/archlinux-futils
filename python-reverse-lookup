@@ -1,0 +1,59 @@
+#!/usr/bin/ruby
+
+"""
+Usage: $0 pypi_package [repository]
+"""
+
+$pkg = ARGV[0].downcase
+$repo = ARGV[1] || "all"
+
+$repo = $repo == "all" ? ["core", "extra", "community", "multilib", "testing", "community-testing", "multilib-testing"] : $repo.split(",")
+
+CACHEDIR = "#{Dir.home}/.cache/python-reverse-lookup"
+Dir.mkdir(CACHEDIR) unless Dir.exist?(CACHEDIR)
+
+def parse_metadata(pattern)
+    `pacman -Fx #{pattern}`.split(/\n/).each do |line|
+        case line.split
+        in [file, "is", "owned", "by", package, version]
+            _repo, package = package.split("/")
+            next unless $repo.include?(_repo)
+
+            cachefile = "#{CACHEDIR}/" + "#{package}-#{version}-#{file}".gsub("/", "_")
+
+            unless File.exist?(cachefile)
+                path = "/var/cache/pacman/pkg/#{package}-#{version}-*.pkg.tar.zst"
+                if ! File.exist? path
+                    out = `sudo pacman -Sw --noconfirm #{package} 2>&1`
+                    puts out unless $?.success?
+                end
+                content = `bsdtar xOf #{path} #{file}`
+                File.write(cachefile, content) if $?.success?
+            end
+
+            File.readlines(cachefile).each do |line|
+                yield [_repo, package].join("/"), line
+            end if File.exist?(cachefile)
+        end
+    end
+end
+
+parse_metadata("/usr/lib/python3\\.*/site-packages/.*\\.dist-info/METADATA") do |package, line|
+    if line.downcase.start_with? /requires-dist: #{$pkg}[>=< ]/
+        puts "#{package}: #{line}"
+    end
+end
+
+$last_package = nil
+parse_metadata("/usr/lib/python3\\.*/site-packages/.*\\.egg-info/requires.txt") do |package, line|
+    if package != $last_package
+        $extra = ""
+        $last_package = package
+    end
+    if line.match /\[.+\]/
+        $extra = " #{line.chomp}"
+    end
+    if line.downcase.start_with? /#{$pkg}[>=< ]/
+        puts "#{package}: #{line.chomp}#{$extra}"
+    end
+end
