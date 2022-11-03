@@ -4,6 +4,8 @@
 Usage: $0 pypi_package [repository]
 """
 
+require 'concurrent'
+
 $pkg = ARGV[0].downcase
 $repo = ARGV[1] || "all"
 
@@ -12,6 +14,9 @@ $repo = $repo == "all" ? ["core", "extra", "community", "multilib", "testing", "
 CACHEDIR = "#{Dir.home}/.cache/python-reverse-lookup"
 Dir.mkdir(CACHEDIR) unless Dir.exist?(CACHEDIR)
 
+POOL = Concurrent::FixedThreadPool.new(Concurrent.processor_count)
+PACMAN_LOCK = Mutex.new
+
 def parse_metadata(pattern)
     `pacman -Fx #{pattern}`.split(/\n/).each do |line|
         case line.split
@@ -19,21 +24,25 @@ def parse_metadata(pattern)
             _repo, package = package.split("/")
             next unless $repo.include?(_repo)
 
-            cachefile = "#{CACHEDIR}/" + "#{package}-#{version}-#{file}".gsub("/", "_")
+            POOL.post do
+                cachefile = "#{CACHEDIR}/" + "#{package}-#{version}-#{file}".gsub("/", "_")
 
-            unless File.exist?(cachefile)
-                path = "/var/cache/pacman/pkg/#{package}-#{version}-*.pkg.tar.zst"
-                if ! File.exist? path
-                    out = `sudo pacman -Sw --noconfirm #{package} 2>&1`
-                    puts out unless $?.success?
+                unless File.exist?(cachefile)
+                    path = "/var/cache/pacman/pkg/#{package}-#{version}-*.pkg.tar.zst"
+                    if ! File.exist? path
+                        PACMAN_LOCK.synchronize do
+                            out = `sudo pacman -Sw --noconfirm #{package} 2>&1`
+                            puts out unless $?.success?
+                        end
+                    end
+                    content = `bsdtar xOf #{path} #{file}`
+                    File.write(cachefile, content) if $?.success?
                 end
-                content = `bsdtar xOf #{path} #{file}`
-                File.write(cachefile, content) if $?.success?
-            end
 
-            File.readlines(cachefile).each do |line|
-                yield [_repo, package].join("/"), line
-            end if File.exist?(cachefile)
+                File.readlines(cachefile).each do |line|
+                    yield [_repo, package].join("/"), line
+                end if File.exist?(cachefile)
+            end
         end
     end
 end
@@ -57,3 +66,6 @@ parse_metadata("/usr/lib/python3\\.*/site-packages/.*\\.egg-info/requires.txt") 
         puts "#{package}: #{line.chomp}#{$extra}"
     end
 end
+
+POOL.shutdown
+POOL.wait_for_termination

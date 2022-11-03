@@ -26,3 +26,5 @@ gpg --detach-sign $PKG
 rsync -avP ./$PKG{,.sig} $TIER0SERVER:$_remote_path/repo/$REPO/
 ssh -tt $TIER0SERVER "cd $_remote_path/repo/$REPO/; flock /tmp/riscv-repo-$REPO.lck repo-add -R $REPO.db.tar.gz $PKG"
 # flock ../$REPO.lck rsync -avP --delete $RVREPO/$REPO/ $TIER0SERVER/repo/$REPO/
+
+rm -r $WORKDIR
