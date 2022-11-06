@@ -25,7 +25,7 @@ get '/*' do |path|
     # These two use cases always the same server for consistency.
     mirror = mirrors[-1]
 
-    if !path.end_with? '.db'
+    unless path.end_with? '.db'
         # Find a faster mirror with the requested file present
         mirrors[..-2].each { |m|
             response = HTTP.head(m + path)
