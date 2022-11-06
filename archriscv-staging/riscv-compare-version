@@ -132,7 +132,14 @@ for pkgname in sorted(version_mismatch):
     x86ver = x86_packages[pkgname]['version']
     cmp = pyalpm.vercmp(rvver, x86ver)
     if cmp < 0:
-        verstr = f"<font color=green>{rvver} -> {x86ver}</font>"
+        rvpkgver = rvver.split("-")[0]
+        x86pkgver = x86ver.split("-")[0]
+        if rvpkgver == x86pkgver:
+            rvpkgrel = rvver.split("-")[1]
+            x86pkgrel = x86ver.split("-")[1]
+            verstr = f"{rvpkgver}-<font color=green>{rvpkgrel} -> </font>{x86pkgver}-<font color=green>{x86pkgrel}</font>"
+        else:
+            verstr = f"<font color=green>{rvver} -> {x86ver}</font>"
     elif cmp > 0:
         verstr = f"<font color=yellow>{rvver} <- {x86ver}</font>"
     verstr += f" <a href={x86_history_link(pkgbase, db)}>Changes</a>"
