@@ -18,6 +18,8 @@ for _db in core extra community; do
   echo "[$_db] $RV / $ARCH ($PERCENT%)" >> $_tmpfile
 done
 
+(cd $PATCHREPO; git pull)
+
 riscv-compare-version $_tmpdir $REPOROOT $PATCHREPO > $REPOROOT/.status/status.htm.new
 mv $REPOROOT/.status/status.htm{.new,}
 

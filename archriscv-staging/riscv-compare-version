@@ -79,6 +79,12 @@ def x86_history_link(package, db):
         repo = 'unsupported'
     return f"https://github.com/archlinux/svntogit-{repo}/commits/packages/{package}/trunk"
 
+def patch_repo_link(package):
+    if os.path.exists(f"{PATCHREPO}/{package}"):
+        return f" <a href=https://github.com/felixonmars/archriscv-packages/tree/master/{package}><font color=gray>[Patched]</font></a>"
+    else:
+        return ""
+
 broken_pkgs = set()
 outdated_logs = set()
 old_log_threshold = time.time() - 30 * 24 * 60 * 60
@@ -107,7 +113,8 @@ for pkgname, package in x86_packages.items():
         if pkgname != package['base']:
             pkgname_str += f" ({package['base']})"
 
-        print(f"<tr><td>{package['db']}</td><td>{pkgname_str}</td><td><a href='{ftbfs_link}'><font color=red>FTBFS</font></a>{old_log_mark}</td></tr>")
+        print(f"<tr><td>{package['db']}</td><td>{pkgname_str}</td><td><a href='{ftbfs_link}'>"
+              f"<font color=red>FTBFS</font></a>{old_log_mark + patch_repo_link(package['base'])}</td></tr>")
         broken_pkgs.add(pkgname)
 
 def missing_dep(pkgbase):
@@ -151,6 +158,8 @@ for pkgname in sorted(version_mismatch):
     if pkgname in outdated_logs:
         verstr += f" <a href='logs/{pkgbase}/'><font color=yellow>(Outdated FTBFS Logs)</font></a>"
 
+    verstr += patch_repo_link(pkgbase)
+
     pkgname_str = pkgname
     if pkgname != pkgbase:
         pkgname_str += f" ({pkgbase})"
@@ -172,6 +181,7 @@ for pkgname, package in x86_packages.items():
         verstr = "Leaf package, port it!"
         if pkgname in outdated_logs:
             verstr += f" <a href='logs/{package['base']}/'><font color=yellow>(Outdated FTBFS Logs)</font></a>"
+        verstr += patch_repo_link(package['base'])
         print(f"<tr><td>{package['db']}</td><td>{pkgname_str}</td><td>{verstr}</td></tr>")
 
 for pkgname, package in rv_packages.items():
