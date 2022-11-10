@@ -1,0 +1,94 @@
+#!/usr/bin/ruby
+
+require 'colorize'
+require 'concurrent'
+require 'set'
+require 'stringio'
+
+def `(cmd)
+    Kernel.`("bash -c '. /etc/makepkg.conf; . /usr/share/makepkg/source.sh; #{cmd}'")  # workaround for stupid syntax highlighting `
+end
+
+SRCDEST = `echo $SRCDEST`.strip
+POOL = Concurrent::FixedThreadPool.new(ENV.fetch('JOBS', Concurrent.processor_count).to_i)
+
+Dir.glob('./*/trunk/PKGBUILD').each do |pkgbuild|
+    POOL.post do
+        keyids = Set[]
+        `. #{pkgbuild} && echo ${source[@]}`.split.each do |source|
+            filename = `get_filename #{source}`.chomp
+            protocol = `get_protocol #{source}`.chomp
+            url = `get_url #{source}`.chomp
+            filepath = `get_filepath #{source}`.chomp
+
+            if filename.end_with?('.sig') || source.include?('?signed')
+                unless $?.success?
+                    case protocol
+                    when 'git'
+                        if ENV.fetch('NOVCS', '') == '1'
+                            puts "SKIP: #{pkgbuild} skipping #{source} because NOVCS is set".yellow
+                            next
+                        end
+                        puts "DEBUG: #{pkgbuild}: downloading #{source}..." if ENV.fetch('DEBUG', '') == '1'
+                        `cd #{SRCDEST}; download_git #{source}`
+                    when 'http', 'https', 'ftp'
+                        puts "DEBUG: #{pkgbuild}: downloading #{source}..." if ENV.fetch('DEBUG', '') == '1'
+                        `cd #{SRCDEST}; download_file #{source}`
+                    else
+                        puts "FAIL: #{pkgbuild} unknown protocol #{protocol}".red
+                        next
+                    end
+                    unless $?.success?
+                        puts "FAIL: #{pkgbuild} failed to download #{source}".red
+                        next
+                    end
+                    filepath = `get_filepath #{source}`.chomp
+                end
+
+                case protocol
+                when 'git'
+                    ref = `get_uri_fragment #{source}`.chomp.split("=").last
+                    cmd = "cd #{SRCDEST}/#{filename}; git fetch; git show --pretty=raw #{ref} | sed \"s/^gpgsig //;s/^ //\" | gpg --list-packets"
+                when 'http', 'https', 'ftp'
+                    cmd = "gpg --list-packets #{filepath}"
+                end
+                puts "DEBUG: #{pkgbuild}: checking signature of #{source}... cmd: #{cmd}" if ENV.fetch('DEBUG', '') == '1'
+                `#{cmd}`.each_line do |line|
+                    case line.split
+                    in [':signature', 'packet:', 'algo', algo, "keyid", keyid]
+                        keyids << keyid
+                    else
+                    end
+                end
+            end
+        end
+        next if keyids.empty?
+
+        `. #{pkgbuild} && echo ${validpgpkeys[@]}`.split.each do |key|
+            keyfile = "#{File.dirname(pkgbuild)}/keys/pgp/#{key}.asc"
+            if File.exists? keyfile
+                `gpg --show-keys --with-key-data #{keyfile}`.each_line do |line|
+                    keyids.each do |keyid|
+                        if line.start_with?('pub', 'sub') && line.include?(":#{keyid}:")
+                            keyids.delete keyid
+                            break
+                        end
+                    end
+                end
+            else
+                puts "SKIP: #{pkgbuild} key #{key} not exported".yellow
+            end
+        end
+
+        if keyids.empty?
+            puts "OK: #{pkgbuild}".green
+        elsif Dir.exists? "#{File.dirname(pkgbuild)}/keys/pgp"
+            puts "FAIL: #{pkgbuild} keys #{keyids.join(', ')} not found in exported keys. ignore until we fix export-pkgbuild-keys.".yellow
+        elsif `. #{pkgbuild} && echo ${validpgpkeys[@]}`.chomp.empty?
+            puts "FAIL: #{pkgbuild} validpgpkeys array is empty".red
+        end
+    end
+end
+
+POOL.shutdown
+POOL.wait_for_termination
