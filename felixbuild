@@ -64,7 +64,7 @@ if [[ -n "$(. PKGBUILD; echo $validpgpkeys)" && ! "$_cmd" == *"--skippgpcheck"* 
   msg "Ensuring required PGP keys are present..."
   for _key in $(source PKGBUILD; echo "${validpgpkeys[@]}" 2>/dev/null); do
     msg2 "Checking for $_key..."
-    if ! ssh $BUILDHOST "gpg --recv-keys $_key || gpg --fingerprint $_key >/dev/null 2>&1"; then
+    if ! ssh $BUILDHOST "gpg --recv-keys $_key || gpg --fingerprint $_key"; then
       if [[ -f keys/pgp/$_key.asc ]]; then
         msg2 "Importing key from local..."
         ssh $BUILDHOST "gpg --import packages/$PKGNAME/keys/pgp/$_key.asc"
