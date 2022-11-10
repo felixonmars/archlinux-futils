@@ -62,14 +62,18 @@ rsync -avzzP ./ $BUILDHOST:packages/$PKGNAME/ --exclude=*.src.tar* --exclude=*.p
 # === Handle validpgpkeys ===
 if [[ -n "$(. PKGBUILD; echo $validpgpkeys)" && ! "$_cmd" == *"--skippgpcheck"* ]]; then
   msg "Ensuring required PGP keys are present..."
-  if [[ -d keys ]]; then
-    ssh $BUILDHOST "gpg --import packages/$PKGNAME/keys/pgp/*"
-  else
-    for _key in $(source PKGBUILD; echo "${validpgpkeys[@]}" 2>/dev/null); do
-      msg2 "Checking for $_key..."
-      ssh $BUILDHOST "gpg --fingerprint $_key >/dev/null 2>&1 || gpg --recv-keys $_key" || exit 1
-    done
-  fi
+  for _key in $(source PKGBUILD; echo "${validpgpkeys[@]}" 2>/dev/null); do
+    msg2 "Checking for $_key..."
+    if ! ssh $BUILDHOST "gpg --recv-keys $_key || gpg --fingerprint $_key >/dev/null 2>&1"; then
+      if [[ -f keys/pgp/$_key.asc ]]; then
+        msg2 "Importing key from local..."
+        ssh $BUILDHOST "gpg --import packages/$PKGNAME/keys/pgp/$_key.asc"
+      else
+        error "Failed to locate key $_key"
+        exit 1
+      fi
+    fi
+  done
 fi
 
 # Try to fetch logs
