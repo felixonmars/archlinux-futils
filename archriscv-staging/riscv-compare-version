@@ -81,9 +81,31 @@ def x86_history_link(package, db):
 
 def patch_repo_link(package):
     if os.path.exists(f"{PATCHREPO}/{package}"):
-        return f" <a href=https://github.com/felixonmars/archriscv-packages/tree/master/{package}><font color=gray>[Patched]</font></a>"
+        return f" <a href=https://github.com/felixonmars/archriscv-packages/tree/master/{package}><span class='badge bg-secondary'>patched</span></a>"
     else:
         return ""
+
+def parse_build_log(log):
+    stages = [
+        ("patch failed", "\x1b[1m\x1b[32m==>\x1b[m\x0f\x1b[1m Applying RISC-V patches...\x1b[m\x0f"),
+        ("source download failed", "\x1b[1m\x1b[31m==> ERROR:\x1b[m\x0f\x1b[1m Failure while downloading"),
+        ("checksum mismatch", "\x1b[1m\x1b[31m==> ERROR:\x1b[m\x0f\x1b[1m One or more files did not pass the validity check"),
+        ("gpg failed", "\x1b[1m\x1b[31m==> ERROR:\x1b[m\x0f\x1b[1m One or more PGP signatures"),
+        ("dependency missing", "\x1b[?25h\x1b[1m\x1b[31m==> ERROR:\x1b[m\x0f\x1b[1m Could not resolve all dependencies"),
+        ("dependency missing", "\x1b[1m\x1b[31m==> ERROR:\x1b[m\x0f\x1b[1m Could not resolve all dependencies."),
+        ("prepare() failed", "\x1b[1m\x1b[31m==> ERROR:\x1b[m\x0f\x1b[1m A failure occurred in prepare()."),
+        ("build() failed", "\x1b[1m\x1b[31m==> ERROR:\x1b[m\x0f\x1b[1m A failure occurred in build()."),
+        ("check() failed", "\x1b[1m\x1b[31m==> ERROR:\x1b[m\x0f\x1b[1m A failure occurred in check()."),
+        ("package() failed", "\x1b[1m\x1b[31m==> ERROR:\x1b[m\x0f\x1b[1m A failure occurred in package"),
+        ("old config.guess", "configure: error: cannot guess build type; you must specify one"),
+    ]
+    last_failed_stage = None
+    with open(log) as f:
+        for line in f:
+            for stage, prefix in stages:
+                if line.startswith(prefix):
+                    last_failed_stage = stage
+    return last_failed_stage
 
 broken_pkgs = set()
 outdated_logs = set()
@@ -98,13 +120,16 @@ for pkgname, package in x86_packages.items():
                 continue
 
         ftbfs_link = f"logs/{package['base']}/"
-        old_log_mark = ""
+        log_marks = ""
         if os.path.isfile(f"{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}.log"):
             ftbfs_link = f"logs/{package['base']}/{package['base']}-{package['version']}.log"
             if os.path.getmtime(f"{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}.log") < old_log_threshold:
-                old_log_mark = " <small>(old)</small>"
+                log_marks += " <span class='badge bg-warning'>old</span>"
+            failed_stage = parse_build_log(f"{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}.log")
+            if failed_stage:
+                log_marks += f" <span class='badge bg-danger'>{failed_stage}</span>"
         elif glob.glob(f"{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}-*.log"):
-            old_log_mark = " <small>(old format)</small>"
+            log_marks += " <span class='badge bg-warning'>old format</span>"
         else:
             outdated_logs |= pkgbase_map[package['base']]
             continue
@@ -114,7 +139,7 @@ for pkgname, package in x86_packages.items():
             pkgname_str += f" ({package['base']})"
 
         print(f"<tr><td>{package['db']}</td><td>{pkgname_str}</td><td><a href='{ftbfs_link}'>"
-              f"<font color=red>FTBFS</font></a>{old_log_mark + patch_repo_link(package['base'])}</td></tr>")
+              f"<font color=red>FTBFS</font></a>{log_marks + patch_repo_link(package['base'])}</td></tr>")
         broken_pkgs.add(pkgname)
 
 def missing_dep(pkgbase):
