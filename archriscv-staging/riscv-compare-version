@@ -98,13 +98,19 @@ def parse_build_log(log):
         ("check() failed", "\x1b[1m\x1b[31m==> ERROR:\x1b[m\x0f\x1b[1m A failure occurred in check()."),
         ("package() failed", "\x1b[1m\x1b[31m==> ERROR:\x1b[m\x0f\x1b[1m A failure occurred in package"),
         ("old config.guess", "configure: error: cannot guess build type; you must specify one"),
+        ("broken rust target", "  error: Error loading target specification: Could not find specification for target \"riscv64-unknown-linux-gnu\".")
     ]
     last_failed_stage = None
     with open(log) as f:
         for line in f:
-            for stage, prefix in stages:
+            for stage, prefix in stages.copy():
                 if line.startswith(prefix):
                     last_failed_stage = stage
+                    # Only check stages after the last failed stage for the following lines
+                    for stage, prefix in stages.copy():
+                        stages.remove((stage, prefix))
+                        if stage == last_failed_stage:
+                            break
     return last_failed_stage
 
 broken_pkgs = set()
