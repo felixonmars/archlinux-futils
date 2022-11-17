@@ -28,7 +28,12 @@ get '/*' do |path|
     unless path.end_with? '.db'
         # Find a faster mirror with the requested file present
         mirrors[..-2].each { |m|
-            response = HTTP.head(m + path)
+            begin
+                response = HTTP.head(m + path)
+            rescue => e
+                logger.error "skipping mirror #{m}, failed to HEAD: #{e}"
+                next
+            end
             if response.status == 200
                 mirror = m
                 break
