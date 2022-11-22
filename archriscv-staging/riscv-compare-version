@@ -101,7 +101,7 @@ def parse_build_log(log):
         ("broken rust target", "  error: Error loading target specification: Could not find specification for target \"riscv64-unknown-linux-gnu\".")
     ]
     last_failed_stage = None
-    with open(log) as f:
+    with open(log, errors="backslashreplace") as f:
         for line in f:
             for stage, prefix in stages.copy():
                 if line.startswith(prefix):
