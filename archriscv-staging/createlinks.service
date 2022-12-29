@@ -1,0 +1,9 @@
+[Unit]
+Description=Create sogrep database
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/createlinks
+Nice=19
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
