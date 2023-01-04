@@ -11,7 +11,7 @@ _login=${_buildserver//[a-zA-Z]/}
 
 while read -r abbr addr; do
   if [[ "$_server" == "$abbr" ]]; then
-    msg "Building on $abbr"
+    msg "Building on ${addr##*@}"
     BUILDHOST=$addr
     shift
     break
