@@ -3,7 +3,6 @@
 require 'colorize'
 require 'concurrent'
 require 'set'
-require 'stringio'
 
 def `(cmd)
     Kernel.`("bash -c '. /etc/makepkg.conf; . /usr/share/makepkg/source.sh; #{cmd}'")  # workaround for stupid syntax highlighting `
