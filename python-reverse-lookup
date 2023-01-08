@@ -47,14 +47,14 @@ def parse_metadata(pattern)
     end
 end
 
-parse_metadata("/usr/lib/python3\\.*/site-packages/.*\\.dist-info/METADATA") do |package, line|
-    if line.downcase.start_with? /requires-dist: #{$pkg}[>=< ]/
+parse_metadata("/usr/lib/python3\\.[0-9]+/site-packages/.*\\.dist-info/METADATA") do |package, line|
+    if line.downcase.start_with? /requires-dist: #{$pkg}[^\w]/
         puts "#{package}: #{line}"
     end
 end
 
 $last_package = nil
-parse_metadata("/usr/lib/python3\\.*/site-packages/.*\\.egg-info/requires.txt") do |package, line|
+parse_metadata("/usr/lib/python3\\.[0-9]+/site-packages/.*\\.egg-info/requires.txt") do |package, line|
     if package != $last_package
         $extra = ""
         $last_package = package
@@ -62,7 +62,7 @@ parse_metadata("/usr/lib/python3\\.*/site-packages/.*\\.egg-info/requires.txt") 
     if line.match /\[.+\]/
         $extra = " #{line.chomp}"
     end
-    if line.downcase.start_with? /#{$pkg}[>=< ]/
+    if line.downcase.start_with? /#{$pkg}[^\w]/
         puts "#{package}: #{line.chomp}#{$extra}"
     end
 end
