@@ -16,7 +16,8 @@
 require 'http'
 require 'sinatra'
 
-mirrors = File.readlines("/etc/pacman.d/mirrorlist-accel").filter_map { |line| line.strip if line && line[0] != "#" }
+config = ENV.fetch("PACMAN_ACCEL_CONF", "/etc/pacman.d/mirrorlist-accel")
+mirrors = File.readlines(config).filter_map { |line| line.strip if line && line[0] != "#" }
 
 get '/*' do |path|
     # Set TIER 0/1 mirrors as the last one, for:
