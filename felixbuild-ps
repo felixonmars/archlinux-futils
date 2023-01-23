@@ -20,9 +20,9 @@ end
   server = line.split("felixbuild ")[1].split[0].match(/[a-zA-Z]+/)[0]
   arch = line.split("felixbuild ")[1].split[1].match(/\w+-(\w+)-build/)[1]
 
-  if cwd =~ /.*\/([a-zA-Z0-9_\-\.]+)\/trunk/
+  if cwd =~ /.*\/([a-zA-Z0-9_\-\.+]+)\/trunk/
     pkgbase = $1
-  elsif cwd =~ /.*\/([a-zA-Z0-9_\-\.]+)\/repos\/\w+-\w+/
+  elsif cwd =~ /.*\/([a-zA-Z0-9_\-\.+]+)\/repos\/\w+-\w+/
     pkgbase = $1
   else
     pkgbase = "unknown"
