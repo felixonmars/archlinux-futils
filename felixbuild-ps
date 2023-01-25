@@ -11,7 +11,7 @@ Dir.glob("/etc/felixbuild.d/*").each do |conf|
     end
 end
 
-`ps a`.split(/\n/).each do |line|
+`ps aww`.split(/\n/).each do |line|
   next unless line.include? 'felixbuild '
 
   pid = line.split[0]
