@@ -76,8 +76,8 @@ if grep '^_commit=' PKGBUILD >/dev/null; then
   _oldcommit=$(. PKGBUILD; echo $_commit)
   for _source in $(. PKGBUILD; echo ${source[@]}); do
     if [[ $_source =~ git\+(https://.*)\#commit=$_oldcommit ]]; then
-      _repo=${BASH_REMATCH[1]}
-      tags="$(git ls-remote --tags $_repo)"
+      _gitrepo=${BASH_REMATCH[1]}
+      tags="$(git ls-remote --tags $_gitrepo)"
 
       _guess_tag_prefix=$(echo "$tags" | grep ^$_oldcommit | sed "s|.*refs/tags/||;s|$_oldpkgver.*||")
       if echo "$tags" | grep refs/tags/$_guess_tag_prefix$_pkgver$ >/dev/null; then
