@@ -1,0 +1,131 @@
+#!/bin/bash
+set -e
+
+_repo=$1
+_pkgbase=$2
+_pkgver=$3
+_pkgrel=$4
+_msg=$5
+
+_build=1
+
+if [[ -z "$_pkgrel" ]]; then
+  _pkgrel=1
+fi
+
+if [[ "$_pkgrel" == "0" ]]; then
+  _build=0
+fi
+
+case $_repo in
+  e)
+    _repo=extra
+    ;;
+  c)
+    _repo=community
+    ;;
+  m)
+    _repo=multilib
+    ;;
+  t)
+    _repo=testing
+    ;;
+  ct)
+    _repo=community-testing
+    ;;
+  mt)
+    _repo=multilib-testing
+    ;;
+  s)
+    _repo=staging
+    ;;
+  cs)
+    _repo=community-staging
+    ;;
+  ms)
+    _repo=multilib-staging
+    ;;
+esac
+
+_x86_64_build=extra-x86_64-build
+_x86_64_pkg=${_repo}pkg
+
+if [[ "$_repo" == *testing ]]; then
+  _x86_64_build=testing-x86_64-build
+elif [[ "$_repo" == *staging ]]; then
+  _x86_64_build=staging-x86_64-build
+fi
+
+if [[ "$_repo" == multilib ]]; then
+  _x86_64_build=multilib-build
+elif [[ "$_repo" == multilib-testing ]]; then
+  _x86_64_build=multilib-testing-build
+elif [[ "$_repo" == multilib-staging ]]; then
+  _x86_64_build=multilib-staging-build
+fi
+
+pushd $_pkgbase/trunk
+
+_oldpkgver=$(. PKGBUILD; echo $pkgver)
+
+setconf PKGBUILD pkgver $_pkgver
+setconf PKGBUILD pkgrel $_pkgrel
+
+if grep '^_commit=' PKGBUILD >/dev/null; then
+  # Attempt to update _commit
+  _oldcommit=$(. PKGBUILD; echo $_commit)
+  for _source in $(. PKGBUILD; echo ${source[@]}); do
+    if [[ $_source =~ git\+(https://.*)\#commit=$_oldcommit ]]; then
+      _repo=${BASH_REMATCH[1]}
+      tags="$(git ls-remote --tags $_repo)"
+
+      _guess_tag_prefix=$(echo "$tags" | grep ^$_oldcommit | sed "s|.*refs/tags/||;s|$_oldpkgver.*||")
+      if echo "$tags" | grep refs/tags/$_guess_tag_prefix$_pkgver$ >/dev/null; then
+        _newtag=$_guess_tag_prefix$_pkgver
+      elif echo "$tags" | grep refs/tags/$_pkgver$ >/dev/null; then
+        _newtag=$_guess_tag_prefix$_pkgver
+      elif echo "$tags" | grep refs/tags/v$_pkgver$ >/dev/null; then
+        _newtag=v$_pkgver
+      elif echo "$tags" | grep refs/tags/V$_pkgver$ >/dev/null; then
+        _newtag=V$_pkgver
+      else
+        echo "Unable to find tag for $_pkgver"
+        exit 1
+      fi
+
+      if echo "$tags" | grep $_newtag^{}$ >/dev/null; then
+        _commit=$(echo "$tags" | grep refs/tags/$_newtag^{}$ | cut -f1)
+      else
+        _commit=$(echo "$tags" | grep refs/tags/$_newtag$ | cut -f1)
+      fi
+
+      setconf PKGBUILD _commit $_commit
+      break
+    fi
+  done
+fi
+
+# Autofixes
+grep -E "^sha256sums=|^sha512sums=" PKGBUILD || \
+  sed -e 's|^sha1sums=|sha256sums=|' \
+      -e 's|^md5sums=|sha256sums=|' \
+      -i PKGBUILD
+sed -e 's|http://github.com/|https://github.com/|' \
+    -e "s|arch=('i686' 'x86_64')|arch=('x86_64')|" \
+    -e "s|arch=(\"i686\" \"x86_64\")|arch=('x86_64')|" \
+    -i PKGBUILD
+
+updpkgsums
+
+svn diff
+
+if [[ "$_build" -eq 1 ]]; then
+  _buildserver=$(felixbuild-server-select)
+
+  felixbuild $_buildserver $_x86_64_build
+
+  felix-package-broker $_buildserver $_repo $_pkgbase
+  flock ../../repo.lck $_x86_64_pkg "$_msg"
+
+  cleanpkg
+fi
