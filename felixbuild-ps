@@ -18,7 +18,12 @@ end
   cwd = File.readlink("/proc/#{pid}/cwd")
 
   server = line.split("felixbuild ")[1].split[0].match(/[a-zA-Z]+/)[0]
-  arch = line.split("felixbuild ")[1].split[1].match(/\w+-(\w+)-build/)[1]
+
+  begin
+    arch = line.split("felixbuild ")[1].split[1].match(/\w+-(\w+)-build/)[1]
+  rescue NoMethodError
+    arch = "x86_64"
+  end
 
   if cwd =~ /.*\/([a-zA-Z0-9_\-\.+]+)\/trunk/
     pkgbase = $1
