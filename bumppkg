@@ -105,8 +105,16 @@ if grep '^_commit=' PKGBUILD >/dev/null; then
   done
 fi
 
+# Refuse my own packages to use GitHub tarballs anymore
+if grep 'Maintainer: Felix Yan' PKGBUILD >/dev/null; then
+  if grep '^source=.*github\.com/.*/archive/.*\.tar' PKGBUILD >/dev/null; then
+    echo "Refusing to use GitHub tarballs for my own packages"
+    exit 1
+  fi
+fi
+
 # Autofixes
-grep -E "^sha256sums=|^sha512sums=" PKGBUILD || \
+grep -E "^sha256sums=|^sha512sums=|^b2sums=" PKGBUILD >/dev/null || \
   sed -e 's|^sha1sums=|sha256sums=|' \
       -e 's|^md5sums=|sha256sums=|' \
       -i PKGBUILD
