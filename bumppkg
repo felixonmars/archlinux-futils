@@ -83,7 +83,7 @@ if grep '^_commit=' PKGBUILD >/dev/null; then
       if echo "$tags" | grep refs/tags/$_guess_tag_prefix$_pkgver$ >/dev/null; then
         _newtag=$_guess_tag_prefix$_pkgver
       elif echo "$tags" | grep refs/tags/$_pkgver$ >/dev/null; then
-        _newtag=$_guess_tag_prefix$_pkgver
+        _newtag=$_pkgver
       elif echo "$tags" | grep refs/tags/v$_pkgver$ >/dev/null; then
         _newtag=v$_pkgver
       elif echo "$tags" | grep refs/tags/V$_pkgver$ >/dev/null; then
