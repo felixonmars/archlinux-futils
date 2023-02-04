@@ -17,6 +17,7 @@ HASKELL_DO_NOT_EXPAND = {
     'happy',
     'hedgewars',
     'hopenpgp-tools',
+    'pandoc-cli',
     'tamarin-prover',
     'uusi',
     'xmonad-utils',
