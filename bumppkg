@@ -79,7 +79,7 @@ if grep '^_commit=' PKGBUILD >/dev/null; then
       _gitrepo=${BASH_REMATCH[1]}
       tags="$(git ls-remote --tags $_gitrepo)"
 
-      _guess_tag_prefix=$(echo "$tags" | grep ^$_oldcommit | sed "s|.*refs/tags/||;s|$_oldpkgver.*||")
+      _guess_tag_prefix=$(echo "$tags" | grep ^$_oldcommit | sed "s|.*refs/tags/||;s|$_oldpkgver.*||" | head -n1)
       if echo "$tags" | grep refs/tags/$_guess_tag_prefix$_pkgver$ >/dev/null; then
         _newtag=$_guess_tag_prefix$_pkgver
       elif echo "$tags" | grep refs/tags/$_pkgver$ >/dev/null; then
