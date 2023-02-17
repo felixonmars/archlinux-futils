@@ -72,44 +72,40 @@ setconf PKGBUILD pkgver $_pkgver
 setconf PKGBUILD pkgrel $_pkgrel
 
 if grep '^_commit=' PKGBUILD >/dev/null; then
-  # Attempt to update _commit
-  _oldcommit=$(. PKGBUILD; echo $_commit)
-  for _source in $(. PKGBUILD; echo ${source[@]}); do
-    if [[ $_source =~ git\+(https://.*)\#commit=$_oldcommit ]]; then
-      _gitrepo=${BASH_REMATCH[1]}
-      tags="$(git ls-remote --tags $_gitrepo)"
+  if [[ -n "$COMMIT" ]]; then
+    setconf PKGBUILD _commit $COMMIT
+  else
+    # Attempt to update _commit
+    _oldcommit=$(. PKGBUILD; echo $_commit)
+    for _source in $(. PKGBUILD; echo ${source[@]}); do
+      if [[ $_source =~ git\+(https://.*)\#commit=$_oldcommit ]]; then
+        _gitrepo=${BASH_REMATCH[1]}
+        tags="$(git ls-remote --tags $_gitrepo)"
 
-      _guess_tag_prefix=$(echo "$tags" | grep ^$_oldcommit | sed "s|.*refs/tags/||;s|$_oldpkgver.*||" | head -n1)
-      if echo "$tags" | grep refs/tags/$_guess_tag_prefix$_pkgver$ >/dev/null; then
-        _newtag=$_guess_tag_prefix$_pkgver
-      elif echo "$tags" | grep refs/tags/$_pkgver$ >/dev/null; then
-        _newtag=$_pkgver
-      elif echo "$tags" | grep refs/tags/v$_pkgver$ >/dev/null; then
-        _newtag=v$_pkgver
-      elif echo "$tags" | grep refs/tags/V$_pkgver$ >/dev/null; then
-        _newtag=V$_pkgver
-      else
-        echo "Unable to find tag for $_pkgver"
-        exit 1
+        _guess_tag_prefix=$(echo "$tags" | grep ^$_oldcommit | sed "s|.*refs/tags/||;s|$_oldpkgver.*||" | head -n1)
+        if echo "$tags" | grep refs/tags/$_guess_tag_prefix$_pkgver$ >/dev/null; then
+          _newtag=$_guess_tag_prefix$_pkgver
+        elif echo "$tags" | grep refs/tags/$_pkgver$ >/dev/null; then
+          _newtag=$_pkgver
+        elif echo "$tags" | grep refs/tags/v$_pkgver$ >/dev/null; then
+          _newtag=v$_pkgver
+        elif echo "$tags" | grep refs/tags/V$_pkgver$ >/dev/null; then
+          _newtag=V$_pkgver
+        else
+          echo "Unable to find tag for $_pkgver"
+          exit 1
+        fi
+
+        if echo "$tags" | grep $_newtag^{}$ >/dev/null; then
+          _commit=$(echo "$tags" | grep refs/tags/$_newtag^{}$ | cut -f1)
+        else
+          _commit=$(echo "$tags" | grep refs/tags/$_newtag$ | cut -f1)
+        fi
+
+        setconf PKGBUILD _commit $_commit
+        break
       fi
-
-      if echo "$tags" | grep $_newtag^{}$ >/dev/null; then
-        _commit=$(echo "$tags" | grep refs/tags/$_newtag^{}$ | cut -f1)
-      else
-        _commit=$(echo "$tags" | grep refs/tags/$_newtag$ | cut -f1)
-      fi
-
-      setconf PKGBUILD _commit $_commit
-      break
-    fi
-  done
-fi
-
-# Refuse my own packages to use GitHub tarballs anymore
-if grep 'Maintainer: Felix Yan' PKGBUILD >/dev/null; then
-  if grep '^source=.*github\.com/.*/archive/.*\.tar' PKGBUILD >/dev/null; then
-    echo "Refusing to use GitHub tarballs for my own packages"
-    exit 1
+    done
   fi
 fi
 
