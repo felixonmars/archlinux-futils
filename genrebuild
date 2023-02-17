@@ -26,6 +26,7 @@ HASKELL_DO_NOT_EXPAND = {
 HASKELL_REAL_MAKEDEPEND = {
     'alex',
     'happy',
+    'pandoc-cli',
     'uusi',
 }
 
@@ -68,13 +69,14 @@ handle = pyalpm.Handle(".", args.dbpath)
 for db in args.db:
     db_handle = handle.register_syncdb(db, 0)
     for package in db_handle.search(""):
-        for field in ("depends", "makedepends", "checkdepends", "arch"):
+        for field in ("depends", "makedepends", "checkdepends", "provides", "arch"):
             package_db[package.name][field] = getattr(package, field)
 
 for pkg in package_db:
     package_db[pkg]["depends"] = {dep.split("=")[0].split(">")[0].split("<")[0] for dep in package_db[pkg]["depends"]}
     package_db[pkg]["makedepends"] = {dep.split("=")[0].split(">")[0].split("<")[0] for dep in package_db[pkg]["makedepends"]}
     package_db[pkg]["checkdepends"] = {dep.split("=")[0].split(">")[0].split("<")[0] for dep in package_db[pkg]["checkdepends"]}
+    package_db[pkg]["provides"] = {dep.split("=")[0].split(">")[0].split("<")[0] for dep in package_db[pkg]["provides"]}
 
 
 def resolve_pkg(pkg):
@@ -90,17 +92,17 @@ def resolve_pkg(pkg):
         for _pkg in package_db:
             if args.haskell_check and not ({"ghc", "ghc-libs"} & set(package_db[_pkg]["depends"]) and package_db[_pkg]["arch"] != "any"):
                 continue
-            if pkg in package_db[_pkg]["depends"] or pkg in package_db[_pkg]["makedepends"] or \
-               pkg in package_db[_pkg]["checkdepends"]:
+            if ({pkg} | package_db[pkg]["provides"]) & (package_db[_pkg]["depends"] | package_db[_pkg]["makedepends"] | \
+                                                        package_db[_pkg]["checkdepends"]):
                 reverse_deps[pkg].add(_pkg)
                 if args.haskell_check and pkg in HASKELL_DO_NOT_EXPAND:
                     pass
                 else:
-                    if args.expand and pkg in package_db[_pkg]["depends"]:
+                    if args.expand and ({pkg} | package_db[pkg]["provides"]) & package_db[_pkg]["depends"]:
                         newpkgs.add(_pkg)
-                    if args.expand_make and pkg in package_db[_pkg]["makedepends"]:
+                    if args.expand_make and ({pkg} | package_db[pkg]["provides"]) & package_db[_pkg]["makedepends"]:
                         newpkgs.add(_pkg)
-                    if args.expand_check and pkg in package_db[_pkg]["checkdepends"]:
+                    if args.expand_check and ({pkg} | package_db[pkg]["provides"]) & package_db[_pkg]["checkdepends"]:
                         newpkgs.add(_pkg)
 
     # Handle empty gracefully
