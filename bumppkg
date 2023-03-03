@@ -119,7 +119,18 @@ sed -e 's|http://github.com/|https://github.com/|' \
     -e "s|arch=(\"i686\" \"x86_64\")|arch=('x86_64')|" \
     -i PKGBUILD
 
-updpkgsums
+# root workaround
+if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+  TMPDIR=$(mktemp -d)
+  cp PKGBUILD "$TMPDIR/"
+  pushd "$TMPDIR"
+  chown -R nobody .
+  sudo -u nobody -H updpkgsums
+  popd
+  cp "$TMPDIR/PKGBUILD" ./
+else
+  updpkgsums
+fi
 
 svn diff
 
