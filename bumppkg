@@ -122,7 +122,7 @@ sed -e 's|http://github.com/|https://github.com/|' \
 # root workaround
 if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
   TMPDIR=$(mktemp -d)
-  cp ./* "$TMPDIR/"
+  rsync -av ./ "$TMPDIR/"
   pushd "$TMPDIR"
   chown -R nobody .
   sudo -u nobody -H updpkgsums
