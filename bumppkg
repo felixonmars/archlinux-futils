@@ -64,6 +64,8 @@ elif [[ "$_repo" == multilib-staging ]]; then
   _x86_64_build=multilib-staging-build
 fi
 
+[[ -d "$_pkgbase" ]] || svn up "$_pkgbase"
+
 pushd $_pkgbase/trunk
 
 _oldpkgver=$(. PKGBUILD; echo $pkgver)
