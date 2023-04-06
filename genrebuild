@@ -154,6 +154,19 @@ for cycle in list(nx.algorithms.components.strongly_connected_components(G)):
     G.remove_nodes_from(cycle)
 
 
+try:
+    while cycles := nx.find_cycle(G):
+        for cycle in cycles:
+            if len(cycle) == 2 and cycle[0] == cycle[1]:
+                logger.warning("Removing edge to resolve self-loop: " + str(cycle))
+                G.remove_edge(cycle[0], cycle[1])
+            else:
+                logger.error("Found circular dependency after resolving: " + str(cycle))
+                exit(1)
+except nx.NetworkXNoCycle:
+    pass
+
+
 def pass1(pkg):
     NG = nx.DiGraph()
     NG.add_nodes_from(pkg)
