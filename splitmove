@@ -1,0 +1,37 @@
+#!/usr/bin/ruby
+
+PACKAGES_REPO = '/home/felix/projects/arch/svntogit-packages'
+COMMUNITY_REPO = '/home/felix/projects/arch/svntogit-community'
+
+$packages = []
+$community = []
+
+$failed = []
+
+def detect(pkg, converted=false)
+    if Dir.exists?("#{PACKAGES_REPO}/#{pkg}")
+        $packages << pkg
+    elsif Dir.exists?("#{COMMUNITY_REPO}/#{pkg}")
+        $community << pkg
+    elsif !converted
+        $failed << pkg
+    else
+        puts "#{pkg} not found!"
+    end
+end
+
+ARGF.each do |line|
+    line.chomp!.split.each do |pkg|
+        detect(pkg)
+    end
+end
+
+`expac -Sv %e #{$failed.join(' ')}`.split.each do |pkg|
+    detect(pkg, true)
+end
+
+puts "Packages:"
+puts $packages.join(' ')
+
+puts "Community:"
+puts $community.join(' ')
