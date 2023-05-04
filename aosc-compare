@@ -1,0 +1,38 @@
+#!/usr/bin/ruby
+
+`cd /var/www/aosc-os-abbs && git pull`
+`treevsrepo --tree /var/www/aosc-os-abbs > /tmp/treevsrepo.txt`
+
+File.open('/var/www/aosc/treevsrepo/index.html.tmp', 'w') do |f|
+    f.puts '
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.2.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>tr:hover { background-color: #ddd !important; }</style>
+    <div class="table-responsive-sm"><table class="table table-sm table-hover">
+    <thead><tr><th scope="col">Package</th><th scope="col">Arch</th><th scope="col">Tree Version</th>
+    <th scope="col">Repo Version</th></thead><tbody>
+    '
+
+    File.open('/tmp/treevsrepo.txt').each do |line|
+        case line.split("|").map(&:strip)
+        in [name, arch, tree_version, repo_version]
+            next if tree_version == "tree_version"  # skip header
+            if `vercmp #{tree_version} #{repo_version}`.to_i > 0
+                tree_color = "green"
+                repo_color = "red"
+            else
+                tree_color = "red"
+                repo_color = "green"
+            end
+            f.puts "<tr><td>#{name}</td><td>#{arch}</td>
+                    <td><font color=#{tree_color}>#{tree_version}</font></td>
+                    <td><font color=#{repo_color}>#{repo_version}</font></td></tr>"
+        else
+            next
+        end
+    end
+
+    f.puts '</tbody></table></div>'
+end
+
+File.rename('/var/www/aosc/treevsrepo/index.html.tmp', '/var/www/aosc/treevsrepo/index.html')
