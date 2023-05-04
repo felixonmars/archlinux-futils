@@ -3,6 +3,14 @@
 `cd /var/www/aosc-os-abbs && git pull`
 `treevsrepo --tree /var/www/aosc-os-abbs > /tmp/treevsrepo.txt`
 
+def vercmp_workaround(version)
+    if version.include? "-"
+        return version
+    else
+        return version + "-0"
+    end
+end
+
 File.open('/var/www/aosc/treevsrepo/index.html.tmp', 'w') do |f|
     f.puts '
     <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -17,7 +25,7 @@ File.open('/var/www/aosc/treevsrepo/index.html.tmp', 'w') do |f|
         case line.split("|").map(&:strip)
         in [name, arch, tree_version, repo_version]
             next if tree_version == "tree_version"  # skip header
-            if `vercmp #{tree_version} #{repo_version}`.to_i > 0
+            if `vercmp #{vercmp_workaround(tree_version)} #{vercmp_workaround(repo_version)}`.to_i > 0
                 tree_color = "green"
                 repo_color = "red"
             else
