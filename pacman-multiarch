@@ -1,0 +1,25 @@
+#!/usr/bin/ruby
+#
+# A simple local redirector for pacman, used for arch-compare
+
+require 'sinatra'
+
+MIRRORS = {
+    "i486": "http://mirror.archlinux32.org/i486/REPO/",
+    "i686": "http://mirror.archlinux32.org/i686/REPO/",
+    "pentium4": "http://mirror.archlinux32.org/pentium4/REPO/",
+    "aarch64": "http://nj.us.mirror.archlinuxarm.org/aarch64/REPO/",
+    "armv7h": "http://nj.us.mirror.archlinuxarm.org/armv7h/REPO/",
+    "riscv64": "https://archriscv.felixc.at/repo/REPO/",
+    "loong64": "https://mirrors.wsyu.edu.cn/loongarch/archlinux/REPO/os/loong64/",
+}.transform_keys(&:to_s)
+
+get '/:arch/:repo/*' do |arch, repo, path|
+    path["#{arch}-#{repo}"] = repo
+    target = MIRRORS[arch].gsub("REPO", repo) + path
+    logger.info "redirecting to #{target}"
+    redirect target, 302
+end
+
+set :bind, ENV.fetch("PACMAN_ACCEL_BIND", "127.0.0.1")
+set :port, ENV.fetch("PACMAN_ACCEL_PORT", "19810")

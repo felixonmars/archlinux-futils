@@ -1,0 +1,9 @@
+[Unit]
+Description=Pacman Multiarch Hack
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/pacman-multiarch
+
+[Install]
+WantedBy=multi-user.target
