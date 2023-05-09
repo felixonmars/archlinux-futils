@@ -113,6 +113,7 @@ def parse_build_log(log):
                             break
     return last_failed_stage
 
+
 broken_pkgs = set()
 outdated_logs = set()
 old_log_threshold = time.time() - 30 * 24 * 60 * 60
@@ -125,27 +126,14 @@ for pkgname, package in x86_packages.items():
             if rvver == package["version"]:
                 continue
 
-        ftbfs_link = f"logs/{package['base']}/"
-        log_marks = ""
         if os.path.isfile(f"{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}.log"):
-            ftbfs_link = f"logs/{package['base']}/{package['base']}-{package['version']}.log"
-            if os.path.getmtime(f"{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}.log") < old_log_threshold:
-                log_marks += " <span class='badge bg-warning'>old</span>"
-            failed_stage = parse_build_log(f"{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}.log")
-            if failed_stage:
-                log_marks += f" <span class='badge bg-danger'>{failed_stage}</span>"
+            pass
         elif glob.glob(f"{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}-*.log"):
-            log_marks += " <span class='badge bg-warning'>old format</span>"
+            pass
         else:
             outdated_logs |= pkgbase_map[package['base']]
             continue
 
-        pkgname_str = pkgname
-        if pkgname != package['base']:
-            pkgname_str += f" ({package['base']})"
-
-        print(f"<tr><td>{package['db']}</td><td>{pkgname_str}</td><td><a href='{ftbfs_link}'>"
-              f"<font color=red>FTBFS</font></a>{log_marks + patch_repo_link(package['base'])}</td></tr>")
         broken_pkgs.add(pkgname)
 
 def missing_dep(pkgbase):
@@ -153,13 +141,66 @@ def missing_dep(pkgbase):
     for pkgname in pkgbase_map[pkgbase]:
         package = x86_packages[pkgname]
         check_pkgs |= set(package["depends"] + package["makedepends"] + package["checkdepends"])
+
+    missing = set()
+    broken = set()
+    outdated = set()
     for dep in check_pkgs:
         for _c in "<", ">", "=":
             dep = dep.split(_c)[0]
         if dep not in rv_provides and dep not in pkgbase_map[pkgbase]:
-            return dep
+            missing.add(dep)
+        elif dep in broken_pkgs:
+            broken.add(dep)
+        elif dep in version_mismatch:
+            outdated.add(dep)
 
-    return False
+    return missing, broken, outdated
+
+
+def make_link(package):
+    return f"<a href='#{package}'>{package}</a>"
+
+
+def render_missing_dep(pkgbase, show_leaf=False):
+    verstr = ""
+    missing, broken, outdated = missing_dep(pkgbase)
+    if missing:
+        verstr += f" <font color=red>DEP MISSING: {','.join(map(make_link, missing))}</font>"
+    if broken:
+        verstr += f" <font color=red>DEP BROKEN: {','.join(map(make_link, broken))}</font>"
+    if outdated:
+        verstr += f" <font color=yellow>DEP OUTDATED: {','.join(map(make_link, outdated))}</font>"
+
+    if show_leaf and not verstr:
+        verstr += "Leaf package, port it!"
+
+    if pkgname in outdated_logs:
+        verstr += f" <a href='logs/{pkgbase}/'><font color=grey>(Outdated FTBFS Logs)</font></a>"
+    return verstr
+
+
+for pkgname in sorted(broken_pkgs):
+    package = x86_packages[pkgname]
+    ftbfs_link = f"logs/{package['base']}/"
+    log_marks = render_missing_dep(package["base"])
+    if os.path.isfile(f"{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}.log"):
+        ftbfs_link = f"logs/{package['base']}/{package['base']}-{package['version']}.log"
+        if os.path.getmtime(f"{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}.log") < old_log_threshold:
+            log_marks += " <span class='badge bg-warning'>old</span>"
+        failed_stage = parse_build_log(f"{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}.log")
+        if failed_stage:
+            log_marks += f" <span class='badge bg-danger'>{failed_stage}</span>"
+    elif glob.glob(f"{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}-*.log"):
+        log_marks += " <span class='badge bg-warning'>old format</span>"
+
+    pkgname_str = pkgname
+    if pkgname != package['base']:
+        pkgname_str += f" ({package['base']})"
+
+    print(f"<tr id='{pkgname}'><td>{package['db']}</td><td>{pkgname_str}</td><td><a href='{ftbfs_link}'>"
+          f"<font color=red>FTBFS</font></a>{log_marks + patch_repo_link(package['base'])}</td></tr>")
+
 
 for pkgname in sorted(version_mismatch):
     if pkgname in broken_pkgs:
@@ -182,12 +223,7 @@ for pkgname in sorted(version_mismatch):
         verstr = f"<font color=yellow>{rvver} <- {x86ver}</font>"
     verstr += f" <a href={x86_history_link(pkgbase, db)}>Changes</a>"
 
-    dep = missing_dep(pkgbase)
-    if dep:
-        verstr += f" <font color=red>Dependency '{dep}' not satisfied.</font>"
-
-    if pkgname in outdated_logs:
-        verstr += f" <a href='logs/{pkgbase}/'><font color=yellow>(Outdated FTBFS Logs)</font></a>"
+    verstr += render_missing_dep(pkgbase)
 
     verstr += patch_repo_link(pkgbase)
 
@@ -195,7 +231,7 @@ for pkgname in sorted(version_mismatch):
     if pkgname != pkgbase:
         pkgname_str += f" ({pkgbase})"
 
-    print(f"<tr><td>{db}</td><td>{pkgname_str}</td><td>{verstr}</td></tr>")
+    print(f"<tr id='{pkgname}'><td>{db}</td><td>{pkgname_str}</td><td>{verstr}</td></tr>")
 
 for pkgname, package in x86_packages.items():
     if pkgname in rv_packages or pkgname in broken_pkgs or pkgname in blacklist:
@@ -205,15 +241,9 @@ for pkgname, package in x86_packages.items():
     if pkgname != package['base']:
         pkgname_str += f" ({package['base']})"
 
-    dep = missing_dep(package['base'])
-    if dep:
-        print(f"<tr><td>{package['db']}</td><td>{pkgname_str}</td><td><font color=red>Dependency '{dep}' not satisfied.</font></td></tr>")
-    else:
-        verstr = "Leaf package, port it!"
-        if pkgname in outdated_logs:
-            verstr += f" <a href='logs/{package['base']}/'><font color=yellow>(Outdated FTBFS Logs)</font></a>"
-        verstr += patch_repo_link(package['base'])
-        print(f"<tr><td>{package['db']}</td><td>{pkgname_str}</td><td>{verstr}</td></tr>")
+    verstr = render_missing_dep(package['base'], show_leaf=True)
+    verstr += patch_repo_link(package['base'])
+    print(f"<tr id='{pkgname}'><td>{package['db']}</td><td>{pkgname_str}</td><td>{verstr}</td></tr>")
 
 for pkgname, package in rv_packages.items():
     if pkgname not in x86_packages:
