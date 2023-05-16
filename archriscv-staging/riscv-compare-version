@@ -40,11 +40,16 @@ print("""
 <thead><tr><th scope="col">DB</th><th scope="col">Package</th><th scope="col">Status</th></tr></thead><tbody>
 """)
 
-def read_db(handle, db, result, build_pkgbase_map=False, check_duplicate=False):
+def read_db(handle, db, result, build_pkgbase_map=False, check_duplicate=False, check_file=False):
     db_handle = handle.register_syncdb(db, 0)
     for package in db_handle.search(""):
+        if check_file:
+            if not os.path.exists(f"{REPOROOT}/repo/{db}/{package.filename}"):
+                print(f"<tr><td>{db}</td><td>{package.name}</td><td><font color=red>Lint: package file not found in repository</font></td></tr>")
+            elif not os.path.exists(f"{REPOROOT}/repo/{db}/{package.filename}.sig"):
+                print(f"<tr><td>{db}</td><td>{package.name}</td><td><font color=red>Lint: package signature not found in repository</font></td></tr>")
         if check_duplicate and package.name in result:
-            print(f"<tr><td>{db}</td><td>{package.name}</td><td><font color=red>Lint: package found in different repository: {result[package.name]['db']}.</font></td></tr>")
+            print(f"<tr><td>{db}</td><td>{package.name}</td><td><font color=red>Lint: package found in different repository: {result[package.name]['db']}. x86 repo: {x86_packages[package.name]['db']}</font></td></tr>")
         for field in ("depends", "makedepends", "checkdepends", "provides", "arch", "base", "version"):
             result[package.name][field] = getattr(package, field)
         result[package.name]["db"] = db
@@ -53,7 +58,7 @@ def read_db(handle, db, result, build_pkgbase_map=False, check_duplicate=False):
 
 for db in ["core", "extra", "community"]:
     read_db(x86_handle, db, x86_packages, build_pkgbase_map=True)
-    read_db(rv_handle, db, rv_packages, check_duplicate=True)
+    read_db(rv_handle, db, rv_packages, check_duplicate=True, check_file=True)
 
 rv_provides |= set(rv_packages)
 
