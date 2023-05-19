@@ -5,9 +5,9 @@
 
 common_header = '
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.2.0/dist/css/bootstrap.min.css" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@0.9.4/css/bulma.min.css">
 <style>tr:hover { background-color: #ddd !important; }</style>
-<div class="table-responsive-sm"><table class="table table-sm table-hover">'
+<table class="table is-hoverable">'
 
 def vercmp_workaround(version)
     if version.include? "-"
@@ -21,8 +21,8 @@ arch_data = Hash.new{|h,k| h[k] = []}
 
 File.open('/var/www/aosc/treevsrepo/index.html.tmp', 'w') do |f|
     f.puts common_header + '
-    <thead><tr><th scope="col">Package</th><th scope="col">Arch</th><th scope="col">Tree Version</th>
-    <th scope="col">Repo Version</th></thead><tbody>'
+    <thead><tr><th>Package</th><th>Arch</th><th>Tree Version</th>
+    <th>Repo Version</th></thead><tbody>'
 
     File.open('/tmp/treevsrepo.txt').each do |line|
         case line.split("|").map(&:strip)
@@ -44,7 +44,7 @@ File.open('/var/www/aosc/treevsrepo/index.html.tmp', 'w') do |f|
         end
     end
 
-    f.puts '</tbody></table></div>'
+    f.puts '</tbody></table>'
 end
 
 File.rename('/var/www/aosc/treevsrepo/index.html.tmp', '/var/www/aosc/treevsrepo/index.html')
@@ -54,14 +54,14 @@ arch_data.each do |arch, data|
     arch_dir = "/var/www/aosc/treevsrepo/#{arch}"
     Dir.mkdir(arch_dir) unless File.exists?(arch_dir)
     File.open("#{arch_dir}/index.html.tmp", 'w') do |f|
-        f.puts common_header + '<thead><tr><th scope="col">Package</th><th scope="col">Tree Version</th>
-        <th scope="col">Repo Version</th></thead><tbody>'
+        f.puts common_header + '<thead><tr><th>Package</th><th>Tree Version</th>
+        <th>Repo Version</th></thead><tbody>'
         data.each do |name, tree_version, tree_color, repo_version, repo_color|
             f.puts "<tr><td>#{name}</td>
                     <td><font color=#{tree_color}>#{tree_version}</font></td>
                     <td><font color=#{repo_color}>#{repo_version}</font></td></tr>"
         end
-        f.puts '</tbody></table></div>'
+        f.puts '</tbody></table>'
     end
     File.rename("#{arch_dir}/index.html.tmp", "#{arch_dir}/index.html")
 end
