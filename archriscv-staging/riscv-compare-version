@@ -34,10 +34,10 @@ with open(PATCHREPO + "/blacklist.txt") as f:
 
 print("""
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.2.0/dist/css/bootstrap.min.css" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@0.9.4/css/bulma.min.css">
 <style>tr:hover { background-color: #ddd !important; }</style>
-<div class="table-responsive-sm"><table class="table table-sm table-hover">
-<thead><tr><th scope="col">DB</th><th scope="col">Package</th><th scope="col">Status</th></tr></thead><tbody>
+<table class="table is-hoverable">
+<thead><tr><th>DB</th><th>Package</th><th>Status</th></tr></thead><tbody>
 """)
 
 def read_db(handle, db, result, build_pkgbase_map=False, check_duplicate=False, check_file=False):
@@ -86,7 +86,7 @@ def x86_history_link(package, db):
 
 def patch_repo_link(package):
     if os.path.exists(f"{PATCHREPO}/{package}"):
-        return f" <a href=https://github.com/felixonmars/archriscv-packages/tree/master/{package}><span class='badge bg-secondary'>patched</span></a>"
+        return f" <a href=https://github.com/felixonmars/archriscv-packages/tree/master/{package}><span class='tag is-info'>patched</span></a>"
     else:
         return ""
 
@@ -171,17 +171,17 @@ def render_missing_dep(pkgbase, show_leaf=False):
     verstr = ""
     missing, broken, outdated = missing_dep(pkgbase)
     if missing:
-        verstr += f" <font color=red>DEP MISSING: {','.join(map(make_link, missing))}</font>"
+        verstr += f" <span class='tag is-danger'>DEP MISSING: {','.join(map(make_link, missing))}</span>"
     if broken:
-        verstr += f" <font color=red>DEP BROKEN: {','.join(map(make_link, broken))}</font>"
+        verstr += f" <span class='tag is-danger'>DEP BROKEN: {','.join(map(make_link, broken))}</span>"
     if outdated:
-        verstr += f" <font color=yellow>DEP OUTDATED: {','.join(map(make_link, outdated))}</font>"
+        verstr += f" <span class='tag is-warning'>DEP OUTDATED: {','.join(map(make_link, outdated))}</span>"
 
     if show_leaf and not verstr:
         verstr += "Leaf package, port it!"
 
     if pkgname in outdated_logs:
-        verstr += f" <a href='logs/{pkgbase}/'><font color=grey>(Outdated FTBFS Logs)</font></a>"
+        verstr += f" <a href='logs/{pkgbase}/'><span class='tag is-light'>Outdated FTBFS Logs</span></a>"
     return verstr
 
 
@@ -192,19 +192,19 @@ for pkgname in sorted(broken_pkgs):
     if os.path.isfile(f"{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}.log"):
         ftbfs_link = f"logs/{package['base']}/{package['base']}-{package['version']}.log"
         if os.path.getmtime(f"{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}.log") < old_log_threshold:
-            log_marks += " <span class='badge bg-warning'>old</span>"
+            log_marks += " <span class='tag is-warning'>old</span>"
         failed_stage = parse_build_log(f"{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}.log")
         if failed_stage:
-            log_marks += f" <span class='badge bg-danger'>{failed_stage}</span>"
+            log_marks += f" <span class='tag is-danger'>{failed_stage}</span>"
     elif glob.glob(f"{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}-*.log"):
-        log_marks += " <span class='badge bg-warning'>old format</span>"
+        log_marks += " <span class='tag is-warning'>old format</span>"
 
     pkgname_str = pkgname
     if pkgname != package['base']:
         pkgname_str += f" ({package['base']})"
 
     print(f"<tr id='{pkgname}'><td>{package['db']}</td><td>{pkgname_str}</td><td><a href='{ftbfs_link}'>"
-          f"<font color=red>FTBFS</font></a>{log_marks + patch_repo_link(package['base'])}</td></tr>")
+          f"<span class='tag is-danger'>FTBFS</span></a>{log_marks + patch_repo_link(package['base'])}</td></tr>")
 
 
 for pkgname in sorted(version_mismatch):
@@ -225,8 +225,8 @@ for pkgname in sorted(version_mismatch):
         else:
             verstr = f"<font color=green>{rvver} -> {x86ver}</font>"
     elif cmp > 0:
-        verstr = f"<font color=yellow>{rvver} <- {x86ver}</font>"
-    verstr += f" <a href={x86_history_link(pkgbase, db)}>Changes</a>"
+        verstr = f"<font color=orange>{rvver} <- {x86ver}</font>"
+    verstr += f" <a href={x86_history_link(pkgbase, db)}><span class='tag is-info'>Changes</span></a>"
 
     verstr += render_missing_dep(pkgbase)
 
@@ -256,4 +256,4 @@ for pkgname, package in rv_packages.items():
     elif x86_packages[pkgname]["db"] != package["db"]:
         print(f"<tr><td>{package['db']}</td><td>{pkgname}</td><td><font color=red>Lint: package in different x86 repository: {x86_packages[pkgname]['db']}.</font></td></tr>")
 
-print('</tbody></table></div>')
+print('</tbody></table>')
