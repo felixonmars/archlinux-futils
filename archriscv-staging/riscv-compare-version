@@ -1,6 +1,7 @@
 #!/usr/bin/python
 
 from collections import defaultdict
+from functools import partial
 import glob
 import os
 import pyalpm
@@ -35,7 +36,10 @@ with open(PATCHREPO + "/blacklist.txt") as f:
 print("""
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@0.9.4/css/bulma.min.css">
-<style>tr:hover { background-color: #ddd !important; }</style>
+<style>
+tr:hover { background-color: #ddd !important; }
+.tag.tag-with-details { height: auto; min-height: 2em; }
+</style>
 <table class="table is-hoverable">
 <thead><tr><th>DB</th><th>Package</th><th>Status</th></tr></thead><tbody>
 """)
@@ -163,19 +167,30 @@ def missing_dep(pkgbase):
     return missing, broken, outdated
 
 
-def make_link(package):
-    return f"<a href='#{package}'>{package}</a>"
+def make_link(list, package):
+    return f"<li><a href='#{package}'>{package}</a></li>" if list else f"<a href='#{package}'>{package}</a>"
 
-
+def make_tag_with_details(pkg_set, label, category):
+    def get_config(pkg_set):
+        # config: use_list, separator, content_before, content_after
+        if len(pkg_set) <= 2:
+            return False, ', ', '', ''
+        else:
+            return True, '', '<details><ul>', '</ul></details>'
+    use_list, separator, content_before, content_after = get_config(pkg_set)
+    return f" <span class='tag tag-with-details is-{category}'>" + \
+        f"{label}: {content_before}{separator.join(map(partial(make_link, use_list), pkg_set))}{content_after}</span>"
+    
 def render_missing_dep(pkgbase, show_leaf=False):
     verstr = ""
     missing, broken, outdated = missing_dep(pkgbase)
+
     if missing:
-        verstr += f" <span class='tag is-danger'>DEP MISSING: {','.join(map(make_link, missing))}</span>"
+        verstr += make_tag_with_details(missing, 'DEP MISSING', 'danger')
     if broken:
-        verstr += f" <span class='tag is-danger'>DEP BROKEN: {','.join(map(make_link, broken))}</span>"
+        verstr += make_tag_with_details(broken, 'DEP BROKEN', 'danger')
     if outdated:
-        verstr += f" <span class='tag is-warning'>DEP OUTDATED: {','.join(map(make_link, outdated))}</span>"
+        verstr += make_tag_with_details(outdated, 'DEP OUTDATED', 'warning')
 
     if show_leaf and not verstr:
         verstr += "Leaf package, port it!"
