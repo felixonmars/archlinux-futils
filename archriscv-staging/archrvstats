@@ -10,7 +10,7 @@ mkdir sync
 
 pacman -Sy >/dev/null
 
-for _db in core extra community; do
+for _db in core extra; do
   cp $REPOROOT/repo/$_db/$_db.db sync/
   ARCH=$(pacman -Sl $_db | wc -l)
   RV=$(pacman -Sl $_db -b $_tmpdir 2>/dev/null | wc -l)

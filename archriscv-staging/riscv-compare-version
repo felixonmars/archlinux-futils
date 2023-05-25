@@ -60,7 +60,7 @@ def read_db(handle, db, result, build_pkgbase_map=False, check_duplicate=False, 
         if build_pkgbase_map:
             pkgbase_map[result[package.name]["base"]].add(package.name)
 
-for db in ["core", "extra", "community"]:
+for db in ["core", "extra"]:
     read_db(x86_handle, db, x86_packages, build_pkgbase_map=True)
     read_db(rv_handle, db, rv_packages, check_duplicate=True, check_file=True)
 
@@ -79,18 +79,12 @@ for pkgname, package in rv_packages.copy().items():
     for _package in package["provides"]:
         rv_provides.add(_package.split("=")[0])
 
-def x86_history_link(package, db):
-    if db in ["community"]:
-        repo = 'community'
-    elif db in ["core", "extra"]:
-        repo = 'packages'
-    else:
-        repo = 'unsupported'
-    return f"https://github.com/archlinux/svntogit-{repo}/commits/packages/{package}/trunk"
+def x86_history_link(pkgbase):
+    return f"https://gitlab.archlinux.org/archlinux/packaging/packages/{pkgbase}/-/commits/main"
 
-def patch_repo_link(package):
-    if os.path.exists(f"{PATCHREPO}/{package}"):
-        return f" <a href=https://github.com/felixonmars/archriscv-packages/tree/master/{package}><span class='tag is-info'>patched</span></a>"
+def patch_repo_link(pkgbase):
+    if os.path.exists(f"{PATCHREPO}/{pkgbase}"):
+        return f" <a href=https://github.com/felixonmars/archriscv-packages/tree/master/{pkgbase}><span class='tag is-info'>patched</span></a>"
     else:
         return ""
 
@@ -241,7 +235,7 @@ for pkgname in sorted(version_mismatch):
             verstr = f"<font color=green>{rvver} -> {x86ver}</font>"
     elif cmp > 0:
         verstr = f"<font color=orange>{rvver} <- {x86ver}</font>"
-    verstr += f" <a href={x86_history_link(pkgbase, db)}><span class='tag is-info'>Changes</span></a>"
+    verstr += f" <a href={x86_history_link(pkgbase)}><span class='tag is-info'>Changes</span></a>"
 
     verstr += render_missing_dep(pkgbase)
 
