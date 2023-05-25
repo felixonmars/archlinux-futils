@@ -25,10 +25,8 @@ end
     arch = "x86_64"
   end
 
-  if cwd =~ /.*\/([a-zA-Z0-9_\-\.+]+)\/trunk/
-    pkgbase = $1
-  elsif cwd =~ /.*\/([a-zA-Z0-9_\-\.+]+)\/repos\/\w+-\w+/
-    pkgbase = $1
+  if File.exist? "#{cwd}/PKGBUILD"
+    pkgbase = cwd.split("/")[-1]
   else
     pkgbase = "unknown"
   end
