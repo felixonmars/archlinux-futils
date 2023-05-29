@@ -1,0 +1,15 @@
+#!/bin/bash
+
+if [[ $1 == "copy" ]]; then
+    if [[ $XDG_SESSION_TYPE == "wayland" ]]; then
+        wl-copy
+    else
+        xclip -i -selection clipboard
+    fi
+else
+    if [[ $XDG_SESSION_TYPE == "wayland" ]]; then
+        wl-paste
+    else
+        xclip -o -selection clipboard
+    fi
+fi
