@@ -1,32 +1,4 @@
 #!/bin/bash
+# placeholder for compatiblity
 
-REPOROOT=/var/www/archlinuxriscv
-PATCHREPO=/var/www/archriscv-packages
-
-_tmpfile=$(mktemp)
-_tmpdir=$(mktemp -d)
-cd $_tmpdir
-mkdir sync
-
-pacman -Sy >/dev/null
-
-for _db in core extra; do
-  cp $REPOROOT/repo/$_db/$_db.db sync/
-  ARCH=$(pacman -Sl $_db | wc -l)
-  RV=$(pacman -Sl $_db -b $_tmpdir 2>/dev/null | wc -l)
-  PERCENT=$(bc <<< "scale=2; $RV * 100 / $ARCH")
-  echo "[$_db] $RV / $ARCH ($PERCENT%)" >> $_tmpfile
-done
-
-(cd $PATCHREPO; git pull)
-
-riscv-compare-version $_tmpdir $REPOROOT $PATCHREPO > $REPOROOT/.status/status.htm.new
-mv $REPOROOT/.status/status.htm{.new,}
-
-chmod 644 $_tmpfile
-mv $_tmpfile $REPOROOT/.status/status.txt
-rm -r $_tmpdir
-
-cd $REPOROOT
-find . -name '*.tar.zst' -type f -printf "%T@ %TF %TT %p\n" | sort -k1nr | head -n 10 | cut -d " " -f 2-4 > .status/lastupdate.txt
-find . -name '*.log' -type f -printf "%T@ %TF %TT %p\n" | sort -k1nr | head -n 50 | cut -d " " -f 2-4 > .status/latestlogs.txt
+riscv-compare-version

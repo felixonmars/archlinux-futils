@@ -1,268 +1,330 @@
-#!/usr/bin/python
+#!/usr/bin/ruby
 
-from collections import defaultdict
-from functools import partial
-import glob
-import os
-import pyalpm
-import sys
-import time
+require 'set'
+require 'tempfile'
+require 'pycall/import'
 
-RVDBDIR = sys.argv[1]
-REPOROOT = sys.argv[2]
-PATCHREPO = sys.argv[3]
+include PyCall::Import
 
-x86_handle = pyalpm.Handle(".", "/var/lib/pacman")
-rv_handle = pyalpm.Handle(".", f"{RVDBDIR}")
+pyimport :pyalpm
 
-rv_packages = defaultdict(dict)
-x86_packages = defaultdict(dict)
-pkgbase_map = defaultdict(set)
+REPOROOT = "/var/www/archlinuxriscv"
+PATCHREPO = "/var/www/archriscv-packages"
 
-rv_provides = set()
+$x86_packages = Hash.new{|h,k| h[k] = {}}
+$rv_packages = Hash.new{|h,k| h[k] = {}}
+$pkgbase_map = Hash.new{|h,k| h[k] = Set[]}
 
-version_mismatch = set()
-db_mismatch = set()
+$rv_provides = Set[]
 
-blacklist = set()
+$outdated_logs = Set[]
+$version_mismatch = Set[]
+$blacklist = Set[]
+$broken_pkgs = Set[]
 
-with open(PATCHREPO + "/blacklist.txt") as f:
-    for pkg in f:
-        pkg = pkg.rstrip("\n")
-        if pkg.startswith("#") or not pkg:
-            continue
-        blacklist.add(pkg)
+File.read(PATCHREPO + "/blacklist.txt").each_line do |pkg|
+    pkg.chomp!
+    next if pkg.start_with? "#" or pkg == ""
+    $blacklist << pkg
+end
 
-print("""
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@0.9.4/css/bulma.min.css">
-<style>
-tr:hover { background-color: #ddd !important; }
-.tag.tag-with-details { height: auto; min-height: 2em; }
-</style>
-<table class="table is-hoverable">
-<thead><tr><th>DB</th><th>Package</th><th>Status</th></tr></thead><tbody>
-""")
+File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
+    f.puts('
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@0.9.4/css/bulma.min.css">
+    <style>
+    tr:hover { background-color: #ddd !important; }
+    .tag.tag-with-details { height: auto; min-height: 2em; }
+    </style>
+    <table class="table is-hoverable">
+    <thead><tr><th>DB</th><th>Package</th><th>Status</th></tr></thead><tbody>
+    ')
 
-def read_db(handle, db, result, build_pkgbase_map=False, check_duplicate=False, check_file=False):
-    db_handle = handle.register_syncdb(db, 0)
-    for package in db_handle.search(""):
-        if check_file:
-            if not os.path.exists(f"{REPOROOT}/repo/{db}/{package.filename}"):
-                print(f"<tr><td>{db}</td><td>{package.name}</td><td><font color=red>Lint: package file not found in repository</font></td></tr>")
-            elif not os.path.exists(f"{REPOROOT}/repo/{db}/{package.filename}.sig"):
-                print(f"<tr><td>{db}</td><td>{package.name}</td><td><font color=red>Lint: package signature not found in repository</font></td></tr>")
-        if check_duplicate and package.name in result:
-            print(f"<tr><td>{db}</td><td>{package.name}</td><td><font color=red>Lint: package found in different repository: {result[package.name]['db']}. x86 repo: {x86_packages[package.name]['db']}</font></td></tr>")
-        for field in ("depends", "makedepends", "checkdepends", "provides", "arch", "base", "version"):
-            result[package.name][field] = getattr(package, field)
-        result[package.name]["db"] = db
-        if build_pkgbase_map:
-            pkgbase_map[result[package.name]["base"]].add(package.name)
+    def read_db(handle, db, result, build_pkgbase_map: false, check_duplicate: false, check_rv: false)
+        rvstat = "" if check_rv
 
-for db in ["core", "extra"]:
-    read_db(x86_handle, db, x86_packages, build_pkgbase_map=True)
-    read_db(rv_handle, db, rv_packages, check_duplicate=True, check_file=True)
+        db_handle = handle.register_syncdb(db, 0)
+        count = 0
+        db_handle.search("").each do |package|
+            if check_rv
+                if ! File.exists?("#{REPOROOT}/repo/#{db}/#{package.filename}")
+                    f.puts("<tr><td>#{db}</td><td>#{package.name}</td><td><font color=red>Lint: package file not found in repository</font></td></tr>")
+                elsif ! File.exists?("#{REPOROOT}/repo/#{db}/#{package.filename}.sig")
+                    f.puts("<tr><td>#{db}</td><td>#{package.name}</td><td><font color=red>Lint: package signature not found in repository</font></td></tr>")
+                end
+            end
 
-rv_provides |= set(rv_packages)
+            if check_duplicate && result.has_key?(package.name)
+                f.puts("<tr><td>#{db}</td><td>#{package.name}</td>
+                            <td><font color=red>Lint: package found in different repository: #{result[package.name]['db']}.
+                            x86 repo: #{$x86_packages[package.name]['db']}</font></td></tr>")
+            end
+            ["depends", "makedepends", "checkdepends", "provides", "arch", "base", "version"].each do |field|
+                result[package.name][field] = package.send(field)
+            end
+            result[package.name]["db"] = db
 
-for pkgname, package in rv_packages.copy().items():
-    rvver = package["version"]
+            $pkgbase_map[result[package.name]["base"]] << package.name if build_pkgbase_map
+            count += 1
+        end
 
-    if "." in rvver.split("-")[1]:
-        rvver = "-".join((rvver.split("-")[0], rvver.split("-")[1].split(".")[0]))
+        if check_rv
+            percent = (count * 100.0 / check_rv).round(2)
+            return "[#{db}] #{count} / #{check_rv} (#{percent}%)"
+        end
 
-    if pkgname in x86_packages:
-        if rvver != x86_packages[pkgname]["version"]:
-            version_mismatch.add(pkgname)
+        count
+    end
 
-    for _package in package["provides"]:
-        rv_provides.add(_package.split("=")[0])
+    Dir.mktmpdir do |dir|
+        Dir.mkdir("#{dir}/sync")
+        ["core", "extra"].each do |db|
+            FileUtils.ln_s("#{REPOROOT}/repo/#{db}/#{db}.db", "#{dir}/sync/")
+        end
 
-def x86_history_link(pkgbase):
-    return f"https://gitlab.archlinux.org/archlinux/packaging/packages/{pkgbase}/-/commits/main"
+        x86_handle = pyalpm.Handle.new(".", "/var/lib/pacman")
+        rv_handle = pyalpm.Handle.new(".", "#{dir}")
 
-def patch_repo_link(pkgbase):
-    if os.path.exists(f"{PATCHREPO}/{pkgbase}"):
-        return f" <a href=https://github.com/felixonmars/archriscv-packages/tree/master/{pkgbase}><span class='tag is-info'>patched</span></a>"
-    else:
-        return ""
+        stat = ""
+        ["core", "extra"].each do |db|
+            count = read_db(x86_handle, db, $x86_packages, build_pkgbase_map: true)
+            stat += read_db(rv_handle, db, $rv_packages, check_duplicate: true, check_rv: count) + "\n"
+        end
 
-def parse_build_log(log):
-    stages = [
-        ("patch failed", "\x1b[1m\x1b[32m==>\x1b[m\x0f\x1b[1m Applying RISC-V patches...\x1b[m\x0f"),
-        ("source download failed", "\x1b[1m\x1b[31m==> ERROR:\x1b[m\x0f\x1b[1m Failure while downloading"),
-        ("checksum mismatch", "\x1b[1m\x1b[31m==> ERROR:\x1b[m\x0f\x1b[1m One or more files did not pass the validity check"),
-        ("gpg failed", "\x1b[1m\x1b[31m==> ERROR:\x1b[m\x0f\x1b[1m One or more PGP signatures"),
-        ("dependency missing", "\x1b[?25h\x1b[1m\x1b[31m==> ERROR:\x1b[m\x0f\x1b[1m Could not resolve all dependencies"),
-        ("dependency missing", "\x1b[1m\x1b[31m==> ERROR:\x1b[m\x0f\x1b[1m Could not resolve all dependencies."),
-        ("prepare() failed", "\x1b[1m\x1b[31m==> ERROR:\x1b[m\x0f\x1b[1m A failure occurred in prepare()."),
-        ("build() failed", "\x1b[1m\x1b[31m==> ERROR:\x1b[m\x0f\x1b[1m A failure occurred in build()."),
-        ("check() failed", "\x1b[1m\x1b[31m==> ERROR:\x1b[m\x0f\x1b[1m A failure occurred in check()."),
-        ("package() failed", "\x1b[1m\x1b[31m==> ERROR:\x1b[m\x0f\x1b[1m A failure occurred in package"),
-        ("old config.guess", "configure: error: cannot guess build type; you must specify one"),
-        ("broken rust target", "  error: Error loading target specification: Could not find specification for target \"riscv64-unknown-linux-gnu\".")
-    ]
-    last_failed_stage = None
-    with open(log, errors="backslashreplace") as f:
-        for line in f:
-            for stage, prefix in stages.copy():
-                if line.startswith(prefix):
+        File.open("#{REPOROOT}/.status/status.txt.tmp", 'w') do |f|
+            f.puts(stat)
+        end
+        File.rename("#{REPOROOT}/.status/status.txt.tmp", "#{REPOROOT}/.status/status.txt")
+    end
+
+    $rv_provides |= $rv_packages.keys.to_set
+
+    $rv_packages.each do |pkgname, package|
+        rvver = package["version"]
+
+        if rvver.split("-")[1].include? "."
+            rvver = [rvver.split("-")[0], rvver.split("-")[1].split(".")[0]].join("-")
+        end
+
+        if $x86_packages.has_key?(pkgname) && $x86_packages[pkgname]["version"] != rvver
+            $version_mismatch << pkgname
+        end
+
+        package["provides"].each do |_package|
+            $rv_provides << _package.split("=")[0]
+        end
+    end
+
+    def x86_history_link(pkgbase)
+        "https://gitlab.archlinux.org/archlinux/packaging/packages/#{pkgbase}/-/commits/main"
+    end
+
+    def patch_repo_link(pkgbase)
+        if File.exists?("#{PATCHREPO}/#{pkgbase}")
+            " <a href=https://github.com/felixonmars/archriscv-packages/tree/master/#{pkgbase}>
+              <span class='tag is-info'>patched</span></a>"
+        else
+            ""
+        end
+    end
+
+    def parse_build_log(log)
+        stages = [
+            ["patch failed", "\x1b[1m\x1b[32m==>\x1b[m\x0f\x1b[1m Applying RISC-V patches...\x1b[m\x0f"],
+            ["source download failed", "\x1b[1m\x1b[31m==> ERROR:\x1b[m\x0f\x1b[1m Failure while downloading"],
+            ["checksum mismatch", "\x1b[1m\x1b[31m==> ERROR:\x1b[m\x0f\x1b[1m One or more files did not pass the validity check"],
+            ["gpg failed", "\x1b[1m\x1b[31m==> ERROR:\x1b[m\x0f\x1b[1m One or more PGP signatures"],
+            ["dependency missing", "\x1b[?25h\x1b[1m\x1b[31m==> ERROR:\x1b[m\x0f\x1b[1m Could not resolve all dependencies"],
+            ["dependency missing", "\x1b[1m\x1b[31m==> ERROR:\x1b[m\x0f\x1b[1m Could not resolve all dependencies."],
+            ["prepare() failed", "\x1b[1m\x1b[31m==> ERROR:\x1b[m\x0f\x1b[1m A failure occurred in prepare()."],
+            ["build() failed", "\x1b[1m\x1b[31m==> ERROR:\x1b[m\x0f\x1b[1m A failure occurred in build()."],
+            ["check() failed", "\x1b[1m\x1b[31m==> ERROR:\x1b[m\x0f\x1b[1m A failure occurred in check()."],
+            ["package() failed", "\x1b[1m\x1b[31m==> ERROR:\x1b[m\x0f\x1b[1m A failure occurred in package"],
+            ["old config.guess", "configure: error: cannot guess build type; you must specify one"],
+            ["broken rust target", "  error: Error loading target specification: Could not find specification for target \"riscv64-unknown-linux-gnu\"."],
+        ]
+        last_failed_stage = nil
+        File.read(log).each_line do |line|
+            stages.each do |stage, prefix|
+                if line.start_with?(prefix)
                     last_failed_stage = stage
                     # Only check stages after the last failed stage for the following lines
-                    for stage, prefix in stages.copy():
-                        stages.remove((stage, prefix))
-                        if stage == last_failed_stage:
+                    stages.dup.each do |stage, prefix|
+                        stages.delete [stage, prefix]
+                        if stage == last_failed_stage
                             break
-    return last_failed_stage
+                        end
+                    end
+                end
+            end
+        end
+        last_failed_stage
+    end
 
+    old_log_threshold = Time.now - 30 * 24 * 60 * 60
+    $x86_packages.each do |pkgname, package|
+        if File.exists?("#{REPOROOT}/.status/logs/#{package['base']}")
+            if $rv_packages.has_key?(pkgname)
+                rvver = $rv_packages[pkgname]["version"]
+                if rvver.split("-")[1].include? "."
+                    rvver = [rvver.split("-")[0], rvver.split("-")[1].split(".")[0]].join("-")
+                end
+                next if rvver == package["version"]
+            end
 
-broken_pkgs = set()
-outdated_logs = set()
-old_log_threshold = time.time() - 30 * 24 * 60 * 60
-for pkgname, package in x86_packages.items():
-    if os.path.exists(f"{REPOROOT}/.status/logs/{package['base']}"):
-        if pkgname in rv_packages:
-            rvver = rv_packages[pkgname]["version"]
-            if "." in rvver.split("-")[1]:
-                rvver = "-".join((rvver.split("-")[0], rvver.split("-")[1].split(".")[0]))
-            if rvver == package["version"]:
-                continue
+            if File.exists?("#{REPOROOT}/.status/logs/#{package['base']}/#{package['base']}-#{package['version']}.log")
+                nil
+            elsif Dir.glob("#{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}-*.log").any?
+                nil
+            else
+                $outdated_logs |= $pkgbase_map[package['base']]
+                next
+            end
 
-        if os.path.isfile(f"{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}.log"):
-            pass
-        elif glob.glob(f"{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}-*.log"):
-            pass
-        else:
-            outdated_logs |= pkgbase_map[package['base']]
-            continue
+            $broken_pkgs << pkgname
+        end
+    end
 
-        broken_pkgs.add(pkgname)
+    def missing_dep(pkgbase)
+        check_pkgs = Set[]
+        $pkgbase_map[pkgbase].each do |pkgname|
+            package = $x86_packages[pkgname]
+            check_pkgs |= (package["depends"] + package["makedepends"] + package["checkdepends"]).to_set
+        end
 
-def missing_dep(pkgbase):
-    check_pkgs = set()
-    for pkgname in pkgbase_map[pkgbase]:
-        package = x86_packages[pkgname]
-        check_pkgs |= set(package["depends"] + package["makedepends"] + package["checkdepends"])
+        missing = Set[]
+        broken = Set[]
+        outdated = Set[]
+        check_pkgs.each do |dep|
+            ["<", ">", "="].each do |op|
+                dep = dep.split(op)[0]
+            end
 
-    missing = set()
-    broken = set()
-    outdated = set()
-    for dep in check_pkgs:
-        for _c in "<", ">", "=":
-            dep = dep.split(_c)[0]
-        if dep not in rv_provides and dep not in pkgbase_map[pkgbase]:
-            missing.add(dep)
-        elif dep in broken_pkgs:
-            broken.add(dep)
-        elif dep in version_mismatch:
-            outdated.add(dep)
+            if ! $rv_provides.include?(dep) && ! $pkgbase_map[pkgbase].include?(dep)
+                missing << dep
+            elsif $broken_pkgs.include?(dep)
+                broken << dep
+            elsif $version_mismatch.include?(dep)
+                outdated << dep
+            end
+        end
+        
+        return missing, broken, outdated
+    end
 
-    return missing, broken, outdated
+    def make_link(list, package)
+        list ? "<li><a href='##{package}'>#{package}</a></li>" : "<a href='##{package}'>#{package}</a>"
+    end
 
+    def make_tag_with_details(pkg_set, label, category)
+        def get_config(pkg_set)
+            # config: use_list, separator, content_before, content_after
+            if pkg_set.size < 3
+                return false, ', ', '', ''
+            else
+                return true, '', '<details><ul>', '</ul></details>'
+            end
+        end
 
-def make_link(list, package):
-    return f"<li><a href='#{package}'>{package}</a></li>" if list else f"<a href='#{package}'>{package}</a>"
+        use_list, separator, content_before, content_after = get_config(pkg_set)
+        " <span class='tag tag-with-details is-#{category}'>
+          #{label}: #{content_before}#{pkg_set.map{|pkg| make_link(use_list, pkg)}.join(separator)}
+          #{content_after}</span>"
+    end
+        
+    def render_missing_dep(pkgbase, show_leaf=false)
+        verstr = ""
+        missing, broken, outdated = missing_dep(pkgbase)
 
-def make_tag_with_details(pkg_set, label, category):
-    def get_config(pkg_set):
-        # config: use_list, separator, content_before, content_after
-        if len(pkg_set) <= 2:
-            return False, ', ', '', ''
-        else:
-            return True, '', '<details><ul>', '</ul></details>'
-    use_list, separator, content_before, content_after = get_config(pkg_set)
-    return f" <span class='tag tag-with-details is-{category}'>" + \
-        f"{label}: {content_before}{separator.join(map(partial(make_link, use_list), pkg_set))}{content_after}</span>"
-    
-def render_missing_dep(pkgbase, show_leaf=False):
-    verstr = ""
-    missing, broken, outdated = missing_dep(pkgbase)
+        verstr += make_tag_with_details(missing, 'DEP MISSING', 'danger') if missing.any?
+        verstr += make_tag_with_details(broken, 'DEP BROKEN', 'danger') if broken.any?
+        verstr += make_tag_with_details(outdated, 'DEP OUTDATED', 'warning') if outdated.any?
 
-    if missing:
-        verstr += make_tag_with_details(missing, 'DEP MISSING', 'danger')
-    if broken:
-        verstr += make_tag_with_details(broken, 'DEP BROKEN', 'danger')
-    if outdated:
-        verstr += make_tag_with_details(outdated, 'DEP OUTDATED', 'warning')
+        verstr += "Leaf package, port it!" if show_leaf and verstr.empty?
+        verstr += " <a href='logs/#{pkgbase}/'><span class='tag is-light'>Outdated FTBFS Logs</span></a>" if $outdated_logs.include?(pkgbase)
+        verstr
+    end
 
-    if show_leaf and not verstr:
-        verstr += "Leaf package, port it!"
+    $broken_pkgs.sort.each do |pkgname|
+        package = $x86_packages[pkgname]
+        ftbfs_link = "logs/#{package['base']}/"
+        log_marks = render_missing_dep(package["base"])
+        if File.exist?("#{REPOROOT}/.status/logs/#{package['base']}/#{package['base']}-#{package['version']}.log")
+            ftbfs_link = "logs/#{package['base']}/#{package['base']}-#{package['version']}.log"
+            if File.mtime("#{REPOROOT}/.status/logs/#{package['base']}/#{package['base']}-#{package['version']}.log") < old_log_threshold
+                log_marks += " <span class='tag is-warning'>old</span>"
+            end
+            failed_stage = parse_build_log("#{REPOROOT}/.status/logs/#{package['base']}/#{package['base']}-#{package['version']}.log")
+            log_marks += " <span class='tag is-danger'>#{failed_stage}</span>" if failed_stage
+        elsif Dir.glob("#{REPOROOT}/.status/logs/#{package['base']}/#{package['base']}-#{package['version']}-*.log").any?
+            log_marks += " <span class='tag is-warning'>old format</span>"
+        end
 
-    if pkgname in outdated_logs:
-        verstr += f" <a href='logs/{pkgbase}/'><span class='tag is-light'>Outdated FTBFS Logs</span></a>"
-    return verstr
+        pkgname_str = pkgname
+        pkgname_str += " (#{package['base']})" if pkgname != package['base']
 
+        f.puts("<tr id='#{pkgname}'><td>#{package['db']}</td><td>#{pkgname_str}</td><td><a href='#{ftbfs_link}'>
+                <span class='tag is-danger'>FTBFS</span></a>#{log_marks + patch_repo_link(package['base'])}</td></tr>")
+    end
 
-for pkgname in sorted(broken_pkgs):
-    package = x86_packages[pkgname]
-    ftbfs_link = f"logs/{package['base']}/"
-    log_marks = render_missing_dep(package["base"])
-    if os.path.isfile(f"{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}.log"):
-        ftbfs_link = f"logs/{package['base']}/{package['base']}-{package['version']}.log"
-        if os.path.getmtime(f"{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}.log") < old_log_threshold:
-            log_marks += " <span class='tag is-warning'>old</span>"
-        failed_stage = parse_build_log(f"{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}.log")
-        if failed_stage:
-            log_marks += f" <span class='tag is-danger'>{failed_stage}</span>"
-    elif glob.glob(f"{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}-*.log"):
-        log_marks += " <span class='tag is-warning'>old format</span>"
+    $version_mismatch.sort.each do |pkgname|
+        next if $broken_pkgs.include? pkgname
 
-    pkgname_str = pkgname
-    if pkgname != package['base']:
-        pkgname_str += f" ({package['base']})"
+        db = $x86_packages[pkgname]['db']
+        pkgbase = $x86_packages[pkgname]['base']
+        rvver = $rv_packages[pkgname]["version"]
+        x86ver = $x86_packages[pkgname]['version']
 
-    print(f"<tr id='{pkgname}'><td>{package['db']}</td><td>{pkgname_str}</td><td><a href='{ftbfs_link}'>"
-          f"<span class='tag is-danger'>FTBFS</span></a>{log_marks + patch_repo_link(package['base'])}</td></tr>")
+        cmp = pyalpm.vercmp(rvver, x86ver)
+        if cmp < 0
+            rvpkgver = rvver.split("-")[0]
+            x86pkgver = x86ver.split("-")[0]
+            if rvpkgver == x86pkgver
+                rvpkgrel = rvver.split("-")[1]
+                x86pkgrel = x86ver.split("-")[1]
+                verstr = "#{rvpkgver}-<font color=green>#{rvpkgrel} -> </font>#{x86pkgver}-<font color=green>#{x86pkgrel}</font>"
+            else
+                verstr = "<font color=green>#{rvver} -> #{x86ver}</font>"
+            end
+        elsif cmp > 0
+            verstr = "<font color=orange>#{rvver} <- #{x86ver}</font>"
+        end
 
+        verstr += " <a href=#{x86_history_link(pkgbase)}><span class='tag is-info'>Changes</span></a>"
 
-for pkgname in sorted(version_mismatch):
-    if pkgname in broken_pkgs:
-        continue
-    db = x86_packages[pkgname]['db']
-    pkgbase = x86_packages[pkgname]['base']
-    rvver = rv_packages[pkgname]["version"]
-    x86ver = x86_packages[pkgname]['version']
-    cmp = pyalpm.vercmp(rvver, x86ver)
-    if cmp < 0:
-        rvpkgver = rvver.split("-")[0]
-        x86pkgver = x86ver.split("-")[0]
-        if rvpkgver == x86pkgver:
-            rvpkgrel = rvver.split("-")[1]
-            x86pkgrel = x86ver.split("-")[1]
-            verstr = f"{rvpkgver}-<font color=green>{rvpkgrel} -> </font>{x86pkgver}-<font color=green>{x86pkgrel}</font>"
-        else:
-            verstr = f"<font color=green>{rvver} -> {x86ver}</font>"
-    elif cmp > 0:
-        verstr = f"<font color=orange>{rvver} <- {x86ver}</font>"
-    verstr += f" <a href={x86_history_link(pkgbase)}><span class='tag is-info'>Changes</span></a>"
+        verstr += render_missing_dep(pkgbase)
 
-    verstr += render_missing_dep(pkgbase)
+        verstr += patch_repo_link(pkgbase)
 
-    verstr += patch_repo_link(pkgbase)
+        pkgname_str = pkgname
+        pkgname_str += " ({pkgbase})" if pkgname != pkgbase
 
-    pkgname_str = pkgname
-    if pkgname != pkgbase:
-        pkgname_str += f" ({pkgbase})"
+        f.puts("<tr id='#{pkgname}'><td>#{db}</td><td>#{pkgname_str}</td><td>#{verstr}</td></tr>")
+    end
 
-    print(f"<tr id='{pkgname}'><td>{db}</td><td>{pkgname_str}</td><td>{verstr}</td></tr>")
+    $x86_packages.each do |pkgname, package|
+        next if $rv_packages.include? pkgname or $broken_pkgs.include? pkgname or $blacklist.include? pkgname
 
-for pkgname, package in x86_packages.items():
-    if pkgname in rv_packages or pkgname in broken_pkgs or pkgname in blacklist:
-        continue
+        pkgname_str = pkgname
+        pkgname_str += " (#{package['base']})" if pkgname != package['base']
 
-    pkgname_str = pkgname
-    if pkgname != package['base']:
-        pkgname_str += f" ({package['base']})"
+        verstr = render_missing_dep(package['base'], show_leaf=true)
+        verstr += patch_repo_link(package['base'])
+        f.puts("<tr id='#{pkgname}'><td>#{package['db']}</td><td>#{pkgname_str}</td><td>#{verstr}</td></tr>")
+    end
 
-    verstr = render_missing_dep(package['base'], show_leaf=True)
-    verstr += patch_repo_link(package['base'])
-    print(f"<tr id='{pkgname}'><td>{package['db']}</td><td>{pkgname_str}</td><td>{verstr}</td></tr>")
+    $rv_packages.each do |pkgname, package|
+        if ! $x86_packages.include? pkgname
+            f.puts("<tr><td>#{package['db']}</td><td>#{pkgname}</td><td><font color=yellow>Lint: package not found in x86 repository.</font></td></tr>")
+        elsif $x86_packages[pkgname]["db"] != package["db"]
+            f.puts("<tr><td>#{package['db']}</td><td>#{pkgname}</td><td><font color=red>Lint: package in different x86 repository: #{$x86_packages[pkgname]['db']}.</font></td></tr>")
+        end
+    end
 
-for pkgname, package in rv_packages.items():
-    if pkgname not in x86_packages:
-        print(f"<tr><td>{package['db']}</td><td>{pkgname}</td><td><font color=yellow>Lint: package not found in x86 repository.</font></td></tr>")
-    elif x86_packages[pkgname]["db"] != package["db"]:
-        print(f"<tr><td>{package['db']}</td><td>{pkgname}</td><td><font color=red>Lint: package in different x86 repository: {x86_packages[pkgname]['db']}.</font></td></tr>")
+    f.puts('</tbody></table>')
+end
 
-print('</tbody></table>')
+File.rename("#{REPOROOT}/.status/status.htm.tmp", "#{REPOROOT}/.status/status.htm")
+
+puts `cd #{REPOROOT}/; find . -name '*.tar.zst' -type f -printf "%T@ %TF %TT %p\n" | sort -k1nr | head -n 10 | cut -d " " -f 2-4 > .status/lastupdate.txt`
+puts `cd #{REPOROOT}/; find . -name '*.log' -type f -printf "%T@ %TF %TT %p\n" | sort -k1nr | head -n 50 | cut -d " " -f 2-4 > .status/latestlogs.txt`
