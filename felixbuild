@@ -42,12 +42,6 @@ else
   fi
 fi
 
-# === Handle pkgver() ===
-if (. PKGBUILD; type pkgver &>/dev/null); then
-  msg "Attempt to run pkgver()..."
-  makepkg -o
-fi
-
 # === Sync package to remote host ===
 # Prefer to use rsync here because it's much faster than source packages
 # makepkg -Sf --skipchecksums --skippgpcheck || exit 1
@@ -77,8 +71,8 @@ if [[ -n "$(. PKGBUILD; echo $validpgpkeys)" && ! "$_cmd" == *"--skippgpcheck"* 
 fi
 
 # Try to fetch logs
-PKGPREFIX=$(source PKGBUILD; echo $PKGNAME-$epoch${epoch:+:}$pkgver-$pkgrel)
 fetch_logs() {
+  PKGPREFIX=$(source PKGBUILD; echo $PKGNAME-$epoch${epoch:+:}$pkgver-$pkgrel)
   rsync -avzz $BUILDHOST:packages/$PKGNAME/$PKGPREFIX-*.log ./
 }
 trap fetch_logs EXIT
@@ -124,3 +118,9 @@ ssh -tt $BUILDHOST "cd packages/$PKGNAME && rm -f *.pkg.tar.*; $_cmd" || exit 1
 # === Sync back artifacts ===
 msg "Syncing back built packages..."
 rsync -avzzP $BUILDHOST:packages/$PKGNAME/*.pkg.tar.* ./ || exit 1
+
+# === Sync back PKGBUILD ===
+if [[ -n "$SYNCBACKPKGBUILD" ]]; then
+  msg "Syncing back PKGBUILD..."
+  rsync -avzzP $BUILDHOST:packages/$PKGNAME/PKGBUILD ./ || exit 1
+fi
