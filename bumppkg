@@ -2,10 +2,26 @@
 set -e
 
 _repo=$1
-_pkgbase=$2
-_pkgver=$3
-_pkgrel=$4
-_msg=$5
+
+case $_repo in
+  s)
+    _suffix=staging
+    shift
+    ;;
+  t)
+    _suffix=testing
+    shift
+    ;;
+  *)
+    # Stable
+    _suffix=
+    ;;
+esac
+
+_pkgbase=$1
+_pkgver=$2
+_pkgrel=$3
+_msg=$4
 
 _build=1
 
@@ -17,56 +33,27 @@ if [[ "$_pkgrel" == "0" ]]; then
   _build=0
 fi
 
-case $_repo in
-  e)
-    _repo=extra
-    ;;
-  c)
-    _repo=community
-    ;;
-  m)
-    _repo=multilib
-    ;;
-  t)
-    _repo=testing
-    ;;
-  ct)
-    _repo=community-testing
-    ;;
-  mt)
-    _repo=multilib-testing
-    ;;
-  s)
-    _repo=staging
-    ;;
-  cs)
-    _repo=community-staging
-    ;;
-  ms)
-    _repo=multilib-staging
-    ;;
-esac
+[[ -d "$_pkgbase" ]] || pkgctl repo clone "$_pkgbase"
 
-_x86_64_build=extra-x86_64-build
-_x86_64_pkg=${_repo}pkg
+pushd $_pkgbase/
 
-if [[ "$_repo" == *testing ]]; then
-  _x86_64_build=testing-x86_64-build
-elif [[ "$_repo" == *staging ]]; then
-  _x86_64_build=staging-x86_64-build
+_pkgname=$(. PKGBUILD; echo $pkgname)
+for _repo in core extra multilib; do
+    if pacman -Sql $_repo | grep "^$_pkgname$" >/dev/null; then
+        _target=$_repo
+        break
+    fi
+done
+
+if [[ -n "$_suffix" ]]; then
+  _target=$_target-$_suffix
+  _suffix=--$_suffix
 fi
 
-if [[ "$_repo" == multilib ]]; then
-  _x86_64_build=multilib-build
-elif [[ "$_repo" == multilib-testing ]]; then
-  _x86_64_build=multilib-testing-build
-elif [[ "$_repo" == multilib-staging ]]; then
-  _x86_64_build=multilib-staging-build
+if [[ -z "$_target" ]]; then
+    error "Cannot find package in x86 repo."
+    exit 1
 fi
-
-[[ -d "$_pkgbase" ]] || svn up "$_pkgbase"
-
-pushd $_pkgbase/trunk
 
 _oldpkgver=$(. PKGBUILD; echo $pkgver)
 
@@ -123,27 +110,21 @@ sed -e 's|http://github.com/|https://github.com/|' \
 
 # root workaround
 if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
-  TMPDIR=$(mktemp -d)
-  rsync -a ./ "$TMPDIR/"
-  pushd "$TMPDIR"
-  chown -R nobody .
-  sudo -u nobody -H updpkgsums
-  popd
-  cp "$TMPDIR/PKGBUILD" ./
-  rm -r "$TMPDIR"
+  EUID=1000 updpkgsums
 else
   updpkgsums
 fi
 
-svn diff
+git --no-pager diff
 
 if [[ "$_build" -eq 1 ]]; then
   _buildserver=$(felixbuild-server-select)
 
-  felixbuild $_buildserver $_x86_64_build
+  felixbuild $_buildserver pkgctl build $_suffix
 
-  felix-package-broker $_buildserver $_repo $_pkgbase
-  flock ../../repo.lck $_x86_64_pkg "$_msg"
+  felix-package-broker $_buildserver $_target $_pkgbase
+
+  pkgctl release $_suffix -m "$_msg" --db-update
 
   cleanpkg
 fi
