@@ -22,6 +22,8 @@ $version_mismatch = Set[]
 $blacklist = Set[]
 $broken_pkgs = Set[]
 
+`pacman -Sy`
+
 File.read(PATCHREPO + "/blacklist.txt").each_line do |pkg|
     pkg.chomp!
     next if pkg.start_with? "#" or pkg == ""
@@ -326,5 +328,5 @@ end
 
 File.rename("#{REPOROOT}/.status/status.htm.tmp", "#{REPOROOT}/.status/status.htm")
 
-puts `cd #{REPOROOT}/; find . -name '*.tar.zst' -type f -printf "%T@ %TF %TT %p\n" | sort -k1nr | head -n 10 | cut -d " " -f 2-4 > .status/lastupdate.txt`
-puts `cd #{REPOROOT}/; find . -name '*.log' -type f -printf "%T@ %TF %TT %p\n" | sort -k1nr | head -n 50 | cut -d " " -f 2-4 > .status/latestlogs.txt`
+`cd #{REPOROOT}/; find . -name '*.tar.zst' -type f -printf "%T@ %TF %TT %p\n" | sort -k1nr | head -n 10 | cut -d " " -f 2-4 > .status/lastupdate.txt`
+`cd #{REPOROOT}/; find . -name '*.log' -type f -printf "%T@ %TF %TT %p\n" | sort -k1nr | head -n 50 | cut -d " " -f 2-4 > .status/latestlogs.txt`
