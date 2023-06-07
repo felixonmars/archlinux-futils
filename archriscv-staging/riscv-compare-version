@@ -299,7 +299,7 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
         verstr += patch_repo_link(pkgbase)
 
         pkgname_str = pkgname
-        pkgname_str += " ({pkgbase})" if pkgname != pkgbase
+        pkgname_str += " (#{pkgbase})" if pkgname != pkgbase
 
         f.puts("<tr id='#{pkgname}'><td>#{db}</td><td>#{pkgname_str}</td><td>#{verstr}</td></tr>")
     end
