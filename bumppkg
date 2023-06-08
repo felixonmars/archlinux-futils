@@ -110,7 +110,7 @@ sed -e 's|http://github.com/|https://github.com/|' \
 
 # root workaround
 if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
-  EUID=1000 updpkgsums
+  env EUID=1000 updpkgsums
 else
   updpkgsums
 fi
@@ -124,7 +124,12 @@ if [[ "$_build" -eq 1 ]]; then
 
   felix-package-broker $_buildserver $_target $_pkgbase
 
-  pkgctl release $_suffix -m "$_msg" --db-update
+  pkgctl release $_suffix -m "$_msg"
+
+  while ! db-update; do
+    echo "db-update failed, retrying after 5s..."
+    sleep 5
+  done
 
   cleanpkg
 fi
