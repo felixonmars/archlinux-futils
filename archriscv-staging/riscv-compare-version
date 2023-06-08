@@ -42,37 +42,18 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
     <thead><tr><th>DB</th><th>Package</th><th>Status</th></tr></thead><tbody>
     ')
 
-    def read_db(handle, db, result, build_pkgbase_map: false, check_duplicate: false, check_rv: false)
-        rvstat = "" if check_rv
-
-        db_handle = handle.register_syncdb(db, 0)
+    def read_db(handle, db, result)
         count = 0
+        db_handle = handle.register_syncdb(db, 0)
         db_handle.search("").each do |package|
-            if check_rv
-                if ! File.exists?("#{REPOROOT}/repo/#{db}/#{package.filename}")
-                    f.puts("<tr><td>#{db}</td><td>#{package.name}</td><td><font color=red>Lint: package file not found in repository</font></td></tr>")
-                elsif ! File.exists?("#{REPOROOT}/repo/#{db}/#{package.filename}.sig")
-                    f.puts("<tr><td>#{db}</td><td>#{package.name}</td><td><font color=red>Lint: package signature not found in repository</font></td></tr>")
-                end
-            end
+            yield package
 
-            if check_duplicate && result.has_key?(package.name)
-                f.puts("<tr><td>#{db}</td><td>#{package.name}</td>
-                            <td><font color=red>Lint: package found in different repository: #{result[package.name]['db']}.
-                            x86 repo: #{$x86_packages[package.name]['db']}</font></td></tr>")
-            end
             ["depends", "makedepends", "checkdepends", "provides", "arch", "base", "version"].each do |field|
                 result[package.name][field] = package.send(field)
             end
             result[package.name]["db"] = db
 
-            $pkgbase_map[result[package.name]["base"]] << package.name if build_pkgbase_map
             count += 1
-        end
-
-        if check_rv
-            percent = (count * 100.0 / check_rv).round(2)
-            return "[#{db}] #{count} / #{check_rv} (#{percent}%)"
         end
 
         count
@@ -89,8 +70,26 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
 
         stat = ""
         ["core", "extra"].each do |db|
-            count = read_db(x86_handle, db, $x86_packages, build_pkgbase_map: true)
-            stat += read_db(rv_handle, db, $rv_packages, check_duplicate: true, check_rv: count) + "\n"
+            x86_count = read_db(x86_handle, db, $x86_packages) do |package|
+                $pkgbase_map[package.base] << package.name
+            end
+
+            rv_count = read_db(rv_handle, db, $rv_packages) do |package|
+                if ! File.exists?("#{REPOROOT}/repo/#{db}/#{package.filename}")
+                    f.puts("<tr><td>#{db}</td><td>#{package.name}</td><td><font color=red>Lint: package file not found in repository</font></td></tr>")
+                elsif ! File.exists?("#{REPOROOT}/repo/#{db}/#{package.filename}.sig")
+                    f.puts("<tr><td>#{db}</td><td>#{package.name}</td><td><font color=red>Lint: package signature not found in repository</font></td></tr>")
+                end
+
+                if $rv_packages.has_key?(package.name)
+                    f.puts("<tr><td>#{db}</td><td>#{package.name}</td>
+                                <td><font color=red>Lint: package found in different repository: #{$rv_packages[package.name]['db']}.
+                                x86 repo: #{$x86_packages[package.name]['db']}</font></td></tr>")
+                end
+            end
+
+            percent = (rv_count * 100.0 / x86_count).round(2)
+            stat += "[#{db}] #{rv_count} / #{x86_count} (#{percent}%)\n"
         end
 
         File.open("#{REPOROOT}/.status/status.txt.tmp", 'w') do |f|
