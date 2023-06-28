@@ -37,6 +37,7 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
     <style>
     tr:hover { background-color: #ddd !important; }
     .tag.tag-with-details { height: auto; min-height: 2em; }
+    .tag.is-pink { background-color: hotpink; color: white; }
     </style>
     <table class="table is-hoverable">
     <thead><tr><th>DB</th><th>Package</th><th>Status</th></tr></thead><tbody>
@@ -163,14 +164,24 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
     end
 
     old_log_threshold = Time.now - 30 * 24 * 60 * 60
+    $nocheck_packages = Set[]
     $x86_packages.each do |pkgname, package|
         if File.exists?("#{REPOROOT}/.status/logs/#{package['base']}")
             if $rv_packages.has_key?(pkgname)
                 rvver = $rv_packages[pkgname]["version"]
+                if File.exists?("#{REPOROOT}/.status/logs/#{package['base']}/.nocheck")
+                    nocheckver = File.read("#{REPOROOT}/.status/logs/#{package['base']}/.nocheck").chomp
+                    nochecked = nocheckver == rvver
+                    $nocheck_packages << package['base'] if nochecked
+                else
+                    nochecked = false
+                end
+
                 if rvver.split("-")[1].include? "."
                     rvver = [rvver.split("-")[0], rvver.split("-")[1].split(".")[0]].join("-")
                 end
-                next if rvver == package["version"]
+
+                next if rvver == package["version"] and ! nochecked
             end
 
             if File.exists?("#{REPOROOT}/.status/logs/#{package['base']}/#{package['base']}-#{package['version']}.log")
@@ -203,7 +214,7 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
 
             if ! $rv_provides.include?(dep) && ! $pkgbase_map[pkgbase].include?(dep)
                 missing << dep
-            elsif $broken_pkgs.include?(dep)
+            elsif $broken_pkgs.include?(dep) && ! $nocheck_packages.include?(dep)
                 broken << dep
             elsif $version_mismatch.include?(dep)
                 outdated << dep
@@ -259,6 +270,10 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
             log_marks += " <span class='tag is-danger'>#{failed_stage}</span>" if failed_stage
         elsif Dir.glob("#{REPOROOT}/.status/logs/#{package['base']}/#{package['base']}-#{package['version']}-*.log").any?
             log_marks += " <span class='tag is-warning'>old format</span>"
+        end
+
+        if $nocheck_packages.include?(package['base'])
+            log_marks += " <span class='tag is-pink'>nocheck</span>"
         end
 
         pkgname_str = pkgname
