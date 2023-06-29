@@ -90,7 +90,7 @@ if [[ "$1" =~ riscv ]]; then
   fi
   if [[ ! "$ARCH" =~ any ]]; then
     msg 'Patching arch to riscv64...'
-    ssh $BUILDHOST "cd packages/$PKGNAME && setconf PKGBUILD arch '(\"riscv64\")'" || exit 1
+    ssh $BUILDHOST "echo -e '\narch=(riscv64)' >> packages/$PKGNAME/PKGBUILD" || exit 1
   fi
 
   # Handle cachedir
