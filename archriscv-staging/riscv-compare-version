@@ -172,7 +172,7 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
                 if File.exists?("#{REPOROOT}/.status/logs/#{package['base']}/.nocheck")
                     nocheckver = File.read("#{REPOROOT}/.status/logs/#{package['base']}/.nocheck").chomp
                     nochecked = nocheckver == rvver
-                    $nocheck_packages << package['base'] if nochecked
+                    $nocheck_packages << pkgname if nochecked
                 else
                     nochecked = false
                 end
@@ -272,7 +272,7 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
             log_marks += " <span class='tag is-warning'>old format</span>"
         end
 
-        if $nocheck_packages.include?(package['base'])
+        if $nocheck_packages.include?(pkgname)
             log_marks += " <span class='tag is-pink'>nocheck</span>"
         end
 
@@ -284,7 +284,7 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
     end
 
     $version_mismatch.sort.each do |pkgname|
-        next if $broken_pkgs.include? pkgname
+        next if $broken_pkgs.include? pkgname and ! $nocheck_packages.include? pkgname
 
         db = $x86_packages[pkgname]['db']
         pkgbase = $x86_packages[pkgname]['base']
