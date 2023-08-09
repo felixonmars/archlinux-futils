@@ -3,25 +3,15 @@
 source /usr/share/makepkg/util/message.sh
 colorize
 
-# === Handle server aliases ===
+# === Handle server & multiple logins ===
 _buildserver=$1
 
-_server=${_buildserver//[0-9]/}
-_login=${_buildserver//[a-zA-Z]/}
+# BUILDHOST shall not contain any numbers
+BUILDHOST=${_buildserver//[0-9]/}
+_login=${_buildserver//[a-zA-Z.@]/}
 
-while read -r abbr addr; do
-  if [[ "$_server" == "$abbr" ]]; then
-    msg "Building on ${addr##*@}"
-    BUILDHOST=$addr
-    shift
-    break
-  fi
-done < <(cat /etc/felixbuild.d/*)
-
-if [[ -z $BUILDHOST ]]; then
-  BUILDHOST=build.archlinux.org
-  msg "Building on default $BUILDHOST"
-fi
+msg "Building on ${BUILDHOST##*@}"
+shift
 
 # === Deal with multiple logins (for parallel building) ===
 if [[ -z "$_login" ]]; then

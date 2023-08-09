@@ -1,23 +1,12 @@
 #!/usr/bin/ruby
 
-abbr_map = {}
-Dir.glob("/etc/felixbuild.d/*").each do |conf|
-    File.readlines(conf).each do |line|
-        case line.chomp.split
-        in [abbr, addr]
-            addr = addr.split("@")[1] if addr.include? "@"
-            abbr_map[abbr] = addr
-        end
-    end
-end
-
 `ps aww`.split(/\n/).each do |line|
   next unless line.include? 'felixbuild '
 
   pid = line.split[0]
   cwd = File.readlink("/proc/#{pid}/cwd")
 
-  server = line.split("felixbuild ")[1].split[0].match(/[a-zA-Z]+/)[0]
+  server = line.split("felixbuild ")[1].split[0].match(/[a-zA-Z.@]+/)[0].split("@")[-1]
 
   begin
     arch = line.split("felixbuild ")[1].split[1].match(/\w+-(\w+)-build/)[1]
@@ -31,5 +20,5 @@ end
     pkgbase = "unknown"
   end
 
-  puts "#{pkgbase} #{arch} on #{abbr_map[server]}"
+  puts "#{pkgbase} #{arch} on #{server}"
 end
