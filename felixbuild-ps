@@ -9,9 +9,23 @@
   server = line.split("felixbuild ")[1].split[0].match(/[a-zA-Z.@]+/)[0].split("@")[-1]
 
   begin
-    arch = line.split("felixbuild ")[1].split[1].match(/\w+-(\w+)-build/)[1]
-  rescue NoMethodError
-    arch = "x86_64"
+    buildcmd = line.split("felixbuild ")[1]
+    maincmd = buildcmd.split[1]
+    if maincmd == "pkgctl"
+      # New pkgctl
+      arch = "x86_64"
+      repo = "*"
+      if buildcmd.split[-1] == "--staging"
+        repo += "-staging"
+      elsif buildcmd.split[-1] == "--testing"
+        repo += "-testing"
+      end
+    else
+      # Legacy #repo-#arch-build
+      repo, arch = maincmd.match(/([\w-]+)-(\w+)-build/)[1..]
+    end
+  rescue
+    repo, arch = "unknown", "unknown"
   end
 
   if File.exist? "#{cwd}/PKGBUILD"
@@ -20,5 +34,5 @@
     pkgbase = "unknown"
   end
 
-  puts "#{pkgbase} #{arch} on #{server}"
+  puts "[#{repo}] #{pkgbase} #{arch} on #{server}"
 end
