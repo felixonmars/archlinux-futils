@@ -7,7 +7,7 @@ include PyCall::Import
 pyimport :pyalpm
 
 ARCHS = ["i486", "i686", "pentium4", "aarch64", "armv7h", "riscv64", "loong64"]
-DBS = ["core", "extra", "community"]
+DBS = ["core", "extra"]
 
 common_header = '
 <meta name="viewport" content="width=device-width, initial-scale=1">
