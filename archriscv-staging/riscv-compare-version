@@ -33,7 +33,7 @@ end
 File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
     f.puts('
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@0.9.4/css/bulma.min.css">
+    <link rel="stylesheet" href="https://lib.baomitu.com/bulma/0.9.4/css/bulma.min.css">
     <style>
     tr:hover { background-color: #ddd !important; }
     .tag.tag-with-details { height: auto; min-height: 2em; }
