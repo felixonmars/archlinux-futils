@@ -17,8 +17,8 @@ def main():
     parser = argparse.ArgumentParser(description='Check or update nvchecker oldver db from pacman sync db')
     parser.add_argument('-u', '--update', action="store_true",
                         help='Actually update nvchecker db after printing the difference')
-    parser.add_argument('--db', nargs="*", default=["testing", "core", "extra", "community-testing",
-                                                    "community", "multilib-testing", "multilib"],
+    parser.add_argument('--db', nargs="*", default=["core-testing", "core", "extra-testing", "extra",
+                                                    "multilib-testing", "multilib"],
                         help='Pacman sync db to consider. Defaulting to all with testing and multilib enabled')
     parser.add_argument("-n", "--newer", action="store_true",
                         help='Only consider entry when pacman version is not newer than newver (useful when Arch bumped to an alpha, etc)')
