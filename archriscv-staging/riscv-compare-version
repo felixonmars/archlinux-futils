@@ -331,7 +331,7 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
 
     $rv_packages.each do |pkgname, package|
         if ! $x86_packages.include? pkgname
-            f.puts("<tr><td>#{package['db']}</td><td>#{pkgname}</td><td><font color=yellow>Lint: package not found in x86 repository.</font></td></tr>")
+            f.puts("<tr><td>#{package['db']}</td><td>#{pkgname}</td><td><font color=orange>Lint: package not found in x86 repository.</font></td></tr>")
         elsif $x86_packages[pkgname]["db"] != package["db"]
             f.puts("<tr><td>#{package['db']}</td><td>#{pkgname}</td><td><font color=red>Lint: package in different x86 repository: #{$x86_packages[pkgname]['db']}.</font></td></tr>")
         end
