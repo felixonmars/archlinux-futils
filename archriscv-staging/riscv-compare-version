@@ -185,9 +185,9 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
             end
 
             if File.exists?("#{REPOROOT}/.status/logs/#{package['base']}/#{package['base']}-#{package['version']}.log")
-                nil
-            elsif Dir.glob("#{REPOROOT}/.status/logs/{package['base']}/{package['base']}-{package['version']}-*.log").any?
-                nil
+                $nocheck_packages.delete pkgname if nochecked and rvver != package["version"]
+            elsif Dir.glob("#{REPOROOT}/.status/logs/#{package['base']}/#{package['base']}-#{package['version']}-*.log").any?
+                $nocheck_packages.delete pkgname if nochecked and rvver != package["version"]
             else
                 $outdated_logs |= $pkgbase_map[package['base']]
                 next
