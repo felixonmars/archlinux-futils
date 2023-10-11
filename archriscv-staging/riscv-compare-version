@@ -22,10 +22,12 @@ $version_mismatch = Set[]
 $blacklist = Set[]
 $broken_pkgs = Set[]
 
+STDOUT.sync = true
 puts "Running pacman -Sy..."
 `pacman -Sy`
 
 puts "Reading blacklist..."
+`cd #{PATCHREPO}; git pull`
 File.read(PATCHREPO + "/blacklist.txt").each_line do |pkg|
     pkg.chomp!
     next if pkg.start_with? "#" or pkg == ""
