@@ -22,8 +22,10 @@ $version_mismatch = Set[]
 $blacklist = Set[]
 $broken_pkgs = Set[]
 
+puts "Running pacman -Sy..."
 `pacman -Sy`
 
+puts "Reading blacklist..."
 File.read(PATCHREPO + "/blacklist.txt").each_line do |pkg|
     pkg.chomp!
     next if pkg.start_with? "#" or pkg == ""
@@ -60,6 +62,7 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
         count
     end
 
+    puts "Faking sync database..."
     Dir.mktmpdir do |dir|
         Dir.mkdir("#{dir}/sync")
         ["core", "extra"].each do |db|
@@ -71,10 +74,15 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
 
         stat = ""
         ["core", "extra"].each do |db|
+            puts "Reading x86_64 #{db}..."
             x86_count = read_db(x86_handle, db, $x86_packages) do |package|
                 $pkgbase_map[package.base] << package.name
+                package.provides.each do |_package|
+                    $pkgbase_map[package.base] << _package.split("=")[0]
+                end
             end
 
+            puts "Reading riscv64 #{db}..."
             rv_count = read_db(rv_handle, db, $rv_packages) do |package|
                 if ! File.exists?("#{REPOROOT}/repo/#{db}/#{package.filename}")
                     f.puts("<tr><td>#{db}</td><td>#{package.name}</td><td><font color=red>Lint: package file not found in repository</font></td></tr>")
@@ -93,6 +101,7 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
             stat += "[#{db}] #{rv_count} / #{x86_count} (#{percent}%)\n"
         end
 
+        puts "Writing status.txt..."
         File.open("#{REPOROOT}/.status/status.txt.tmp", 'w') do |f|
             f.puts(stat)
         end
@@ -101,6 +110,7 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
 
     $rv_provides |= $rv_packages.keys.to_set
 
+    puts "Checking version mismatch..."
     $rv_packages.each do |pkgname, package|
         rvver = package["version"]
 
@@ -110,6 +120,9 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
 
         if $x86_packages.has_key?(pkgname) && $x86_packages[pkgname]["version"] != rvver
             $version_mismatch << pkgname
+            package['provides'].each do |_package|
+                $version_mismatch << _package.split("=")[0] if ! $x86_packages.has_key? _package.split("=")[0]
+            end
         end
 
         package["provides"].each do |_package|
@@ -163,6 +176,7 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
         last_failed_stage
     end
 
+    puts "Checking broken packages..."
     old_log_threshold = Time.now - 30 * 24 * 60 * 60
     $nocheck_packages = Set[]
     $x86_packages.each do |pkgname, package|
@@ -194,12 +208,16 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
             end
 
             $broken_pkgs << pkgname
+            package['provides'].each do |_package|
+                $broken_pkgs << _package.split("=")[0] if ! $x86_packages.has_key? _package.split("=")[0]
+            end
         end
     end
 
     def missing_dep(pkgbase)
         check_pkgs = Set[]
         $pkgbase_map[pkgbase].each do |pkgname|
+            next if ! $x86_packages.has_key? pkgname
             package = $x86_packages[pkgname]
             check_pkgs |= (package["depends"] + package["makedepends"] + package["checkdepends"]).to_set
         end
@@ -257,7 +275,9 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
         verstr
     end
 
+    puts "Checking FTBFS logs..."
     $broken_pkgs.sort.each do |pkgname|
+        next if ! $x86_packages.has_key? pkgname
         package = $x86_packages[pkgname]
         ftbfs_link = "logs/#{package['base']}/"
         log_marks = render_missing_dep(package["base"])
@@ -283,8 +303,10 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
                 <span class='tag is-danger'>FTBFS</span></a>#{log_marks + patch_repo_link(package['base'])}</td></tr>")
     end
 
+    puts "Rendering version mismatch..."
     $version_mismatch.sort.each do |pkgname|
         next if $broken_pkgs.include? pkgname and ! $nocheck_packages.include? pkgname
+        next if ! $x86_packages.has_key? pkgname
 
         db = $x86_packages[pkgname]['db']
         pkgbase = $x86_packages[pkgname]['base']
@@ -318,6 +340,7 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
         f.puts("<tr id='#{pkgname}'><td>#{db}</td><td>#{pkgname_str}</td><td>#{verstr}</td></tr>")
     end
 
+    puts "Rendering missing packages..."
     $x86_packages.each do |pkgname, package|
         next if $rv_packages.include? pkgname or $broken_pkgs.include? pkgname or $blacklist.include? pkgname
 
@@ -329,6 +352,7 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
         f.puts("<tr id='#{pkgname}'><td>#{package['db']}</td><td>#{pkgname_str}</td><td>#{verstr}</td></tr>")
     end
 
+    puts "Rendering lint..."
     $rv_packages.each do |pkgname, package|
         if ! $x86_packages.include? pkgname
             f.puts("<tr><td>#{package['db']}</td><td>#{pkgname}</td><td><font color=orange>Lint: package not found in x86 repository.</font></td></tr>")
@@ -342,5 +366,6 @@ end
 
 File.rename("#{REPOROOT}/.status/status.htm.tmp", "#{REPOROOT}/.status/status.htm")
 
+puts "Updating lastupdate.txt and latestlogs.txt..."
 `cd #{REPOROOT}/; find . -name '*.tar.zst' -type f -printf "%T@ %TF %TT %p\n" | sort -k1nr | head -n 10 | cut -d " " -f 2-4 > .status/lastupdate.txt`
 `cd #{REPOROOT}/; find . -name '*.log' -type f -printf "%T@ %TF %TT %p\n" | sort -k1nr | head -n 50 | cut -d " " -f 2-4 > .status/latestlogs.txt`
