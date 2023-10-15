@@ -183,27 +183,28 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
     $nocheck_packages = Set[]
     $x86_packages.each do |pkgname, package|
         if File.exists?("#{REPOROOT}/.status/logs/#{package['base']}")
+            nochecked = false
             if $rv_packages.has_key?(pkgname)
                 rvver = $rv_packages[pkgname]["version"]
                 if File.exists?("#{REPOROOT}/.status/logs/#{package['base']}/.nocheck")
                     nocheckver = File.read("#{REPOROOT}/.status/logs/#{package['base']}/.nocheck").chomp
                     nochecked = nocheckver == rvver
-                    $nocheck_packages << pkgname if nochecked
-                else
-                    nochecked = false
                 end
 
                 if rvver.split("-")[1].include? "."
                     rvver = [rvver.split("-")[0], rvver.split("-")[1].split(".")[0]].join("-")
                 end
 
-                next if rvver == package["version"] and ! nochecked
+                if rvver == package["version"]
+                    $nocheck_packages << pkgname if nochecked
+                    next
+                end
             end
 
             if File.exists?("#{REPOROOT}/.status/logs/#{package['base']}/#{package['base']}-#{package['version']}.log")
-                $nocheck_packages.delete pkgname if nochecked and rvver != package["version"]
+                nil
             elsif Dir.glob("#{REPOROOT}/.status/logs/#{package['base']}/#{package['base']}-#{package['version']}-*.log").any?
-                $nocheck_packages.delete pkgname if nochecked and rvver != package["version"]
+                nil
             else
                 $outdated_logs |= $pkgbase_map[package['base']]
                 next
@@ -234,7 +235,7 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
 
             if ! $rv_provides.include?(dep) && ! $pkgbase_map[pkgbase].include?(dep)
                 missing << dep
-            elsif $broken_pkgs.include?(dep) && ! $nocheck_packages.include?(dep)
+            elsif $broken_pkgs.include?(dep)
                 broken << dep
             elsif $version_mismatch.include?(dep)
                 outdated << dep
@@ -278,7 +279,7 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
     end
 
     puts "Checking FTBFS logs..."
-    $broken_pkgs.sort.each do |pkgname|
+    ($broken_pkgs.sort + $nocheck_packages.sort).each do |pkgname|
         next if ! $x86_packages.has_key? pkgname
         package = $x86_packages[pkgname]
         ftbfs_link = "logs/#{package['base']}/"
@@ -307,7 +308,7 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
 
     puts "Rendering version mismatch..."
     $version_mismatch.sort.each do |pkgname|
-        next if $broken_pkgs.include? pkgname and ! $nocheck_packages.include? pkgname
+        next if $broken_pkgs.include? pkgname
         next if ! $x86_packages.has_key? pkgname
 
         db = $x86_packages[pkgname]['db']
