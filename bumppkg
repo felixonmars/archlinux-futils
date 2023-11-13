@@ -122,9 +122,7 @@ if [[ "$_build" -eq 1 ]]; then
 
   felixbuild $_buildserver pkgctl build $_suffix
 
-  felix-package-broker $_buildserver $_target $_pkgbase
-
-  pkgctl release $_suffix -m "$_msg"
+  BUILDHOST=$_buildserver PKGBASE=$_pkgbase felix-rsync-wrapper pkgctl release $_suffix -m "$_msg"
 
   while ! db-update; do
     echo "db-update failed, retrying after 5s..."
