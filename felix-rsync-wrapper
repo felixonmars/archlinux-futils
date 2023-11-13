@@ -1,0 +1,13 @@
+#!/bin/bash
+
+TMPBIN="$(mktemp -d)"
+ln -s /usr/local/bin/felix-package-broker-ng "$TMPBIN"/rsync
+
+export PATH="$TMPBIN:$PATH"
+
+"$@"
+status=$?
+
+rm -rf "$TMPBIN"
+
+exit $status

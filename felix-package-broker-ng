@@ -1,0 +1,41 @@
+#!/bin/bash
+
+# BROKER=magnezone
+# BROKER=squirtle
+BROKER=tentacool
+WORKDIR=/root/broker
+
+source /usr/share/makepkg/util.sh
+colorize
+
+BUILDHOST=${BUILDHOST//[0-9]/}
+
+_rsyncopts=
+_files=
+_srcfiles=
+_brokerfiles=
+_sigfiles=
+_mark=
+for _part in "$@"; do
+  if [[ $_part =~ .*\.zst$ ]]; then
+    _part=$(basename $_part)
+    _mark=1
+    _files="$_files $_part"
+    _srcfiles="$_srcfiles $BUILDHOST:packages/$PKGBASE/$_part"
+    _brokerfiles="$_brokerfiles $WORKDIR/$_part"
+  elif [[ $_part =~ .*\.sig$ ]]; then
+    _mark=1
+  elif [[ -z "$_mark" ]]; then
+    _rsyncopts="$_rsyncopts $_part"
+  else
+    _target="$_part"
+  fi
+done
+
+msg "Package Broker Transferring$_files ($BUILDHOST => $BROKER)"
+ssh $BROKER "rsync $_rsyncopts $_srcfiles $WORKDIR/"
+
+msg "Package Broker Transferring$_files ($BROKER => $_target)"
+ssh $BROKER "rsync $_rsyncopts $_brokerfiles $_target; rm $_brokerfiles"
+
+/usr/bin/rsync "$@"
