@@ -1,5 +1,7 @@
 #!/bin/bash
 
+set -e
+
 # BROKER=magnezone
 # BROKER=squirtle
 # BROKER=tentacool
@@ -28,7 +30,10 @@ for _part in "$@"; do
     _srcfiles="$_srcfiles $BUILDHOST:packages/$PKGBASE/$_part"
     _brokerfiles="$_brokerfiles $WORKDIR/$_part"
   elif [[ $_part =~ .*\.sig$ ]]; then
+    _part=$(basename $_part)
     _mark=1
+    _sigfiles="$_sigfiles ./$_part"
+    _brokerfiles="$_brokerfiles $WORKDIR/$_part"
   elif [[ -z "$_mark" ]]; then
     _rsyncopts="$_rsyncopts $_part"
   else
@@ -39,7 +44,10 @@ done
 msg "Package Broker Transferring$_files ($BUILDHOST => $BROKER)"
 ssh $BROKER "rsync $_rsyncopts $_srcfiles $WORKDIR/"
 
+msg "Package Broker Transferring$_sigfiles (localhost => $BROKER)"
+/usr/bin/rsync $_rsyncopts $_sigfiles "$BROKER:$WORKDIR/"
+
 msg "Package Broker Transferring$_files ($BROKER => $_target)"
 ssh $BROKER "rsync $_rsyncopts $_brokerfiles $_target; rm $_brokerfiles"
 
-/usr/bin/rsync "$@"
+# /usr/bin/rsync "$@"
