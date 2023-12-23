@@ -1,0 +1,79 @@
+#!/usr/bin/ruby
+
+require 'open-uri'
+
+def read_db(url)
+    puts "Reading #{url}..."
+    db = URI.open(url)
+    db = Zlib::GzipReader.new(db).read
+    db = db.split("\n\n")
+    db = db.filter_map do |pkg|
+        pkg = pkg.split("\n").filter_map do |line|
+            line = line.split(': ')
+            line[1].split[0] if line[0] == 'Source' or line[0] == 'Version' or (line[0] == 'Package' and ! pkg.include? 'Source: ')
+        end
+    end
+    db = db.to_h
+    return db
+end
+
+def vercmp_workaround(version)
+    if version.include? "-"
+        return version
+    else
+        return version + "-0"
+    end
+end
+
+def getcolor(version1, version2)
+    if version2 == nil or `vercmp #{vercmp_workaround(version1)} #{vercmp_workaround(version2)}`.to_i > 0
+        return "green", "red"
+    else
+        return "red", "green"
+    end
+end
+
+def debian_12_link(pkg, version, color)
+    return "<a href=https://packages.debian.org/source/bookworm/#{pkg}><font color=#{color}>#{version}</font></a>"
+end
+
+def debian_sid_link(pkg, version)
+    return "<a href=https://packages.debian.org/source/sid/#{pkg}>#{version}</a>"
+end
+
+revyos_db = read_db('https://mirrors.felixc.at/revyos/revyos-c910v/dists/revyos-c910v/main/binary-riscv64/Packages.gz')
+debian_12_db = read_db('http://ftp.de.debian.org/debian/dists/bookworm/main/binary-amd64/Packages.gz')
+debian_sid_db = read_db('http://ftp.de.debian.org/debian/dists/sid/main/binary-riscv64/Packages.gz')
+
+puts "Generating revyos.htm..."
+
+File.open('/var/www/archlinuxriscv/.status/revyos.htm.tmp', 'w') do |f|
+    f.puts '
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <link rel="stylesheet" href="https://lib.baomitu.com/bulma/0.9.4/css/bulma.min.css">
+        <style>tr:hover { background-color: #ddd !important; }</style>
+        <table class="table is-hoverable"><thead><tr><th>Package</th><th>RevyOS</th><th>Debian 12 amd64</th>
+        <th>Debian sid riscv64</th></thead><tbody>'
+
+    revyos_db.each do |pkg, version|
+        if debian_12_db.has_key? pkg and debian_12_db[pkg] != version or ! debian_12_db.has_key? pkg
+            color_revyos, color_12 = getcolor(version, debian_12_db[pkg])
+            f.puts "<tr><td>#{pkg}</td><td><font color=#{color_revyos}>#{version}</font></td>
+                    <td>#{debian_12_link(pkg, debian_12_db[pkg], color_12)}</font></td>
+                    <td>#{debian_sid_link(pkg, debian_sid_db[pkg])}</td></tr>"
+        end
+    end
+
+    f.puts "<tr><td colspan=4>Porting Progress: #{revyos_db.length} / #{(revyos_db.merge(debian_12_db)).length}</td></tr>"
+
+    debian_12_db.each do |pkg, version|
+        if ! revyos_db.has_key? pkg
+            f.puts "<tr><td>#{pkg}</td><td>Help Revy!</td><td>#{debian_12_link(pkg, version, "black")}</td>
+                    <td>#{debian_sid_link(pkg, debian_sid_db[pkg])}</td></tr>"
+        end
+    end
+
+    f.puts '</tbody></table>'
+end
+
+File.rename('/var/www/archlinuxriscv/.status/revyos.htm.tmp', '/var/www/archlinuxriscv/.status/revyos.htm')
