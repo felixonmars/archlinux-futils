@@ -47,7 +47,7 @@ debian_sid_db = read_db('http://ftp.de.debian.org/debian/dists/sid/main/binary-r
 
 puts "Generating revyos.htm..."
 
-File.open('/var/www/archlinuxriscv/.status/revyos.htm.tmp', 'w') do |f|
+File.open('/var/www/revyos/compare/index.html.tmp', 'w') do |f|
     f.puts '
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <link rel="stylesheet" href="https://lib.baomitu.com/bulma/0.9.4/css/bulma.min.css">
@@ -76,4 +76,4 @@ File.open('/var/www/archlinuxriscv/.status/revyos.htm.tmp', 'w') do |f|
     f.puts '</tbody></table>'
 end
 
-File.rename('/var/www/archlinuxriscv/.status/revyos.htm.tmp', '/var/www/archlinuxriscv/.status/revyos.htm')
+File.rename('/var/www/revyos/compare/index.html.tmp', '/var/www/revyos/compare/index.html')
