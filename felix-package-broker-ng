@@ -2,7 +2,11 @@
 
 # BROKER=magnezone
 # BROKER=squirtle
-BROKER=tentacool
+# BROKER=tentacool
+
+BROKERS=(magnezone tentacool)
+BROKER=${BROKERS[$RANDOM % ${#BROKERS[@]}]}
+
 WORKDIR=/root/broker
 
 source /usr/share/makepkg/util.sh
