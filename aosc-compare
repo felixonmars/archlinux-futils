@@ -9,14 +9,6 @@ common_header = '
 <style>tr:hover { background-color: #ddd !important; }</style>
 <table class="table is-hoverable">'
 
-def vercmp_workaround(version)
-    if version.include? "-"
-        return version
-    else
-        return version + "-0"
-    end
-end
-
 arch_data = Hash.new{|h,k| h[k] = []}
 
 File.open('/var/www/aosc/treevsrepo/index.html.tmp', 'w') do |f|
@@ -28,7 +20,8 @@ File.open('/var/www/aosc/treevsrepo/index.html.tmp', 'w') do |f|
         case line.split("|").map(&:strip)
         in [name, arch, tree_version, repo_version]
             next if tree_version == "tree_version" or name == "" # skip header or broken lines
-            if `vercmp #{vercmp_workaround(tree_version)} #{vercmp_workaround(repo_version)}`.to_i > 0
+            `dpkg --compare-versions #{tree_version} gt #{repo_version}`
+            if $?.success?
                 tree_color = "green"
                 repo_color = "red"
             else

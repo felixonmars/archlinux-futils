@@ -17,16 +17,9 @@ def read_db(url)
     return db
 end
 
-def vercmp_workaround(version)
-    if version.include? "-"
-        return version
-    else
-        return version + "-0"
-    end
-end
-
 def getcolor(version1, version2)
-    if version2 == nil or `vercmp #{vercmp_workaround(version1)} #{vercmp_workaround(version2)}`.to_i > 0
+    `dpkg --compare-versions #{version1} gt #{version2}`
+    if version2 == nil or $?.success?
         return "green", "red"
     else
         return "red", "green"
