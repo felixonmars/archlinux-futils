@@ -1,0 +1,89 @@
+#!/bin/bash
+
+PKGBASE=$1
+shift
+if [[ "$PKGBASE" == "" ]]; then
+  PKGBASE=$1
+  shift
+fi
+
+source /usr/local/bin/riscvenv
+source /usr/share/makepkg/util/message.sh
+colorize
+
+WORKDIR="$(mktemp -d)"
+cd $WORKDIR
+
+cleanup() {
+    rm -rf $WORKDIR
+}
+trap cleanup EXIT
+
+nocheck=""
+if [[ "$PKGBASE" == *:nocheck ]]; then
+    PKGBASE=${PKGBASE%:nocheck}
+    nocheck="-- -- --nocheck"
+    #nocheck="-- --nocheck"
+fi
+
+pkgctl repo clone $PKGBASE || exit 1
+
+sudo pacman -Sy
+
+cd $PKGBASE
+
+PKGNAME=$(. PKGBUILD; echo $pkgname)
+for _REPO in core extra; do
+    PKGVER=$(pacman -Sl $_REPO | grep "^$_REPO $PKGNAME " | cut -d " " -f 3)
+    if [[ -n "$PKGVER" ]]; then
+        REPO=$_REPO
+        break
+    fi
+done
+
+if [[ -z "$REPO" ]]; then
+    error "Cannot find package in x86 repo."
+    exit 1
+fi
+
+if ! git checkout --detach ${PKGVER//:/-}; then
+    error "Release tag could not be found."
+    exit 1
+fi
+
+RVVER=$(ssh $TIER0SERVER find-package-in-db-file $TIER0PATH/repo/$REPO/$REPO.db $PKGNAME version)
+
+if [[ "$RVVER" == "$PKGVER"* ]]; then
+    warning "Same package found in riscv64 [$REPO]. Incrementing point pkgrel..."
+    PKGREL=${RVVER#*-}
+    PKGREL=$(echo $PKGREL + .1 | bc)
+    setconf PKGBUILD pkgrel $PKGREL
+    PKGVER=${PKGVER%-*}-$PKGREL
+fi
+
+SERVER=$(felixbuild-server-select riscv64)
+
+if [[ "$NOUPLOAD" == "1" ]]; then
+    felixbuild $SERVER extra-riscv64-build "$@" $nocheck || exit 1
+else
+    LOGFILE=$PKGBASE-$(. PKGBUILD; echo $epoch${epoch:+:}$pkgver-$pkgrel).log
+    felixbuild $SERVER extra-riscv64-build "$@" $nocheck | tee $LOGFILE
+    if [[ ${PIPESTATUS[0]} -ne 0 ]]; then
+        read -r -p "Upload log? [y/N] " response
+        if [[ "$response" =~ ^([yY][eE][sS]|[yY])$ ]]
+        then
+            riscvfail $PKGBASE $LOGFILE
+        fi
+        exit 1
+    fi
+fi
+
+BUILDHOST=$SERVER PKGBASE=$PKGBASE felix-rsync-wrapper riscvadd $REPO
+
+if [[ -n "$nocheck" ]]; then
+    warning "Marking $PKGVER as nocheck"
+    ssh root@$TIER0SERVER mkdir -p $TIER0PATH/.status/logs/$PKGBASE
+    echo $PKGVER | ssh root@$TIER0SERVER tee $TIER0PATH/.status/logs/$PKGBASE/.nocheck
+else
+    ssh root@$TIER0SERVER rm -f $TIER0PATH/.status/logs/$PKGBASE/.nocheck
+fi

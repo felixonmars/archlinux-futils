@@ -51,13 +51,15 @@ if [[ -n "$_suffix" ]]; then
 fi
 
 if [[ -z "$_target" ]]; then
-    error "Cannot find package in x86 repo."
+    echo "Cannot find package in x86 repo."
     exit 1
 fi
 
 _oldpkgver=$(. PKGBUILD; echo $pkgver)
 
-setconf PKGBUILD pkgver $_pkgver
+if [[ "$_pkgver" != "HEAD" ]]; then
+  setconf PKGBUILD pkgver $_pkgver
+fi
 setconf PKGBUILD pkgrel $_pkgrel
 
 if grep '^_commit=' PKGBUILD >/dev/null; then
@@ -69,26 +71,31 @@ if grep '^_commit=' PKGBUILD >/dev/null; then
     for _source in $(. PKGBUILD; echo ${source[@]}); do
       if [[ $_source =~ git\+(https://.*)\#commit=$_oldcommit ]]; then
         _gitrepo=${BASH_REMATCH[1]}
-        tags="$(git ls-remote --tags $_gitrepo)"
 
-        _guess_tag_prefix=$(echo "$tags" | grep ^$_oldcommit | sed "s|.*refs/tags/||;s|$_oldpkgver.*||" | head -n1)
-        if echo "$tags" | grep refs/tags/$_guess_tag_prefix$_pkgver$ >/dev/null; then
-          _newtag=$_guess_tag_prefix$_pkgver
-        elif echo "$tags" | grep refs/tags/$_pkgver$ >/dev/null; then
-          _newtag=$_pkgver
-        elif echo "$tags" | grep refs/tags/v$_pkgver$ >/dev/null; then
-          _newtag=v$_pkgver
-        elif echo "$tags" | grep refs/tags/V$_pkgver$ >/dev/null; then
-          _newtag=V$_pkgver
+        if [[ $_pkgver == "HEAD" ]]; then
+          _commit="$(git ls-remote $_gitrepo | grep HEAD | cut -f1)"
         else
-          echo "Unable to find tag for $_pkgver"
-          exit 1
-        fi
+          tags="$(git ls-remote --tags $_gitrepo)"
 
-        if echo "$tags" | grep $_newtag^{}$ >/dev/null; then
-          _commit=$(echo "$tags" | grep refs/tags/$_newtag^{}$ | cut -f1)
-        else
-          _commit=$(echo "$tags" | grep refs/tags/$_newtag$ | cut -f1)
+          _guess_tag_prefix=$(echo "$tags" | grep ^$_oldcommit | sed "s|.*refs/tags/||;s|$_oldpkgver.*||" | head -n1)
+          if echo "$tags" | grep refs/tags/$_guess_tag_prefix$_pkgver$ >/dev/null; then
+            _newtag=$_guess_tag_prefix$_pkgver
+          elif echo "$tags" | grep refs/tags/$_pkgver$ >/dev/null; then
+            _newtag=$_pkgver
+          elif echo "$tags" | grep refs/tags/v$_pkgver$ >/dev/null; then
+            _newtag=v$_pkgver
+          elif echo "$tags" | grep refs/tags/V$_pkgver$ >/dev/null; then
+            _newtag=V$_pkgver
+          else
+            echo "Unable to find tag for $_pkgver"
+            exit 1
+          fi
+
+          if echo "$tags" | grep $_newtag^{}$ >/dev/null; then
+            _commit=$(echo "$tags" | grep refs/tags/$_newtag^{}$ | cut -f1)
+          else
+            _commit=$(echo "$tags" | grep refs/tags/$_newtag$ | cut -f1)
+          fi
         fi
 
         setconf PKGBUILD _commit $_commit
@@ -107,6 +114,14 @@ sed -e 's|http://github.com/|https://github.com/|' \
     -e "s|arch=('i686' 'x86_64')|arch=('x86_64')|" \
     -e "s|arch=(\"i686\" \"x86_64\")|arch=('x86_64')|" \
     -i PKGBUILD
+  
+if [[ "$_pkgver" == "HEAD" ]]; then
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    env EUID=1000 makepkg -o
+  else
+    makepkg -o
+  fi
+fi
 
 # root workaround
 if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
