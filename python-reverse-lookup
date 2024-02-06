@@ -9,7 +9,7 @@ require 'concurrent'
 $pkg = ARGV[0].downcase
 $repos = ARGV[1] || "all"
 
-$repos = $repos == "all" ? ["core", "extra", "community", "multilib", "testing", "community-testing", "multilib-testing"] : $repos.split(",")
+$repos = $repos == "all" ? ["core", "extra", "multilib", "core-testing", "extra-testing", "multilib-testing"] : $repos.split(",")
 
 CACHEDIR = "#{Dir.home}/.cache/python-reverse-lookup"
 Dir.mkdir(CACHEDIR) unless Dir.exist?(CACHEDIR)
