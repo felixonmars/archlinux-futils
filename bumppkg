@@ -142,9 +142,9 @@ git --no-pager diff
 if [[ "$_build" -eq 1 ]]; then
   _buildserver=$(felixbuild-server-select)
 
-  felixbuild $_buildserver pkgctl build $_suffix $_rebuild
+  SYNCBACKPKGBUILD=1 felixbuild $_buildserver pkgctl build $_suffix $_rebuild
 
-  SYNCBACKPKGBUILD=1 BUILDHOST=$_buildserver PKGBASE=$_pkgbase felix-rsync-wrapper pkgctl release $_suffix -m "$_msg"
+  BUILDHOST=$_buildserver PKGBASE=$_pkgbase felix-rsync-wrapper pkgctl release $_suffix -m "$_msg"
 
   while ! db-update; do
     echo "db-update failed, retrying after 5s..."
