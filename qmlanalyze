@@ -2,6 +2,11 @@
 import sys
 from sh import find, pacman
 
+qtdir = {
+    "5": "usr/lib/qt",
+    "6": "usr/lib/qt6"
+}[sys.argv[1] if len(sys.argv) > 1 else "5"]
+
 qmlmap = {}
 package = None
 for line in pacman("-F", "qmldir"):
@@ -10,8 +15,8 @@ for line in pacman("-F", "qmldir"):
         line = line[6:]
     line = line.strip()
     if line.endswith("/qmldir"):
-        if line.startswith("usr/lib/qt/qml/"):
-            module = line[len("usr/lib/qt/qml/"):-len("/qmldir")].replace("/", ".")
+        if line.startswith(f"{qtdir}/qml/"):
+            module = line[len(f"{qtdir}/qml/"):-len("/qmldir")].replace("/", ".")
             qmlmap[module] = package
     else:
         package = line.split()[0]
@@ -23,31 +28,40 @@ for m in qmlmap.copy():
             qmlmap[new_m] = qmlmap[m]
 
 packages = set()
-for file in find("." if len(sys.argv) < 2 else sys.argv[1], "-name", "*.qml"):
+for file in find("." if len(sys.argv) < 3 else sys.argv[2], "-name", "*.qml"):
     file = file.strip()
     print(f"Analyzing {file}...")
     with open(file) as f:
         for line in f:
             if line.startswith("import "):
-                try:
-                    module, version = line.split("import ")[1].split()[:2]
-                except ValueError:
-                    # skip directory imports
-                    continue
-                version = " " + version
-                while True:
-                    module_name = (module + version).replace(" ", ".")
+                line = line.split("import ")[1].split()
+                if len(line) == 1:
+                    module_name = module = line[0]
+                    if module_name.startswith(('"', "'")):
+                        # skip directory imports
+                        continue
+                    
                     if module_name in qmlmap:
                         print(f"{module_name} found in {qmlmap[module_name]}")
                         packages.add(qmlmap[module_name])
-                        break
-                    elif "." in version:
-                        version = ".".join(version.split(".")[:-1])
-                    elif version:
-                        version = ""
-                    else:
-                        print(f"Unknown module: {module}")
-                        break
+
+                else:
+                    module = line[0]
+                    version = " " + line[1]
+                
+                    while True:
+                        module_name = (module + version).replace(" ", ".")
+                        if module_name in qmlmap:
+                            print(f"{module_name} found in {qmlmap[module_name]}")
+                            packages.add(qmlmap[module_name])
+                            break
+                        elif "." in version:
+                            version = ".".join(version.split(".")[:-1])
+                        elif version:
+                            version = ""
+                        else:
+                            print(f"Unknown module: {module}")
+                            break
 
 print("\nFound dependencies:")
 print("\n".join(packages))
