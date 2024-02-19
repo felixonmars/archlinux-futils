@@ -2,6 +2,8 @@
 
 require 'set'
 require 'tempfile'
+require 'net/http'
+require 'json'
 require 'pycall/import'
 
 include PyCall::Import
@@ -33,6 +35,12 @@ File.read(PATCHREPO + "/blacklist.txt").each_line do |pkg|
     next if pkg.start_with? "#" or pkg == ""
     $blacklist << pkg
 end
+
+puts "Fetching from MelonBot..."
+$marks = JSON.parse(Net::HTTP.get(URI("https://plct-arv.jiejiss.com/pkg")))["markList"].map do |pkg|
+    [pkg["name"], pkg ]
+end.to_h
+
 
 File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
     f.puts('
@@ -278,12 +286,33 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
         verstr
     end
 
+    def melon_mark(name)
+        result = ""
+        if $marks.has_key? name
+            $marks[name]["marks"].map do |mark|
+                title = mark["comment"] + " by " + mark["by"]["alias"]
+                case mark["name"]
+                when "upstreamed"
+                    result += " <a href='#{mark["comment"].split[0]}'><span title='#{title}' class='tag is-success'>Upstreamed</span></a>"
+                when "stuck"
+                    result += " <span class='tag is-danger' title='#{title}'>Stuck</span>"
+                when "ready"
+                    result += " <span class='tag is-success' title='#{title}'>Ready</span>"
+                when "failing"
+                else
+                    result += " <span class='tag is-light' title='#{title}'>#{mark["name"]}</span>"
+                end
+            end
+        end
+        result
+    end
+
     puts "Checking FTBFS logs..."
     ($broken_pkgs.sort + $nocheck_packages.sort).each do |pkgname|
         next if ! $x86_packages.has_key? pkgname
         package = $x86_packages[pkgname]
         ftbfs_link = "logs/#{package['base']}/"
-        log_marks = render_missing_dep(package["base"])
+        log_marks = melon_mark(package["base"]) + render_missing_dep(package["base"])
         if File.exist?("#{REPOROOT}/.status/logs/#{package['base']}/#{package['base']}-#{package['version']}.log")
             ftbfs_link = "logs/#{package['base']}/#{package['base']}-#{package['version']}.log"
             if File.mtime("#{REPOROOT}/.status/logs/#{package['base']}/#{package['base']}-#{package['version']}.log") < old_log_threshold
@@ -333,7 +362,7 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
 
         verstr += " <a href=#{x86_history_link(pkgbase)}><span class='tag is-info'>Changes</span></a>"
 
-        verstr += render_missing_dep(pkgbase)
+        verstr += melon_mark(pkgbase) + render_missing_dep(pkgbase)
 
         verstr += patch_repo_link(pkgbase)
 
@@ -350,7 +379,7 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
         pkgname_str = pkgname
         pkgname_str += " (#{package['base']})" if pkgname != package['base']
 
-        verstr = render_missing_dep(package['base'], show_leaf=true)
+        verstr = melon_mark(package["base"]) + render_missing_dep(package['base'], show_leaf=true)
         verstr += patch_repo_link(package['base'])
         f.puts("<tr id='#{pkgname}'><td>#{package['db']}</td><td>#{pkgname_str}</td><td>#{verstr}</td></tr>")
     end
