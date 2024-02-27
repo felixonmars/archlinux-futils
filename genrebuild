@@ -39,12 +39,15 @@ parser.add_argument('-m', '--expand-make', action="store_true",
                                            help='Expand all reverse make deps')
 parser.add_argument('-c', '--expand-check', action="store_true",
                                             help='Expand all reverse check deps')
+parser.add_argument('--ignore', nargs='?', default="", help='Ignore packages, separated by comma')
 parser.add_argument('-d', '--db', nargs='*', default=["core", "extra", "community", "multilib"],
                                              help='Pacman sync db to consider. Defaulting to all stable dbs.')
 parser.add_argument('--dbpath', nargs='?', default="/var/lib/pacman",
                                            help='Pacman sync db location. Default: /var/lib/pacman')
 parser.add_argument('package', nargs='+', help='Packages to rebuild')
 args = parser.parse_args()
+
+args.ignore = set(args.ignore.split(","))
 
 if args.haskell_check:
     args.expand = True
@@ -69,6 +72,8 @@ handle = pyalpm.Handle(".", args.dbpath)
 for db in args.db:
     db_handle = handle.register_syncdb(db, 0)
     for package in db_handle.search(""):
+        if package.name in args.ignore:
+            continue
         for field in ("depends", "makedepends", "checkdepends", "provides", "arch"):
             package_db[package.name][field] = getattr(package, field)
 
