@@ -37,6 +37,8 @@ fi
 
 pushd $_pkgbase/
 
+git pull --ff-only || :
+
 _pkgname=$(. PKGBUILD; echo $pkgname)
 for _repo in core extra multilib; do
   if pacman -Sql $_repo | grep "^$_pkgname$" >/dev/null; then
