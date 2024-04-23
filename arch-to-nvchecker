@@ -3,6 +3,7 @@
 import pyalpm
 import argparse
 from nvchecker import core as nvchecker_core
+from nvchecker.util import RichResult
 
 PREFIX_MAP = {
     "pypi": "python-",
@@ -74,7 +75,7 @@ def main():
             continue
 
         archver = archvers[pkgname]
-        oldver = oldvers.get(entry_name, None)
+        oldver = oldvers.get(entry_name, None).version
         if archver != oldver:
             if oldver is not None:
                 if oldver + ".0" == archver or archver + ".0" == oldver:
@@ -85,7 +86,7 @@ def main():
                     continue
 
             print(pkgname, oldver, "->", archver)
-            oldvers[entry_name] = archver
+            oldvers[entry_name] = RichResult(version=archver)
 
     if args.update:
         nvchecker_core.write_verfile(nvchecker_options.ver_files[0], oldvers)
