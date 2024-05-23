@@ -75,7 +75,9 @@ def main():
             continue
 
         archver = archvers[pkgname]
-        oldver = oldvers.get(entry_name, None).version
+        oldver = oldvers.get(entry_name, None)
+        if oldver is not None:
+            oldver = oldver.version
         if archver != oldver:
             if oldver is not None:
                 if oldver + ".0" == archver or archver + ".0" == oldver:
