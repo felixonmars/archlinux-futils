@@ -37,10 +37,14 @@ File.read(PATCHREPO + "/blacklist.txt").each_line do |pkg|
 end
 
 puts "Fetching from MelonBot..."
-$marks = JSON.parse(Net::HTTP.get(URI("https://plct-arv.jiejiss.com/pkg")))["markList"].map do |pkg|
-    [pkg["name"], pkg ]
-end.to_h
-
+begin
+    $marks = JSON.parse(Net::HTTP.get(URI("https://plct-arv.jiejiss.com/pkg")))["markList"].map do |pkg|
+        [pkg["name"], pkg ]
+    end.to_h
+rescue => e
+    puts "Failed to fetch from MelonBot: #{e}"
+    $marks = {}
+end
 
 File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
     f.puts('
@@ -54,6 +58,10 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
     <table class="table is-hoverable">
     <thead><tr><th>DB</th><th>Package</th><th>Status</th></tr></thead><tbody>
     ')
+
+    if $marks.empty?
+        f.puts("<tr><td></td><td>_warning</td><td><font color=red>Failed to fetch from MelonBot, marks will be missing!</font></td></tr>")
+    end
 
     def read_db(handle, db, result)
         count = 0
