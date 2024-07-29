@@ -27,4 +27,6 @@ rsync -e ssh -p '--chmod=ug=rw,o=r' -c -h -L --progress --partial -y ./$PKG{,.si
 ssh -tt $TIER0SERVER "cd $_remote_path/repo/$REPO/; flock /tmp/riscv-repo-$REPO.lck repo-add -R $REPO.db.tar.gz $PKG"
 # flock ../$REPO.lck rsync -avP --delete $RVREPO/$REPO/ $TIER0SERVER/repo/$REPO/
 
+ssh -tt $TIER0SERVER "cd $TIER0ARCHIVEPATH/archive; cp -v $_remote_path/repo/$REPO/$PKG{,.sig} ./"
+
 rm -r $WORKDIR
