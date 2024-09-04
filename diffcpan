@@ -7,8 +7,8 @@ ver2=$3
 
 # TODO: Is there an API for this?
 _page=$(curl https://metacpan.org/dist/$cpanname)
-oldauthor=$(echo $_page | grep -oP "(?<=value=\")\w+(?=/$cpanname-$ver1\")" | head -n 1)
-author=$(echo $_page | grep -oP "(?<=value=\")\w+(?=/$cpanname-$ver2\")"  | head -n 1)
+oldauthor=$(echo $_page | grep -oP "(?<=value=\"/release/)\w+(?=/$cpanname-$ver1\")" | head -n 1)
+author=$(echo $_page | grep -oP "(?<=value=\"/release/)\w+(?=/$cpanname-$ver2\")"  | head -n 1)
 
 test -f /tmp/$cpanname.json.$ver1 || curl https://fastapi.metacpan.org/release/$oldauthor/$cpanname-$ver1 | jq -S '.release.dependency | sort | .[] | .module, .phase' > /tmp/$cpanname.json.$ver1
 test -f /tmp/$cpanname.json.$ver2 || curl https://fastapi.metacpan.org/release/$author/$cpanname-$ver2 | jq -S '.release.dependency | sort | .[] | .module, .phase' > /tmp/$cpanname.json.$ver2
