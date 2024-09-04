@@ -45,7 +45,7 @@ File.rename('/var/www/aosc/treevsrepo/index.html.tmp', '/var/www/aosc/treevsrepo
 arch_data.each do |arch, data|
     puts "Generating #{arch} with #{data.length} entries..."
     arch_dir = "/var/www/aosc/treevsrepo/#{arch}"
-    Dir.mkdir(arch_dir) unless File.exists?(arch_dir)
+    Dir.mkdir(arch_dir) unless File.exist?(arch_dir)
     File.open("#{arch_dir}/index.html.tmp", 'w') do |f|
         f.puts common_header + '<thead><tr><th>Package</th><th>Tree Version</th>
         <th>Repo Version</th></thead><tbody>'

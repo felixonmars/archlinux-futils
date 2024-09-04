@@ -65,7 +65,7 @@ Dir.glob('./*/trunk/PKGBUILD').each do |pkgbuild|
 
         `. #{pkgbuild} && echo ${validpgpkeys[@]}`.split.each do |key|
             keyfile = "#{File.dirname(pkgbuild)}/keys/pgp/#{key}.asc"
-            if File.exists? keyfile
+            if File.exist? keyfile
                 `gpg --show-keys --with-key-data #{keyfile}`.each_line do |line|
                     keyids.each do |keyid|
                         if line.start_with?('pub', 'sub') && line.include?(":#{keyid}:")
@@ -81,7 +81,7 @@ Dir.glob('./*/trunk/PKGBUILD').each do |pkgbuild|
 
         if keyids.empty?
             puts "OK: #{pkgbuild}".green
-        elsif Dir.exists? "#{File.dirname(pkgbuild)}/keys/pgp"
+        elsif Dir.exist? "#{File.dirname(pkgbuild)}/keys/pgp"
             puts "FAIL: #{pkgbuild} keys #{keyids.join(', ')} not found in exported keys. ignore until we fix export-pkgbuild-keys.".yellow
         elsif `. #{pkgbuild} && echo ${validpgpkeys[@]}`.chomp.empty?
             puts "FAIL: #{pkgbuild} validpgpkeys array is empty".red

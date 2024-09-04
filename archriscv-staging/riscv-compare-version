@@ -102,9 +102,9 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
 
             puts "Reading riscv64 #{db}..."
             rv_count = read_db(rv_handle, db, $rv_packages) do |package|
-                if ! File.exists?("#{REPOROOT}/repo/#{db}/#{package.filename}")
+                if ! File.exist?("#{REPOROOT}/repo/#{db}/#{package.filename}")
                     f.puts("<tr><td>#{db}</td><td>#{package.name}</td><td><font color=red>Lint: package file not found in repository</font></td></tr>")
-                elsif ! File.exists?("#{REPOROOT}/repo/#{db}/#{package.filename}.sig")
+                elsif ! File.exist?("#{REPOROOT}/repo/#{db}/#{package.filename}.sig")
                     f.puts("<tr><td>#{db}</td><td>#{package.name}</td><td><font color=red>Lint: package signature not found in repository</font></td></tr>")
                 end
 
@@ -153,7 +153,7 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
     end
 
     def patch_repo_link(pkgbase)
-        if File.exists?("#{PATCHREPO}/#{pkgbase}")
+        if File.exist?("#{PATCHREPO}/#{pkgbase}")
             " <a href=https://github.com/felixonmars/archriscv-packages/tree/master/#{pkgbase}>
               <span class='tag is-info'>patched</span></a>"
         else
@@ -198,11 +198,11 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
     old_log_threshold = Time.now - 30 * 24 * 60 * 60
     $nocheck_packages = Set[]
     $x86_packages.each do |pkgname, package|
-        if File.exists?("#{REPOROOT}/.status/logs/#{package['base']}")
+        if File.exist?("#{REPOROOT}/.status/logs/#{package['base']}")
             nochecked = false
             if $rv_packages.has_key?(pkgname)
                 rvver = $rv_packages[pkgname]["version"]
-                if File.exists?("#{REPOROOT}/.status/logs/#{package['base']}/.nocheck")
+                if File.exist?("#{REPOROOT}/.status/logs/#{package['base']}/.nocheck")
                     nocheckver = File.read("#{REPOROOT}/.status/logs/#{package['base']}/.nocheck").chomp
                     nochecked = nocheckver == rvver
                 end
@@ -217,7 +217,7 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
                 end
             end
 
-            if File.exists?("#{REPOROOT}/.status/logs/#{package['base']}/#{package['base']}-#{package['version']}.log")
+            if File.exist?("#{REPOROOT}/.status/logs/#{package['base']}/#{package['base']}-#{package['version']}.log")
                 nil
             elsif Dir.glob("#{REPOROOT}/.status/logs/#{package['base']}/#{package['base']}-#{package['version']}-*.log").any?
                 nil
@@ -366,6 +366,8 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
             end
         elsif cmp > 0
             verstr = "<font color=orange>#{rvver} <- #{x86ver}</font>"
+        else
+            verstr = "<font color=red>#{rvver} == #{x86ver}</font>"
         end
 
         verstr += " <a href=#{x86_history_link(pkgbase)}><span class='tag is-info'>Changes</span></a>"

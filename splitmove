@@ -9,9 +9,9 @@ $community = []
 $failed = []
 
 def detect(pkg, converted=false)
-    if Dir.exists?("#{PACKAGES_REPO}/#{pkg}")
+    if Dir.exist?("#{PACKAGES_REPO}/#{pkg}")
         $packages << pkg
-    elsif Dir.exists?("#{COMMUNITY_REPO}/#{pkg}")
+    elsif Dir.exist?("#{COMMUNITY_REPO}/#{pkg}")
         $community << pkg
     elsif !converted
         $failed << pkg
