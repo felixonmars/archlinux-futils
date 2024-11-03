@@ -1,7 +1,9 @@
 #!/usr/bin/env python
 
-import pyalpm
 import argparse
+from dataclasses import dataclass
+
+import pyalpm
 from nvchecker import core as nvchecker_core
 from nvchecker.util import RichResult
 
@@ -12,9 +14,16 @@ PREFIX_MAP = {
     "gems": "ruby-",
     "npm": "nodejs-",
 }
+@dataclass
+class ParserArgs:
+    """Define argument types to support argument type hints"""
+
+    update: bool
+    db: list[str]
+    newer: bool
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description='Check or update nvchecker oldver db from pacman sync db')
     parser.add_argument('-u', '--update', action="store_true",
                         help='Actually update nvchecker db after printing the difference')
@@ -23,7 +32,7 @@ def main():
                         help='Pacman sync db to consider. Defaulting to all with testing and multilib enabled')
     parser.add_argument("-n", "--newer", action="store_true",
                         help='Only consider entry when pacman version is not newer than newver (useful when Arch bumped to an alpha, etc)')
-    args = parser.parse_args()
+    args = ParserArgs(**vars(parser.parse_args()))
 
     nvchecker_config = nvchecker_core.get_default_config()
     nvchecker_entries, nvchecker_options = nvchecker_core.load_file(nvchecker_config, use_keymanager=False)
