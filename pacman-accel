@@ -50,3 +50,4 @@ end
 
 set :bind, ENV.fetch("PACMAN_ACCEL_BIND", "127.0.0.1")
 set :port, ENV.fetch("PACMAN_ACCEL_PORT", "4567")
+set :host_authorization, { permitted_hosts: [] }
