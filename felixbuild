@@ -3,34 +3,11 @@
 source /usr/share/makepkg/util/message.sh
 colorize
 
-# === Handle server & multiple logins ===
-_buildserver=$1
-
-# BUILDHOST shall not contain any numbers
-BUILDHOST=${_buildserver//[0-9]/}
-_login=${_buildserver//[a-zA-Z.@]/}
-
+# === Handle server ===
+BUILDHOST=$1
 msg "Building on ${BUILDHOST##*@}"
 shift
-
-# === Deal with multiple logins (for parallel building) ===
-if [[ -z "$_login" ]]; then
-  _cmd="$@"
-else
-  _cmd=
-  _login="-l $USER$_login"
-  _mark=
-  for _part in "$@"; do
-    _cmd="$_cmd $_part"
-    if [[ -z "$_mark" && "$_part" == "--" ]]; then
-      _cmd="$_cmd $_login"
-      _mark=1
-    fi
-  done
-  if [[ -z "$_mark" ]]; then
-    _cmd="$_cmd -- $_login"
-  fi
-fi
+CMD="$@"
 
 # === Sync package to remote host ===
 # Prefer to use rsync here because it's much faster than source packages
@@ -44,7 +21,7 @@ msg "Syncing package to remote host..."
 rsync -avzzP ./ $BUILDHOST:packages/$PKGNAME/ --exclude=*.src.tar* --exclude=*.pkg.tar* --exclude=src/ --exclude=pkg/ --exclude=.git/ || exit 1
 
 # === Handle validpgpkeys ===
-if [[ -n "$(. PKGBUILD; echo $validpgpkeys)" && ! "$_cmd" == *"--skippgpcheck"* ]]; then
+if [[ -n "$(. PKGBUILD; echo $validpgpkeys)" && ! "$CMD" == *"--skippgpcheck"* ]]; then
   msg "Ensuring required PGP keys are present..."
   for _key in $(source PKGBUILD; echo "${validpgpkeys[@]}" 2>/dev/null); do
     msg2 "Checking for $_key..."
@@ -68,7 +45,7 @@ fetch_logs() {
 trap fetch_logs EXIT
 
 # === Handle riscv64 patches ===
-if [[ "$1" =~ riscv ]]; then
+if [[ "$CMD" =~ "--arch riscv64" ]]; then
   . /usr/local/bin/riscvenv
   if [[ -d "$RVPATCHREPO/$PKGNAME" ]]; then
     msg "Applying RISC-V patches..."
@@ -82,28 +59,11 @@ if [[ "$1" =~ riscv ]]; then
     msg 'Patching arch to riscv64...'
     ssh $BUILDHOST "echo -e '\narch=(riscv64)' >> packages/$PKGNAME/PKGBUILD" || exit 1
   fi
-
-  # Handle cachedir
-  _HOME="$(ssh $BUILDHOST 'mkdir -p $HOME/packages/riscv64-pkg-cache; echo $HOME')"
-  _oldcmd="$_cmd"
-  _cmd=
-  _cachedir="-d $_HOME/packages/riscv64-pkg-cache:/var/cache/pacman/pkg"
-  _mark=
-  for _part in $_oldcmd; do
-    _cmd="$_cmd $_part"
-    if [[ -z "$_mark" && "$_part" == "--" ]]; then
-      _cmd="$_cmd $_cachedir"
-      _mark=1
-    fi
-  done
-  if [[ -z "$_mark" ]]; then
-    _cmd="$_cmd -- $_cachedir"
-  fi
 fi
 
 # === Build the package ===
-msg "Running $_cmd on remote host..."
-ssh -tt $BUILDHOST "cd packages/$PKGNAME && rm -f *.pkg.tar.*; $_cmd" || exit 1
+msg "Running $CMD on remote host..."
+ssh -tt $BUILDHOST "cd packages/$PKGNAME && rm -f *.pkg.tar.*; $CMD" || exit 1
 
 # === Sync back artifacts ===
 msg "Syncing back built packages..."
