@@ -12,12 +12,20 @@
       maincmd = buildcmd.split[1]
       if maincmd == "pkgctl"
         # New pkgctl
-        arch = "x86_64"
-        repo = "stable"
-        if buildcmd.split[-1] == "--staging"
-          repo = "staging"
-        elsif buildcmd.split[-1] == "--testing"
-          repo = "testing"
+        begin
+          arch = buildcmd.split("--arch ")[1].split[0]
+        rescue
+          arch = "x86_64"
+        end
+        begin
+          repo = buildcmd.split("--repo ")[1].split[0]
+        rescue
+          repo = "stable"
+          if buildcmd.split[-1] == "--staging"
+            repo = "staging"
+          elsif buildcmd.split[-1] == "--testing"
+            repo = "testing"
+          end
         end
       else
         # Legacy #repo-#arch-build
