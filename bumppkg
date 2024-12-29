@@ -146,7 +146,8 @@ if [[ "$_build" -eq 1 ]]; then
 
   SYNCBACKPKGBUILD=1 felixbuild $_buildserver pkgctl build $_suffix $_rebuild
 
-  BUILDHOST=$_buildserver PKGBASE=$_pkgbase felix-rsync-wrapper pkgctl release $_suffix -m "$_msg"
+  # BUILDHOST=$_buildserver PKGBASE=$_pkgbase felix-rsync-wrapper pkgctl release $_suffix -m "$_msg"
+  pkgctl release $_suffix -m "$_msg"
 
   while ! db-update; do
     echo "db-update failed, retrying after 5s..."
