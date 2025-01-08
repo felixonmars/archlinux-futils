@@ -8,5 +8,5 @@ end
 
 pkgs = Set.new(ARGV.filter{|pkg| ! pkg.end_with? ":nocheck"})
 
-# `ssh repos.archlinux.org /packages/db-move extra-staging extra "#{pkgs.join(" ")}"`
+# `ssh repos.archlinux.org bash -x /packages/db-move extra-staging extra #{pkgs.join(" ")}`
 `pkgctl db move extra-staging extra #{pkgs.join(" ")}`
