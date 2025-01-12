@@ -5,7 +5,7 @@
   if line.include? 'felixbuild '
     cwd = File.readlink("/proc/#{pid}/cwd")
 
-    server = line.split("felixbuild ")[1].split[0].match(/[a-zA-Z.@]+/)[0].split("@")[-1]
+    server = line.split("felixbuild ")[1].split[0].split("@")[-1]
 
     begin
       buildcmd = line.split("felixbuild ")[1]
