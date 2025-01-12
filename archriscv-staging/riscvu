@@ -74,10 +74,10 @@ fi
 SERVER=$(felixbuild-server-select riscv64)
 
 if [[ "$NOUPLOAD" == "1" ]]; then
-    felixbuild $SERVER pkgctl build --arch riscv64 --repo extra $CMD $nocheck || exit 1
+    SYNCBACKPKGBUILD=1 felixbuild $SERVER pkgctl build --arch riscv64 --repo extra $CMD $nocheck || exit 1
 else
     LOGFILE=$PKGBASE-$(. PKGBUILD; echo $epoch${epoch:+:}$pkgver-$pkgrel).log
-    felixbuild $SERVER pkgctl build --arch riscv64 --repo extra $CMD $nocheck | tee $LOGFILE
+    SYNCBACKPKGBUILD=1 felixbuild $SERVER pkgctl build --arch riscv64 --repo extra $CMD $nocheck | tee $LOGFILE
     if [[ ${PIPESTATUS[0]} -ne 0 ]]; then
         read -r -p "Upload log? [y/N] " response
         if [[ "$response" =~ ^([yY][eE][sS]|[yY])$ ]]
