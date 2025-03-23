@@ -49,18 +49,16 @@ end
 File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
     f.puts('
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <link rel="stylesheet" href="https://lib.baomitu.com/bulma/0.9.4/css/bulma.min.css">
+    <link rel="stylesheet" href="https://cdnjs.snrat.com/ajax/libs/bulma/1.0.3/css/bulma.min.css" integrity="sha384-DtLgkgZWuBalGogBkye1PTBvXKCD/hnA8vHqpqfcGCf/FOa1heAyeHExO8JNtVM/" crossorigin="anonymous">
     <style>
-    tr:hover { background-color: #ddd !important; }
     .tag.tag-with-details { height: auto; min-height: 2em; }
-    .tag.is-pink { background-color: hotpink; color: white; }
     </style>
     <table class="table is-hoverable">
     <thead><tr><th>DB</th><th>Package</th><th>Status</th></tr></thead><tbody>
     ')
 
     if $marks.empty?
-        f.puts("<tr><td></td><td>_warning</td><td><font color=red>Failed to fetch from MelonBot, marks will be missing!</font></td></tr>")
+        f.puts("<tr><td></td><td>_warning</td><td><span style='color:var(--bulma-danger)'>Failed to fetch from MelonBot, marks will be missing!</span></td></tr>")
     end
 
     def read_db(handle, db, result)
@@ -103,15 +101,15 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
             puts "Reading riscv64 #{db}..."
             rv_count = read_db(rv_handle, db, $rv_packages) do |package|
                 if ! File.exist?("#{REPOROOT}/repo/#{db}/#{package.filename}")
-                    f.puts("<tr><td>#{db}</td><td>#{package.name}</td><td><font color=red>Lint: package file not found in repository</font></td></tr>")
+                    f.puts("<tr><td>#{db}</td><td>#{package.name}</td><td><span style='color:var(--bulma-danger)'>Lint: package file not found in repository</span></td></tr>")
                 elsif ! File.exist?("#{REPOROOT}/repo/#{db}/#{package.filename}.sig")
-                    f.puts("<tr><td>#{db}</td><td>#{package.name}</td><td><font color=red>Lint: package signature not found in repository</font></td></tr>")
+                    f.puts("<tr><td>#{db}</td><td>#{package.name}</td><td><span style='color:var(--bulma-danger)'>Lint: package signature not found in repository</span></td></tr>")
                 end
 
                 if $rv_packages.has_key?(package.name)
                     f.puts("<tr><td>#{db}</td><td>#{package.name}</td>
-                                <td><font color=red>Lint: package found in different repository: #{$rv_packages[package.name]['db']}.
-                                x86 repo: #{$x86_packages[package.name]['db']}</font></td></tr>")
+                                <td><span style='color:var(--bulma-danger)'>Lint: package found in different repository: #{$rv_packages[package.name]['db']}.
+                                x86 repo: #{$x86_packages[package.name]['db']}</span></td></tr>")
                 end
             end
 
@@ -290,7 +288,7 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
         verstr += make_tag_with_details(outdated, 'DEP OUTDATED', 'warning') if outdated.any?
 
         verstr += "Leaf package, port it!" if show_leaf and verstr.empty?
-        verstr += " <a href='logs/#{pkgbase}/'><span class='tag is-light'>Outdated FTBFS Logs</span></a>" if $outdated_logs.include?(pkgbase)
+        verstr += " <a href='logs/#{pkgbase}/'><span class='tag is-text-invert'>Outdated FTBFS Logs</span></a>" if $outdated_logs.include?(pkgbase)
         verstr
     end
 
@@ -308,7 +306,7 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
                     result += " <span class='tag is-success' title='#{title}'>Ready</span>"
                 when "failing"
                 else
-                    result += " <span class='tag is-light' title='#{title}'>#{mark["name"]}</span>"
+                    result += " <span class='tag is-text-invert' title='#{title}'>#{mark["name"]}</span>"
                 end
             end
         end
@@ -360,14 +358,14 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
             if rvpkgver == x86pkgver
                 rvpkgrel = rvver.split("-")[1]
                 x86pkgrel = x86ver.split("-")[1]
-                verstr = "#{rvpkgver}-<font color=green>#{rvpkgrel} -> </font>#{x86pkgver}-<font color=green>#{x86pkgrel}</font>"
+                verstr = "#{rvpkgver}-<span style='color:var(--bulma-success)'>#{rvpkgrel} -> </span>#{x86pkgver}-<span style='color:var(--bulma-success)'>#{x86pkgrel}</span>"
             else
-                verstr = "<font color=green>#{rvver} -> #{x86ver}</font>"
+                verstr = "<span style='color:var(--bulma-success)'>#{rvver} -> #{x86ver}</span>"
             end
         elsif cmp > 0
-            verstr = "<font color=orange>#{rvver} <- #{x86ver}</font>"
+            verstr = "<span style='color:var(--bulma-warning)'>#{rvver} <- #{x86ver}</span>"
         else
-            verstr = "<font color=red>#{rvver} == #{x86ver}</font>"
+            verstr = "<span style='color:var(--bulma-danger)'>#{rvver} == #{x86ver}</span>"
         end
 
         verstr += " <a href=#{x86_history_link(pkgbase)}><span class='tag is-info'>Changes</span></a>"
@@ -397,9 +395,9 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
     puts "Rendering lint..."
     $rv_packages.each do |pkgname, package|
         if ! $x86_packages.include? pkgname
-            f.puts("<tr><td>#{package['db']}</td><td>#{pkgname}</td><td><font color=orange>Lint: package not found in x86 repository.</font></td></tr>")
+            f.puts("<tr><td>#{package['db']}</td><td>#{pkgname}</td><td><span style='color:var(--bulma-warning)'>Lint: package not found in x86 repository.</span></td></tr>")
         elsif $x86_packages[pkgname]["db"] != package["db"]
-            f.puts("<tr><td>#{package['db']}</td><td>#{pkgname}</td><td><font color=red>Lint: package in different x86 repository: #{$x86_packages[pkgname]['db']}.</font></td></tr>")
+            f.puts("<tr><td>#{package['db']}</td><td>#{pkgname}</td><td><span style='color:var(--bulma-danger)'>Lint: package in different x86 repository: #{$x86_packages[pkgname]['db']}.</span></td></tr>")
         end
     end
 
