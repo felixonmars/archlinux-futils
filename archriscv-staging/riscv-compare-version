@@ -160,6 +160,11 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
     end
 
     def parse_build_log(log)
+        cached_stage_file = File.dirname(log) + "/." + File.basename(log) + ".failed_stage"
+        if File.exist?(cached_stage_file) and File.mtime(cached_stage_file) > File.mtime(log)
+            return File.read(cached_stage_file).chomp
+        end
+        puts "Parsing build log #{log}..."
         stages = [
             ["patch failed", "\x1b[1m\x1b[32m==>\x1b[m\x0f\x1b[1m Applying RISC-V patches...\x1b[m\x0f"],
             ["source download failed", "\x1b[1m\x1b[31m==> ERROR:\x1b[m\x0f\x1b[1m Failure while downloading"],
@@ -189,6 +194,7 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
                 end
             end
         end
+        File.write(cached_stage_file, last_failed_stage) if last_failed_stage
         last_failed_stage
     end
 
