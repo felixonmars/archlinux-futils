@@ -380,6 +380,10 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
 
         verstr += patch_repo_link(pkgbase)
 
+        if File.exist?("#{REPOROOT}/.status/logs/#{pkgbase}/.nocheck")
+            verstr += " <span class='tag is-pink'>nocheck</span>"
+        end
+
         pkgname_str = pkgname
         pkgname_str += " (#{pkgbase})" if pkgname != pkgbase
 
