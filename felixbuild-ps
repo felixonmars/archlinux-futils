@@ -21,9 +21,9 @@
           repo = buildcmd.split("--repo ")[1].split[0]
         rescue
           repo = "stable"
-          if buildcmd.split[-1] == "--staging"
+          if buildcmd.split.include? "--staging"
             repo = "staging"
-          elsif buildcmd.split[-1] == "--testing"
+          elsif buildcmd.split.include? "--testing"
             repo = "testing"
           end
         end
