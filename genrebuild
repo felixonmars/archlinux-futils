@@ -32,7 +32,7 @@ HASKELL_REAL_MAKEDEPEND = {
 
 parser = argparse.ArgumentParser(description='Rebuild generator and orderer, generates all haskell reverse deps too')
 parser.add_argument('-H', '--haskell-check', action="store_true",
-                                             help='Filter results for haskell-only rebuilds, also implies --expand, --expand-make, --expand-check')
+                                             help='Filter results for haskell-only rebuilds, also implies --expand, --expand-make, --expand-check, and --ignore ghc,ghc-static')
 parser.add_argument('-e', '--expand', action="store_true",
                                       help='Expand all reverse deps')
 parser.add_argument('-m', '--expand-make', action="store_true",
@@ -40,19 +40,24 @@ parser.add_argument('-m', '--expand-make', action="store_true",
 parser.add_argument('-c', '--expand-check', action="store_true",
                                             help='Expand all reverse check deps')
 parser.add_argument('--ignore', nargs='?', default="", help='Ignore packages, separated by comma')
-parser.add_argument('-d', '--db', nargs='*', default=["core", "extra", "community", "multilib"],
-                                             help='Pacman sync db to consider. Defaulting to all stable dbs.')
+parser.add_argument('-d', '--db', nargs='?', default="core,extra,multilib",
+                                             help='Pacman sync db to consider, separated by comma. Defaulting to all stable dbs.')
 parser.add_argument('--dbpath', nargs='?', default="/var/lib/pacman",
                                            help='Pacman sync db location. Default: /var/lib/pacman')
+parser.add_argument('--dep', nargs='?', default="",
+                                        help='Additional dependencies to consider, as colon-separated pairs separated by comma. Example: foo:bar means foo depends on bar.')
 parser.add_argument('package', nargs='+', help='Packages to rebuild')
 args = parser.parse_args()
-
-args.ignore = set(args.ignore.split(","))
 
 if args.haskell_check:
     args.expand = True
     args.expand_make = True
     args.expand_check = True
+    if args.ignore == "":
+        args.ignore = "ghc,ghc-static"
+
+args.ignore = set(args.ignore.split(","))
+args.db = set(args.db.split(","))
 
 logger = colorlog.getLogger()
 logger.setLevel(colorlog.DEBUG)
@@ -127,6 +132,11 @@ for dep, pkgs in reverse_deps.items():
     for pkg in pkgs:
         if pkg in pkglist:
             G.add_edge(dep, pkg)
+
+
+for dep_pair in args.dep.split(","):
+    pkg, dep = dep_pair.split(":")
+    G.add_edge(dep, pkg)
 
 
 def flatten_frozenset(nodes):
