@@ -135,6 +135,8 @@ for dep, pkgs in reverse_deps.items():
 
 
 for dep_pair in args.dep.split(","):
+    if not dep_pair:
+        continue
     pkg, dep = dep_pair.split(":")
     G.add_edge(dep, pkg)
 
