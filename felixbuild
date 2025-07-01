@@ -72,5 +72,5 @@ rsync -avzzP $BUILDHOST:packages/$PKGNAME/*.pkg.tar.* ./ || exit 1
 # === Sync back PKGBUILD ===
 if [[ -n "$SYNCBACKPKGBUILD" ]]; then
   msg "Syncing back PKGBUILD..."
-  rsync -avzzP $BUILDHOST:packages/$PKGNAME/PKGBUILD ./ || exit 1
+  rsync -avzzP --checksum $BUILDHOST:packages/$PKGNAME/PKGBUILD ./ || exit 1
 fi
