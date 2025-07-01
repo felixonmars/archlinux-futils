@@ -203,22 +203,18 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
     $nocheck_packages = Set[]
     $x86_packages.each do |pkgname, package|
         if File.exist?("#{REPOROOT}/.status/logs/#{package['base']}")
-            nochecked = false
             if $rv_packages.has_key?(pkgname)
                 rvver = $rv_packages[pkgname]["version"]
                 if File.exist?("#{REPOROOT}/.status/logs/#{package['base']}/.nocheck")
                     nocheckver = File.read("#{REPOROOT}/.status/logs/#{package['base']}/.nocheck").chomp
-                    nochecked = nocheckver == rvver
+                    $nocheck_packages << pkgname if nocheckver == rvver
                 end
 
                 if rvver.split("-")[1].include? "."
                     rvver = [rvver.split("-")[0], rvver.split("-")[1].split(".")[0]].join("-")
                 end
 
-                if rvver == package["version"]
-                    $nocheck_packages << pkgname if nochecked
-                    next
-                end
+                next if rvver == package["version"]
             end
 
             if File.exist?("#{REPOROOT}/.status/logs/#{package['base']}/#{package['base']}-#{package['version']}.log")
@@ -380,7 +376,7 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
 
         verstr += patch_repo_link(pkgbase)
 
-        if File.exist?("#{REPOROOT}/.status/logs/#{pkgbase}/.nocheck")
+        if $nocheck_packages.include?(pkgname)
             verstr += " <span class='tag is-pink'>nocheck</span>"
         end
 
