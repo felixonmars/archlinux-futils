@@ -39,6 +39,8 @@ parser.add_argument('-m', '--expand-make', action="store_true",
                                            help='Expand all reverse make deps')
 parser.add_argument('-c', '--expand-check', action="store_true",
                                             help='Expand all reverse check deps')
+parser.add_argument('--only-explicit-make-and-check', action="store_true",
+                                            help='Only expand reverse make and check deps for packages that are explicitly passed to this script, not recursively')
 parser.add_argument('--ignore', nargs='?', default="", help='Ignore packages, separated by comma')
 parser.add_argument('-d', '--db', nargs='?', default="core,extra,multilib",
                                              help='Pacman sync db to consider, separated by comma. Defaulting to all stable dbs.')
@@ -67,6 +69,7 @@ handler.setFormatter(colorlog.ColoredFormatter())
 logger.addHandler(handler)
 
 rebuild_list = set(filter(lambda p: not p.endswith(":nocheck"), args.package))
+original_rebuild_list = rebuild_list.copy()
 
 package_db = defaultdict(dict)
 pkglist = rebuild_list.copy()
@@ -110,6 +113,8 @@ def resolve_pkg(pkg):
                 else:
                     if args.expand and ({pkg} | package_db[pkg]["provides"]) & package_db[_pkg]["depends"]:
                         newpkgs.add(_pkg)
+                    if args.only_explicit_make_and_check and pkg not in original_rebuild_list:
+                        continue
                     if args.expand_make and ({pkg} | package_db[pkg]["provides"]) & package_db[_pkg]["makedepends"]:
                         newpkgs.add(_pkg)
                     if args.expand_check and ({pkg} | package_db[pkg]["provides"]) & package_db[_pkg]["checkdepends"]:
@@ -228,14 +233,16 @@ def pass2(NG, nocheck_pkg):
     best_pass2 = False
     nocheck_pkg_bak = nocheck_pkg.copy()
     # Try 3 times, use the most optimal result
-    pass2 = []
-    broken_set = set()
-    nocheck_pkg = nocheck_pkg_bak.copy()
     for _ in range(3):
-        counter = 0
+        _pass2 = []
+        broken_set = set()
+        nocheck_pkg = nocheck_pkg_bak.copy()
+        loop_detector = 0
+
         while nocheck_pkg | broken_set:
             for pkg in nocheck_pkg | broken_set:
                 if not (package_db[pkg]["depends"] | package_db[pkg]["makedepends"] | package_db[pkg]["checkdepends"]) & broken_set:
+                    loop_detector = 0
                     to_break = set([rdep for rdep in reverse_deps[pkg] if pkg in package_db[rdep]["depends"] and rdep in NG])
                     last_to_break = False
                     while to_break != last_to_break:
@@ -244,7 +251,7 @@ def pass2(NG, nocheck_pkg):
                             to_break = to_break | set([rdep for rdep in reverse_deps[_pkg] if _pkg in package_db[rdep]["depends"] and rdep in NG])
                     # if not to_break <= (nocheck_pkg | broken_set):
                     #     continue
-                    pass2.append(pkg)
+                    _pass2.append(pkg)
                     broken_set |= to_break
                     if pkg in broken_set:
                         broken_set.remove(pkg)
@@ -252,18 +259,26 @@ def pass2(NG, nocheck_pkg):
                         nocheck_pkg.remove(pkg)
                     break
             else:
-                # Deadend. Start over.
-                counter += 1
-                if counter > 20:
-                    logger.error("Cycle Solver pass2 unresolvable loop.")
-                    raise RuntimeError
-                logger.warning("Cycle Solver pass2 loop detected. Starting over...")
-                pass2 = []
-                broken_set = set()
-                nocheck_pkg = nocheck_pkg_bak.copy()
+                loop_detector += 1
+                if loop_detector > 20:
+                    logger.error("Cycle Solver pass2 loop detected, let's abort!")
+                    _pass2 = []
+                    break
 
-        if best_pass2 is False or len(pass2) < len(best_pass2):
-            best_pass2 = pass2.copy()
+                logger.warning("Cycle Solver pass2 (try " + str(_) + ") found no package to build cleanly, adding more nocheck packages...")
+                for pkg in broken_set:
+                    if pkg in nocheck_pkg_bak and not package_db[pkg]["depends"] & broken_set:
+                        _pass2.append(pkg + ":nocheck")
+                        nocheck_pkg.add(pkg)
+                        broken_set.remove(pkg)
+                        break
+
+        if not _pass2:
+            logger.error("Cycle Solver pass2 failed to resolve any packages, retrying from pass1...")
+            raise RuntimeError
+
+        if best_pass2 is False or len(_pass2) < len(best_pass2):
+            best_pass2 = _pass2.copy()
 
     logger.debug("Cycle Solver pass2: " + " ".join(best_pass2))
     return best_pass2
@@ -273,14 +288,19 @@ for pkg in nx.topological_sort(G):
     if isinstance(pkg, str):
         result.append(pkg)
     else:
-        while True:
+        # Try 3 times for a more optimal result
+        best_build_order = False
+        for _ in range(3):
             _pass1, NG, nocheck_pkg = pass1(pkg)
             try:
                 _pass2 = pass2(NG, nocheck_pkg)
             except RuntimeError:
                 logger.warning("Cycle Solver retrying from pass1...")
                 continue
-            result.extend(_pass1 + _pass2)
-            break
+            if best_build_order is False or len(_pass1) + len(_pass2) < len(best_build_order):
+                if best_build_order is not False:
+                    logger.info("Cycle Solver found a better build order (length: %d -> %d)" % (len(best_build_order), len(_pass1) + len(_pass2)))
+                best_build_order = _pass1 + _pass2
+        result.extend(best_build_order)
 
 print(" ".join(result))
