@@ -5,8 +5,11 @@
 REPO=$1
 PKG=$2
 
+PKGNAME="${PKG%.pkg.tar.*}"; for _ in {1..4}; do PKGNAME="${PKGNAME%-*}"; done
+
 if [[ "$REPO" == *-debug ]]; then
     _remote_path=$TIER0ARCHIVEPATH
+    PKGNAME="${PKGNAME%-debug}"
 else
     _remote_path=$TIER0PATH
 fi
@@ -27,6 +30,8 @@ rsync -e ssh -p '--chmod=ug=rw,o=r' -c -h -L --progress --partial -y ./$PKG{,.si
 ssh -tt $TIER0SERVER "cd $_remote_path/repo/$REPO/; flock /tmp/riscv-repo-$REPO.lck repo-add -R $REPO.db.tar.gz $PKG"
 # flock ../$REPO.lck rsync -avP --delete $RVREPO/$REPO/ $TIER0SERVER/repo/$REPO/
 
-ssh -tt $TIER0SERVER "cd $TIER0ARCHIVEPATH/archive; cp -v $_remote_path/repo/$REPO/$PKG{,.sig} ./"
+echo "Deployed $PKGNAME to $REPO. Now copying to archive..."
+
+ssh -tt $TIER0SERVER "cd $TIER0ARCHIVEPATH/archive; rsync -v $_remote_path/repo/$REPO/$PKG{,.sig} ./$PKGNAME/"
 
 rm -r $WORKDIR
