@@ -234,35 +234,41 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
     end
 
     def missing_dep(pkgbase)
-        check_pkgs = Set[]
-        $pkgbase_map[pkgbase].each do |pkgname|
-            next if ! $x86_packages.has_key? pkgname
-            package = $x86_packages[pkgname]
-            check_pkgs |= (package["depends"] + package["makedepends"] + package["checkdepends"]).to_set
+        def check_dep(pkgbase)
+            $pkgbase_map[pkgbase].each do |pkgname|
+                next if ! $x86_packages.has_key? pkgname
+                package = $x86_packages[pkgname]
+                package["depends"].each do |dep| yield [dep, nil] end
+                package["makedepends"].each do |dep| yield [dep, "make"] end
+                package["checkdepends"].each do |dep| yield [dep, "check"] end
+            end
         end
 
         missing = Set[]
         broken = Set[]
         outdated = Set[]
-        check_pkgs.each do |dep|
+
+        check_dep(pkgbase) do |dep, type|
             ["<", ">", "="].each do |op|
                 dep = dep.split(op)[0]
             end
 
             if ! $rv_provides.include?(dep) && ! $pkgbase_map[pkgbase].include?(dep)
-                missing << dep
+                missing << [dep, type]
             elsif $broken_pkgs.include?(dep)
-                broken << dep
+                broken << [dep, type]
             elsif $version_mismatch.include?(dep)
-                outdated << dep
+                outdated << [dep, type]
             end
         end
         
         return missing, broken, outdated
     end
 
-    def make_link(list, package)
-        list ? "<li><a href='##{package}'>#{package}</a></li>" : "<a href='##{package}'>#{package}</a>"
+    def make_link(list, pkg)
+        package, type = pkg
+        type = type ? "&nbsp;(#{type})" : ""
+        list ? "<li><a href='##{package}'>#{package}</a>#{type}</li>" : "<a href='##{package}'>#{package}</a>#{type}"
     end
 
     def make_tag_with_details(pkg_set, label, category)
@@ -319,8 +325,10 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
     ($broken_pkgs.sort + $nocheck_packages.sort).each do |pkgname|
         next if ! $x86_packages.has_key? pkgname
         package = $x86_packages[pkgname]
+        log_marks = ""
         ftbfs_link = "logs/#{package['base']}/"
-        log_marks = melon_mark(package["base"]) + render_missing_dep(package["base"])
+        log_marks += "<a href='#{ftbfs_link}'><span class='tag is-danger'>FTBFS</span></a>" if $broken_pkgs.include? pkgname
+        log_marks += melon_mark(package["base"]) + render_missing_dep(package["base"])
         if File.exist?("#{REPOROOT}/.status/logs/#{package['base']}/#{package['base']}-#{package['version']}.log")
             ftbfs_link = "logs/#{package['base']}/#{package['base']}-#{package['version']}.log"
             if File.mtime("#{REPOROOT}/.status/logs/#{package['base']}/#{package['base']}-#{package['version']}.log") < old_log_threshold
@@ -333,14 +341,17 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
         end
 
         if $nocheck_packages.include?(pkgname)
-            log_marks += " <span class='tag is-pink'>nocheck</span>"
+            log_marks += " " if ! log_marks.empty?
+            log_marks += "<a href='#{ftbfs_link}'><span class='tag is-warning'>nochecked</span></a>"
         end
 
         pkgname_str = pkgname
         pkgname_str += " (#{package['base']})" if pkgname != package['base']
 
-        f.puts("<tr id='#{pkgname}'><td>#{package['db']}</td><td>#{pkgname_str}</td><td><a href='#{ftbfs_link}'>
-                <span class='tag is-danger'>FTBFS</span></a>#{log_marks + patch_repo_link(package['base'])}</td></tr>")
+        id_str = ""
+        id_str = "id='#{pkgname}'" if $broken_pkgs.include? pkgname
+
+        f.puts("<tr #{id_str}><td>#{package['db']}</td><td>#{pkgname_str}</td><td>#{log_marks + patch_repo_link(package['base'])}</td></tr>")
     end
 
     puts "Rendering version mismatch..."
@@ -377,7 +388,7 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
         verstr += patch_repo_link(pkgbase)
 
         if $nocheck_packages.include?(pkgname)
-            verstr += " <span class='tag is-pink'>nocheck</span>"
+            verstr += " <span class='tag is-warning'>nochecked</span>"
         end
 
         pkgname_str = pkgname
