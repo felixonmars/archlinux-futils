@@ -13,7 +13,7 @@ parser.add_argument('-d', '--db', nargs='*', default=["core", "extra", "communit
                     help='Pacman sync db to consider. Defaulting to all stable dbs.')
 parser.add_argument('-m', '--mock', nargs='?', default=None,
                     help='Mock build, do not actually run builds. set to a threshold (0-1, chance to succeed).')
-parser.add_argument('-r', '--retry', nargs='?', default=5,
+parser.add_argument('-r', '--retry', nargs='?', default="5",
                     help='Maximum retry on failure, set to 0 to disable retry. Default: 5')
 parser.add_argument('-l', '--log', nargs='?', default="dorebuild.log",
                     help="Log filename. Default: dorebuild.log")
@@ -58,6 +58,7 @@ async def main():
     loop = asyncio.get_event_loop()
     main.broken = False
     main.next_try = []
+    main.pkg_index = 0
 
     async def status_report():
         while True:
@@ -122,12 +123,40 @@ async def main():
             main.next_try.append(pkg)
         ongoing_pkgs.remove(pkg)
 
-    def handler(*args, **kwargs):
+    def write_next_try(next_try_list):
+        if not next_try_list:
+            return
+        next_try_file = "next_try.txt"
+        with open(next_try_file, "w") as f:
+            f.write("\n".join(next_try_list) + "\n")
+        # Reconstruct a full runnable command from current args
+        cmd_parts = [sys.argv[0]]
+        if args.db != ["core", "extra", "community", "multilib"]:
+            cmd_parts += ["-d"] + args.db
+        if args.command != "rebuild-one":
+            cmd_parts += ["-c", f'"{args.command}"']
+        if args.retry != "5":
+            cmd_parts += ["-r", args.retry]
+        if args.jobs != "10":
+            cmd_parts += ["-j", args.jobs]
+        if args.log != "dorebuild.log":
+            cmd_parts += ["-l", args.log]
+        cmd_parts.append(f'"{args.comment[0]}"')
+        cmd_parts.append(f"$(cat {next_try_file})")
+        full_cmd = " ".join(cmd_parts)
+        logger.warning(f"Next try written to {next_try_file}. To retry, run:")
+        logger.warning(full_cmd)
+
+    def sigint_handler(*_args, **_kwargs):
         logger.error("Received SIGINT, exiting...")
         logger.warning("Ongoing packages: " + ", ".join(ongoing_pkgs))
+        if main.broken:
+            logger.warning("Broken: " + " ".join(main.broken))
+        all_next_try = main.next_try + list(ongoing_pkgs) + args.package[main.pkg_index:]
+        write_next_try(all_next_try)
         sys.exit(1)
 
-    signal.signal(signal.SIGINT, handler)
+    signal.signal(signal.SIGINT, sigint_handler)
 
     for pkg in args.package:
         pending = True
@@ -157,6 +186,7 @@ async def main():
 
                 ongoing_pkgs.add(pkg)
                 loop.create_task(rebuild_single(pkg))
+                main.pkg_index += 1
 
             await asyncio.sleep(0.01)
 
@@ -165,7 +195,7 @@ async def main():
 
     if main.broken:
         logger.warning("Broken: " + " ".join(main.broken))
-        logger.warning("Next try: " + " ".join(main.next_try))
+        write_next_try(main.next_try)
 
 if __name__ == "__main__":
     asyncio.run(main())
