@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bumpbuddy: Last Updated from archlinux.org
 // @namespace    https://github.com/felixonmars/archlinux-futils
-// @version      1.3.0
+// @version      1.4.0
 // @description  Appends last_update time (from archlinux.org) after the local version on bumpbuddy.archlinux.org
 // @author       Felix Yan <felixonmars@archlinux.org>
 // @homepageURL  https://github.com/felixonmars/archlinux-futils
@@ -35,8 +35,15 @@
     }
   }
 
-  /** Fetch a URL via GM and return the response text (or null on error). */
-  function httpGet(url) {
+  function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Fetch a URL via GM and return the response text (or null on error).
+   * Retries automatically on HTTP 429, honouring the Retry-After header.
+   */
+  function httpGet(url, retries = 4) {
     return new Promise((resolve) => {
       queue.push(() => {
         activeFetches++;
@@ -44,7 +51,18 @@
           method: 'GET',
           url,
           timeout: 10000,
-          onload(r)   { activeFetches--; runQueue(); resolve(r.responseText); },
+          onload(r) {
+            activeFetches--;
+            runQueue();
+            if (r.status === 429 && retries > 0) {
+              // Honour Retry-After header (seconds); default to 10s
+              const match = r.responseHeaders && r.responseHeaders.match(/retry-after:\s*(\d+)/i);
+              const delay = match ? parseInt(match[1], 10) * 1000 : 10000;
+              sleep(delay).then(() => httpGet(url, retries - 1).then(resolve));
+            } else {
+              resolve(r.status >= 400 ? null : r.responseText);
+            }
+          },
           onerror()   { activeFetches--; runQueue(); resolve(null); },
           ontimeout() { activeFetches--; runQueue(); resolve(null); },
         });
