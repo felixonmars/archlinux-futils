@@ -15,14 +15,18 @@ PATCHREPO = "/var/www/archriscv-packages"
 
 $x86_packages = Hash.new{|h,k| h[k] = {}}
 $rv_packages = Hash.new{|h,k| h[k] = {}}
-$pkgbase_map = Hash.new{|h,k| h[k] = Set[]}
+$x86_pkgnames_by_pkgbase = Hash.new{|h,k| h[k] = Set[]}
+$x86_depnames_by_pkgbase = Hash.new{|h,k| h[k] = Set[]}
+$x86_pkgbase_by_depname = {}
 
 $rv_provides = Set[]
 
-$outdated_logs = Set[]
-$version_mismatch = Set[]
+$outdated_log_pkgbases = Set[]
+$version_mismatch_pkgbases = Set[]
+$version_mismatch_pkgnames = Set[]
 $blacklist = Set[]
-$broken_pkgs = Set[]
+$broken_pkgbases = Set[]
+$broken_pkgnames = Set[]
 
 STDOUT.sync = true
 puts "Running pacman -Sy..."
@@ -49,12 +53,13 @@ end
 File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
     f.puts('
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
     <link rel="stylesheet" href="https://cdnjs.snrat.com/ajax/libs/bulma/1.0.3/css/bulma.min.css" integrity="sha384-DtLgkgZWuBalGogBkye1PTBvXKCD/hnA8vHqpqfcGCf/FOa1heAyeHExO8JNtVM/" crossorigin="anonymous">
     <style>
     .tag.tag-with-details { height: auto; min-height: 2em; }
     </style>
     <table class="table is-hoverable">
-    <thead><tr><th>DB</th><th>Package</th><th>Status</th></tr></thead><tbody>
+    <thead><tr><th>DB</th><th>Pkgbase</th><th>Status</th></tr></thead><tbody>
     ')
 
     if $marks.empty?
@@ -92,23 +97,27 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
         ["core", "extra"].each do |db|
             puts "Reading x86_64 #{db}..."
             x86_count = read_db(x86_handle, db, $x86_packages) do |package|
-                $pkgbase_map[package.base] << package.name
+                $x86_pkgnames_by_pkgbase[package.base] << package.name
+                $x86_depnames_by_pkgbase[package.base] << package.name
+                $x86_pkgbase_by_depname[package.name] = package.base
                 package.provides.each do |_package|
-                    $pkgbase_map[package.base] << _package.split("=")[0]
+                    depname = _package.split("=")[0]
+                    $x86_depnames_by_pkgbase[package.base] << depname
+                    $x86_pkgbase_by_depname[depname] ||= package.base
                 end
             end
 
             puts "Reading riscv64 #{db}..."
             rv_count = read_db(rv_handle, db, $rv_packages) do |package|
                 if ! File.exist?("#{REPOROOT}/repo/#{db}/#{package.filename}")
-                    f.puts("<tr><td>#{db}</td><td>#{package.name}</td><td><span style='color:var(--bulma-danger)'>Lint: package file not found in repository</span></td></tr>")
+                    f.puts("<tr><td>#{db}</td><td>#{package.base}</td><td><span style='color:var(--bulma-danger)'>Lint: #{package.name} package file not found in repository</span></td></tr>")
                 elsif ! File.exist?("#{REPOROOT}/repo/#{db}/#{package.filename}.sig")
-                    f.puts("<tr><td>#{db}</td><td>#{package.name}</td><td><span style='color:var(--bulma-danger)'>Lint: package signature not found in repository</span></td></tr>")
+                    f.puts("<tr><td>#{db}</td><td>#{package.base}</td><td><span style='color:var(--bulma-danger)'>Lint: #{package.name} package signature not found in repository</span></td></tr>")
                 end
 
                 if $rv_packages.has_key?(package.name)
-                    f.puts("<tr><td>#{db}</td><td>#{package.name}</td>
-                                <td><span style='color:var(--bulma-danger)'>Lint: package found in different repository: #{$rv_packages[package.name]['db']}.
+                    f.puts("<tr><td>#{db}</td><td>#{package.base}</td>
+                                <td><span style='color:var(--bulma-danger)'>Lint: #{package.name} found in different repository: #{$rv_packages[package.name]['db']}.
                                 x86 repo: #{$x86_packages[package.name]['db']}</span></td></tr>")
                 end
             end
@@ -135,9 +144,11 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
         end
 
         if $x86_packages.has_key?(pkgname) && $x86_packages[pkgname]["version"] != rvver
-            $version_mismatch << pkgname
+            $version_mismatch_pkgbases << $x86_packages[pkgname]["base"]
+            $version_mismatch_pkgnames << pkgname
             package['provides'].each do |_package|
-                $version_mismatch << _package.split("=")[0] if ! $x86_packages.has_key? _package.split("=")[0]
+                depname = _package.split("=")[0]
+                $version_mismatch_pkgnames << depname if ! $x86_packages.has_key? depname
             end
         end
 
@@ -200,14 +211,16 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
 
     puts "Checking broken packages..."
     old_log_threshold = Time.now - 30 * 24 * 60 * 60
-    $nocheck_packages = Set[]
+    $nocheck_pkgbases = Set[]
     $x86_packages.each do |pkgname, package|
         if File.exist?("#{REPOROOT}/.status/logs/#{package['base']}")
             if $rv_packages.has_key?(pkgname)
                 rvver = $rv_packages[pkgname]["version"]
                 if File.exist?("#{REPOROOT}/.status/logs/#{package['base']}/.nocheck")
                     nocheckver = File.read("#{REPOROOT}/.status/logs/#{package['base']}/.nocheck").chomp
-                    $nocheck_packages << pkgname if nocheckver == rvver
+                    if nocheckver == rvver
+                        $nocheck_pkgbases << package['base']
+                    end
                 end
 
                 if rvver.split("-")[1].include? "."
@@ -222,20 +235,22 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
             elsif Dir.glob("#{REPOROOT}/.status/logs/#{package['base']}/#{package['base']}-#{package['version']}-*.log").any?
                 nil
             else
-                $outdated_logs |= $pkgbase_map[package['base']]
+                $outdated_log_pkgbases << package['base']
                 next
             end
 
-            $broken_pkgs << pkgname
+            $broken_pkgbases << package['base']
+            $broken_pkgnames << pkgname
             package['provides'].each do |_package|
-                $broken_pkgs << _package.split("=")[0] if ! $x86_packages.has_key? _package.split("=")[0]
+                depname = _package.split("=")[0]
+                $broken_pkgnames << depname if ! $x86_packages.has_key? depname
             end
         end
     end
 
     def missing_dep(pkgbase)
         def check_dep(pkgbase)
-            $pkgbase_map[pkgbase].each do |pkgname|
+            $x86_pkgnames_by_pkgbase[pkgbase].each do |pkgname|
                 next if ! $x86_packages.has_key? pkgname
                 package = $x86_packages[pkgname]
                 package["depends"].each do |dep| yield [dep, nil] end
@@ -253,11 +268,11 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
                 dep = dep.split(op)[0]
             end
 
-            if ! $rv_provides.include?(dep) && ! $pkgbase_map[pkgbase].include?(dep)
+            if ! $rv_provides.include?(dep) && ! $x86_depnames_by_pkgbase[pkgbase].include?(dep)
                 missing << [dep, type]
-            elsif $broken_pkgs.include?(dep)
+            elsif $broken_pkgnames.include?(dep)
                 broken << [dep, type]
-            elsif $version_mismatch.include?(dep)
+            elsif $version_mismatch_pkgnames.include?(dep)
                 outdated << [dep, type]
             end
         end
@@ -265,10 +280,15 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
         return missing, broken, outdated
     end
 
+    def dep_anchor(depname)
+        $x86_pkgbase_by_depname[depname] || depname
+    end
+
     def make_link(list, pkg)
         package, type = pkg
         type = type ? "&nbsp;(#{type})" : ""
-        list ? "<li><a href='##{package}'>#{package}</a>#{type}</li>" : "<a href='##{package}'>#{package}</a>#{type}"
+        anchor = dep_anchor(package)
+        list ? "<li><a href='##{anchor}'>#{package}</a>#{type}</li>" : "<a href='##{anchor}'>#{package}</a>#{type}"
     end
 
     def make_tag_with_details(pkg_set, label, category)
@@ -296,7 +316,7 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
         verstr += make_tag_with_details(outdated, 'DEP OUTDATED', 'warning') if outdated.any?
 
         verstr += "Leaf package, port it!" if show_leaf and verstr.empty?
-        verstr += " <a href='logs/#{pkgbase}/'><span class='tag is-text-invert'>Outdated FTBFS Logs</span></a>" if $outdated_logs.include?(pkgbase)
+        verstr += " <a href='logs/#{pkgbase}/'><span class='tag is-text-invert'>Outdated FTBFS Logs</span></a>" if $outdated_log_pkgbases.include?(pkgbase)
         verstr
     end
 
@@ -321,46 +341,57 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
         result
     end
 
+    def representative_x86_package(pkgbase)
+        pkgnames = $x86_pkgnames_by_pkgbase[pkgbase].select{|pkgname| $x86_packages.has_key? pkgname}.sort
+        pkgname = pkgnames.include?(pkgbase) ? pkgbase : pkgnames.first
+        return nil, nil if ! pkgname
+
+        [pkgname, $x86_packages[pkgname]]
+    end
+
+    def version_mismatch_pkgname(pkgbase)
+        $x86_pkgnames_by_pkgbase[pkgbase].sort.find do |pkgname|
+            $version_mismatch_pkgnames.include?(pkgname) && $rv_packages.has_key?(pkgname)
+        end
+    end
+
     puts "Checking FTBFS logs..."
-    ($broken_pkgs.sort + $nocheck_packages.sort).each do |pkgname|
-        next if ! $x86_packages.has_key? pkgname
-        package = $x86_packages[pkgname]
+    ($broken_pkgbases | $nocheck_pkgbases).sort.each do |pkgbase|
+        _pkgname, package = representative_x86_package(pkgbase)
+        next if ! package
         log_marks = ""
-        ftbfs_link = "logs/#{package['base']}/"
-        log_marks += "<a href='#{ftbfs_link}'><span class='tag is-danger'>FTBFS</span></a>" if $broken_pkgs.include? pkgname
-        log_marks += melon_mark(package["base"]) + render_missing_dep(package["base"])
-        if File.exist?("#{REPOROOT}/.status/logs/#{package['base']}/#{package['base']}-#{package['version']}.log")
-            ftbfs_link = "logs/#{package['base']}/#{package['base']}-#{package['version']}.log"
-            if File.mtime("#{REPOROOT}/.status/logs/#{package['base']}/#{package['base']}-#{package['version']}.log") < old_log_threshold
+        ftbfs_link = "logs/#{pkgbase}/"
+        log_marks += "<a href='#{ftbfs_link}'><span class='tag is-danger'>FTBFS</span></a>" if $broken_pkgbases.include? pkgbase
+        log_marks += melon_mark(pkgbase) + render_missing_dep(pkgbase)
+        if File.exist?("#{REPOROOT}/.status/logs/#{pkgbase}/#{pkgbase}-#{package['version']}.log")
+            ftbfs_link = "logs/#{pkgbase}/#{pkgbase}-#{package['version']}.log"
+            if File.mtime("#{REPOROOT}/.status/logs/#{pkgbase}/#{pkgbase}-#{package['version']}.log") < old_log_threshold
                 log_marks += " <span class='tag is-warning'>old</span>"
             end
-            failed_stage = parse_build_log("#{REPOROOT}/.status/logs/#{package['base']}/#{package['base']}-#{package['version']}.log")
+            failed_stage = parse_build_log("#{REPOROOT}/.status/logs/#{pkgbase}/#{pkgbase}-#{package['version']}.log")
             log_marks += " <span class='tag is-danger'>#{failed_stage}</span>" if failed_stage
-        elsif Dir.glob("#{REPOROOT}/.status/logs/#{package['base']}/#{package['base']}-#{package['version']}-*.log").any?
+        elsif Dir.glob("#{REPOROOT}/.status/logs/#{pkgbase}/#{pkgbase}-#{package['version']}-*.log").any?
             log_marks += " <span class='tag is-warning'>old format</span>"
         end
 
-        if $nocheck_packages.include?(pkgname)
+        if $nocheck_pkgbases.include?(pkgbase)
             log_marks += " " if ! log_marks.empty?
             log_marks += "<a href='#{ftbfs_link}'><span class='tag is-warning'>nochecked</span></a>"
         end
 
-        pkgname_str = pkgname
-        pkgname_str += " (#{package['base']})" if pkgname != package['base']
-
         id_str = ""
-        id_str = "id='#{pkgname}'" if $broken_pkgs.include? pkgname
+        id_str = "id='#{pkgbase}'" if $broken_pkgbases.include? pkgbase
 
-        f.puts("<tr #{id_str}><td>#{package['db']}</td><td>#{pkgname_str}</td><td>#{log_marks + patch_repo_link(package['base'])}</td></tr>")
+        f.puts("<tr #{id_str}><td>#{package['db']}</td><td>#{pkgbase}</td><td>#{log_marks + patch_repo_link(pkgbase)}</td></tr>")
     end
 
     puts "Rendering version mismatch..."
-    $version_mismatch.sort.each do |pkgname|
-        next if $broken_pkgs.include? pkgname
-        next if ! $x86_packages.has_key? pkgname
+    $version_mismatch_pkgbases.sort.each do |pkgbase|
+        next if $broken_pkgbases.include? pkgbase
+        pkgname = version_mismatch_pkgname(pkgbase)
+        next if ! pkgname
 
         db = $x86_packages[pkgname]['db']
-        pkgbase = $x86_packages[pkgname]['base']
         rvver = $rv_packages[pkgname]["version"]
         x86ver = $x86_packages[pkgname]['version']
 
@@ -387,35 +418,65 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
 
         verstr += patch_repo_link(pkgbase)
 
-        if $nocheck_packages.include?(pkgname)
+        if $nocheck_pkgbases.include?(pkgbase)
             verstr += " <span class='tag is-warning'>nochecked</span>"
         end
 
-        pkgname_str = pkgname
-        pkgname_str += " (#{pkgbase})" if pkgname != pkgbase
-
-        f.puts("<tr id='#{pkgname}'><td>#{db}</td><td>#{pkgname_str}</td><td>#{verstr}</td></tr>")
+        f.puts("<tr id='#{pkgbase}'><td>#{db}</td><td>#{pkgbase}</td><td>#{verstr}</td></tr>")
     end
 
     puts "Rendering missing packages..."
+    missing_pkgbases = Set[]
     $x86_packages.each do |pkgname, package|
-        next if $rv_packages.include? pkgname or $broken_pkgs.include? pkgname or $blacklist.include? pkgname
+        pkgbase = package['base']
+        next if $rv_packages.include? pkgname or $broken_pkgbases.include? pkgbase
+        next if $blacklist.include? pkgbase or $blacklist.include? pkgname
 
-        pkgname_str = pkgname
-        pkgname_str += " (#{package['base']})" if pkgname != package['base']
+        missing_pkgbases << pkgbase
+    end
 
-        verstr = melon_mark(package["base"]) + render_missing_dep(package['base'], show_leaf=true)
-        verstr += patch_repo_link(package['base'])
-        f.puts("<tr id='#{pkgname}'><td>#{package['db']}</td><td>#{pkgname_str}</td><td>#{verstr}</td></tr>")
+    missing_pkgbases.each do |pkgbase|
+        _pkgname, package = representative_x86_package(pkgbase)
+        next if ! package
+
+        verstr = melon_mark(pkgbase) + render_missing_dep(pkgbase, show_leaf=true)
+        verstr += patch_repo_link(pkgbase)
+        f.puts("<tr id='#{pkgbase}'><td>#{package['db']}</td><td>#{pkgbase}</td><td>#{verstr}</td></tr>")
     end
 
     puts "Rendering lint..."
+    lint_by_pkgbase = Hash.new do |h,k|
+        h[k] = {
+            "db" => nil,
+            "missing" => [],
+            "wrong_db" => Hash.new{|repo_h, repo| repo_h[repo] = []},
+        }
+    end
     $rv_packages.each do |pkgname, package|
+        pkgbase = package['base']
+        lint_by_pkgbase[pkgbase]["db"] ||= package['db']
         if ! $x86_packages.include? pkgname
-            f.puts("<tr><td>#{package['db']}</td><td>#{pkgname}</td><td><span style='color:var(--bulma-warning)'>Lint: package not found in x86 repository.</span></td></tr>")
+            lint_by_pkgbase[pkgbase]["missing"] << pkgname
         elsif $x86_packages[pkgname]["db"] != package["db"]
-            f.puts("<tr><td>#{package['db']}</td><td>#{pkgname}</td><td><span style='color:var(--bulma-danger)'>Lint: package in different x86 repository: #{$x86_packages[pkgname]['db']}.</span></td></tr>")
+            lint_by_pkgbase[pkgbase]["wrong_db"][$x86_packages[pkgname]["db"]] << pkgname
         end
+    end
+
+    lint_by_pkgbase.each do |pkgbase, lint|
+        messages = []
+        if lint["missing"].any?
+            packages = lint["missing"].join(", ")
+            subject = lint["missing"].size == 1 ? "package" : "packages"
+            messages << "<span style='color:var(--bulma-warning)'>Lint: #{subject} not found in x86 repository: #{packages}.</span>"
+        end
+        lint["wrong_db"].each do |db, pkgnames|
+            packages = pkgnames.join(", ")
+            subject = pkgnames.size == 1 ? "package" : "packages"
+            messages << "<span style='color:var(--bulma-danger)'>Lint: #{subject} in different x86 repository (#{db}): #{packages}.</span>"
+        end
+        next if messages.empty?
+
+        f.puts("<tr><td>#{lint["db"]}</td><td>#{pkgbase}</td><td>#{messages.join(" ")}</td></tr>")
     end
 
     f.puts('</tbody></table>')
