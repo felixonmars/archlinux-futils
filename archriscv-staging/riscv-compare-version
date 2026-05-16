@@ -23,6 +23,7 @@ $x86_depnames_by_pkgbase = Hash.new{|h,k| h[k] = Set[]}
 $x86_pkgbase_by_depname = {}
 
 $rv_provides = Set[]
+$rv_required_by_depname = Hash.new{|h,k| h[k] = Set[]}
 
 $outdated_log_pkgbases = Set[]
 $version_mismatch_pkgbases = Set[]
@@ -191,6 +192,13 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
 
     $rv_provides |= $rv_packages.keys.to_set
 
+    puts "Indexing riscv reverse dependencies..."
+    $rv_packages.each do |pkgname, package|
+        package["depends"].each do |dep|
+            $rv_required_by_depname[dep.split(/[<>=]/)[0]] << pkgname
+        end
+    end
+
     puts "Checking version mismatch..."
     $rv_packages.each do |pkgname, package|
         rvver = package["version"]
@@ -334,9 +342,7 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
         outdated = Set[]
 
         check_dep(pkgbase) do |dep, type|
-            ["<", ">", "="].each do |op|
-                dep = dep.split(op)[0]
-            end
+            dep = dep.split(/[<>=]/)[0]
 
             if ! $rv_provides.include?(dep) && ! $x86_depnames_by_pkgbase[pkgbase].include?(dep)
                 missing << [dep, type]
@@ -538,7 +544,12 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
     lint_by_pkgbase.each do |pkgbase, lint|
         messages = []
         if lint["missing"].any?
-            packages = lint["missing"].join(", ")
+            packages = lint["missing"].map do |pkgname|
+                depnames = [pkgname] + $rv_packages[pkgname]["provides"].map{|_package| _package.split(/[<>=]/)[0]}
+                required_by = depnames.flat_map{|depname| $rv_required_by_depname[depname].to_a}.uniq - [pkgname]
+                required_by_links = required_by.map{|required_by_pkgname| "<a href='##{$rv_packages[required_by_pkgname]["base"]}'>#{required_by_pkgname}</a>"}
+                required_by.empty? ? pkgname : "#{pkgname} (required by #{required_by_links.join(", ")})"
+            end.join(", ")
             subject = lint["missing"].size == 1 ? "package" : "packages"
             messages << "<span style='color:var(--bulma-warning)'>Lint: #{subject} not found in x86 repository: #{packages}.</span>"
         end
