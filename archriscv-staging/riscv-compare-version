@@ -1,7 +1,8 @@
 #!/usr/bin/ruby
 
 require 'set'
-require 'tempfile'
+require 'tmpdir'
+require 'fileutils'
 require 'net/http'
 require 'uri'
 require 'json'
@@ -65,8 +66,6 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
     .commit-loader ul { margin-left: 0.75em; }
     .commit-loader.htmx-request { pointer-events: none; opacity: 0.7; }
     </style>
-    <table class="table is-hoverable">
-    <thead><tr><th>DB</th><th>Pkgbase</th><th>Status</th></tr></thead><tbody>
     ')
 
     f.puts(<<~'HTML')
@@ -113,6 +112,11 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
     });
     </script>
     HTML
+
+    f.puts('
+    <table class="table is-hoverable">
+    <thead><tr><th>DB</th><th>Pkgbase</th><th>Status</th></tr></thead><tbody>
+    ')
 
     if $marks.empty?
         f.puts("<tr><td></td><td>_warning</td><td><span style='color:var(--bulma-danger)'>Failed to fetch from MelonBot, marks will be missing!</span></td></tr>")
