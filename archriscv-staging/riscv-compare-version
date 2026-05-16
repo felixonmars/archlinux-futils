@@ -3,7 +3,9 @@
 require 'set'
 require 'tempfile'
 require 'net/http'
+require 'uri'
 require 'json'
+require 'erb'
 require 'pycall/import'
 
 include PyCall::Import
@@ -55,12 +57,62 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light dark">
     <link rel="stylesheet" href="https://cdnjs.snrat.com/ajax/libs/bulma/1.0.3/css/bulma.min.css" integrity="sha384-DtLgkgZWuBalGogBkye1PTBvXKCD/hnA8vHqpqfcGCf/FOa1heAyeHExO8JNtVM/" crossorigin="anonymous">
+    <meta name="htmx-config" content=\'{"selfRequestsOnly":false}\'>
+    <script src="https://cdnjs.snrat.com/ajax/libs/htmx/2.0.7/htmx.min.js" integrity="sha384-ZBXiYtYQ6hJ2Y0ZNoYuI+Nq5MqWBr+chMrS/RkXpNzQCApHEhOt2aY8EJgqwHLkJ" crossorigin="anonymous"></script>
     <style>
     .tag.tag-with-details { height: auto; min-height: 2em; }
+    .commit-loader a { color: var(--bulma-link-light); }
+    .commit-loader ul { margin-left: 0.75em; }
+    .commit-loader.htmx-request { pointer-events: none; opacity: 0.7; }
     </style>
     <table class="table is-hoverable">
     <thead><tr><th>DB</th><th>Pkgbase</th><th>Status</th></tr></thead><tbody>
     ')
+
+    f.puts(<<~'HTML')
+    <script>
+    const escapeHTML = (value) => String(value).replace(/[&<>"']/g, (char) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        "\"": "&quot;",
+        "'": "&#39;"
+    }[char]));
+
+    document.addEventListener("htmx:afterRequest", function (event) {
+        const tag = event.detail.elt;
+        if (!tag || !tag.classList.contains("commit-loader")) {
+            return;
+        }
+
+        const xhr = event.detail.xhr;
+        if (xhr.status < 200 || xhr.status >= 300) {
+            tag.innerHTML = "GitLab: HTTP " + xhr.status;
+            return;
+        }
+
+        try {
+            const data = JSON.parse(xhr.responseText);
+            const commits = Array.isArray(data.commits) ? data.commits : [];
+
+            if (data.message) {
+                tag.innerHTML = "GitLab: " + escapeHTML(data.message);
+            } else if (commits.length === 0) {
+                tag.innerHTML = "No commits";
+            } else {
+                tag.innerHTML = "Changes: <ul>" + commits.map(function(commit) {
+                    const title = escapeHTML(commit.title || commit.message || commit.id || "commit");
+                    const shortId = commit.short_id ? "<span class=\"commit-meta\">" + escapeHTML(commit.short_id) + "</span> " : "";
+                    const url = escapeHTML(commit.web_url || "#");
+                    return "<li>" + shortId + "<a href=\"" + url + "\">" + title + "</a></li>";
+                }).join("") + "</ul>";
+            }
+        } catch (error) {
+            tag.innerHTML = "GitLab: failed to parse response";
+        }
+    });
+    </script>
+    HTML
 
     if $marks.empty?
         f.puts("<tr><td></td><td>_warning</td><td><span style='color:var(--bulma-danger)'>Failed to fetch from MelonBot, marks will be missing!</span></td></tr>")
@@ -157,8 +209,22 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
         end
     end
 
-    def x86_history_link(pkgbase)
-        "https://gitlab.archlinux.org/archlinux/packaging/packages/#{pkgbase}/-/commits/main"
+    def arch_gitlab_tag(version)
+        tag = version.sub(":", "-")
+        pkgver, sep, pkgrel = tag.rpartition("-")
+        return tag if sep.empty?
+
+        "#{pkgver}-#{pkgrel.split(".")[0]}"
+    end
+
+    def arch_gitlab_compare_url(pkgbase, from_version, to_version)
+        project = URI.encode_www_form_component("archlinux/packaging/packages/#{pkgbase}")
+        params = URI.encode_www_form({
+            "from" => arch_gitlab_tag(from_version),
+            "to" => arch_gitlab_tag(to_version),
+            "straight" => "true",
+        })
+        "https://gitlab.archlinux.org/api/v4/projects/#{project}/repository/compare?#{params}"
     end
 
     def patch_repo_link(pkgbase)
@@ -412,7 +478,10 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
             verstr = "<span style='color:var(--bulma-danger)'>#{rvver} == #{x86ver}</span>"
         end
 
-        verstr += " <a href=#{x86_history_link(pkgbase)}><span class='tag is-info'>Changes</span></a>"
+        from_tag = arch_gitlab_tag(rvver)
+        to_tag = arch_gitlab_tag(x86ver)
+        compare_url = arch_gitlab_compare_url(pkgbase, rvver, x86ver)
+        verstr += " <span class='tag tag-with-details is-dark commit-loader' hx-get='#{ERB::Util.html_escape(compare_url)}' hx-trigger='click once' hx-swap='none' title='Load commits from #{ERB::Util.html_escape(from_tag)} to #{ERB::Util.html_escape(to_tag)}'>Changes</span>"
 
         verstr += melon_mark(pkgbase) + render_missing_dep(pkgbase)
 
