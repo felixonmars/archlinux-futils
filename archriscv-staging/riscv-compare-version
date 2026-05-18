@@ -24,6 +24,7 @@ $x86_pkgbase_by_depname = {}
 
 $rv_provides = Set[]
 $rv_required_by_depname = Hash.new{|h,k| h[k] = Set[]}
+$current_rv_package_mtimes_by_pkgbase = Hash.new{|h,k| h[k] = []}
 
 $outdated_log_pkgbases = Set[]
 $version_mismatch_pkgbases = Set[]
@@ -129,7 +130,7 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
         db_handle.search("").each do |package|
             yield package
 
-            ["depends", "makedepends", "checkdepends", "provides", "arch", "base", "version"].each do |field|
+            ["depends", "makedepends", "checkdepends", "provides", "arch", "base", "version", "filename"].each do |field|
                 result[package.name][field] = package.send(field)
             end
             result[package.name]["db"] = db
@@ -205,6 +206,11 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
 
         if rvver.split("-")[1].include? "."
             rvver = [rvver.split("-")[0], rvver.split("-")[1].split(".")[0]].join("-")
+        end
+
+        if $x86_packages.has_key?(pkgname) && $x86_packages[pkgname]["version"] == rvver
+            pkgfile = "#{REPOROOT}/repo/#{package['db']}/#{package['filename']}"
+            $current_rv_package_mtimes_by_pkgbase[$x86_packages[pkgname]["base"]] << File.mtime(pkgfile) if File.exist?(pkgfile)
         end
 
         if $x86_packages.has_key?(pkgname) && $x86_packages[pkgname]["version"] != rvver
@@ -308,14 +314,16 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
                 next if rvver == package["version"]
             end
 
+            log_mtime = nil
             if File.exist?("#{REPOROOT}/.status/logs/#{package['base']}/#{package['base']}-#{package['version']}.log")
-                nil
+                log_mtime = File.mtime("#{REPOROOT}/.status/logs/#{package['base']}/#{package['base']}-#{package['version']}.log")
             elsif Dir.glob("#{REPOROOT}/.status/logs/#{package['base']}/#{package['base']}-#{package['version']}-*.log").any?
-                nil
+                log_mtime = Dir.glob("#{REPOROOT}/.status/logs/#{package['base']}/#{package['base']}-#{package['version']}-*.log").map{|log| File.mtime(log)}.max
             else
                 $outdated_log_pkgbases << package['base']
                 next
             end
+            next if $current_rv_package_mtimes_by_pkgbase[package['base']].any?{|mtime| mtime > log_mtime}
 
             $broken_pkgbases << package['base']
             $broken_pkgnames << pkgname
@@ -509,6 +517,7 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
     $x86_packages.each do |pkgname, package|
         pkgbase = package['base']
         next if $rv_packages.include? pkgname or $broken_pkgbases.include? pkgbase
+        next if $current_rv_package_mtimes_by_pkgbase[pkgbase].any?
         next if $blacklist.include? pkgbase or $blacklist.include? pkgname
 
         missing_pkgbases << pkgbase
