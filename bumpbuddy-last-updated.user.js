@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bumpbuddy: Last Updated from archlinux.org
 // @namespace    https://github.com/felixonmars/archlinux-futils
-// @version      1.4.1
+// @version      1.4.2
 // @description  Appends last_update time (from archlinux.org) after the local version on bumpbuddy.archlinux.org
 // @author       Felix Yan <felixonmars@archlinux.org>
 // @homepageURL  https://github.com/felixonmars/archlinux-futils
@@ -21,17 +21,35 @@
   // Cache: pkgbase -> ISO date string | null
   const cache = new Map();
 
-  // Pending fetches: pkgbase -> Promise<string|null>
+  // Pending fetches: pkgbase -> { promise: Promise<string|null>, token: object }
   const pending = new Map();
+
+  const CANCELLED = Symbol('cancelled');
 
   // Concurrency queue
   const MAX_CONCURRENT = 5;
   let activeFetches = 0;
   const queue = [];
 
+  let visiblePkgbases = new Set();
+
+  function isVisiblePkgbase(pkgbase) {
+    return !pkgbase || visiblePkgbases.has(pkgbase);
+  }
+
+  function isCancelled(pkgbase, token) {
+    return token.cancelled || !isVisiblePkgbase(pkgbase);
+  }
+
   function runQueue() {
     while (activeFetches < MAX_CONCURRENT && queue.length > 0) {
-      queue.shift()();
+      queue.shift().run();
+    }
+  }
+
+  function cancelQueuedFetches() {
+    while (queue.length > 0) {
+      queue.pop().cancel();
     }
   }
 
@@ -43,29 +61,50 @@
    * Fetch a URL via GM and return the response text (or null on error).
    * Retries automatically on HTTP 429, honouring the Retry-After header.
    */
-  function httpGet(url, retries = 4) {
+  function httpGet(url, pkgbase, token, retries = 4) {
+    if (isCancelled(pkgbase, token)) return Promise.resolve(CANCELLED);
+
     return new Promise((resolve) => {
-      queue.push(() => {
-        activeFetches++;
-        GM_xmlhttpRequest({
-          method: 'GET',
-          url,
-          timeout: 10000,
-          onload(r) {
-            activeFetches--;
-            runQueue();
-            if (r.status === 429 && retries > 0) {
-              // Honour Retry-After header (seconds); default to 10s
-              const match = r.responseHeaders && r.responseHeaders.match(/retry-after:\s*(\d+)/i);
-              const delay = match ? parseInt(match[1], 10) * 1000 : 10000;
-              sleep(delay).then(() => httpGet(url, retries - 1).then(resolve));
-            } else {
-              resolve(r.status >= 400 ? null : r.responseText);
-            }
-          },
-          onerror()   { activeFetches--; runQueue(); resolve(null); },
-          ontimeout() { activeFetches--; runQueue(); resolve(null); },
-        });
+      queue.push({
+        pkgbase,
+        token,
+        cancel() {
+          token.cancelled = true;
+          const entry = pending.get(pkgbase);
+          if (entry && entry.token === token) pending.delete(pkgbase);
+          resolve(CANCELLED);
+        },
+        run() {
+          if (isCancelled(pkgbase, token)) {
+            resolve(CANCELLED);
+            return;
+          }
+
+          activeFetches++;
+          GM_xmlhttpRequest({
+            method: 'GET',
+            url,
+            timeout: 10000,
+            onload(r) {
+              activeFetches--;
+              runQueue();
+              if (isCancelled(pkgbase, token)) {
+                resolve(CANCELLED);
+                return;
+              }
+              if (r.status === 429 && retries > 0) {
+                // Honour Retry-After header (seconds); default to 10s
+                const match = r.responseHeaders && r.responseHeaders.match(/retry-after:\s*(\d+)/i);
+                const delay = match ? parseInt(match[1], 10) * 1000 : 10000;
+                sleep(delay).then(() => httpGet(url, pkgbase, token, retries - 1).then(resolve));
+              } else {
+                resolve(r.status >= 400 ? null : r.responseText);
+              }
+            },
+            onerror()   { activeFetches--; runQueue(); resolve(token.cancelled ? CANCELLED : null); },
+            ontimeout() { activeFetches--; runQueue(); resolve(token.cancelled ? CANCELLED : null); },
+          });
+        },
       });
       runQueue();
     });
@@ -100,19 +139,23 @@
    *
    * All steps filter results by pkgbase to avoid false positives.
    */
-  async function doFetch(pkgbase) {
+  async function doFetch(pkgbase, token) {
     const enc = encodeURIComponent(pkgbase);
 
     // Step 1: exact pkgname match
+    let responseText = await httpGet(`${SEARCH_BASE}?name=${enc}`, pkgbase, token);
+    if (responseText === CANCELLED) return CANCELLED;
     let val = parseLastUpdate(
-      await httpGet(`${SEARCH_BASE}?name=${enc}`),
+      responseText,
       pkgbase,
     );
     if (val) return val;
 
     // Step 2: full-text search with the complete pkgbase string
+    responseText = await httpGet(`${SEARCH_BASE}?q=${enc}`, pkgbase, token);
+    if (responseText === CANCELLED) return CANCELLED;
     val = parseLastUpdate(
-      await httpGet(`${SEARCH_BASE}?q=${enc}`),
+      responseText,
       pkgbase,
     );
     if (val) return val;
@@ -122,8 +165,10 @@
     if (parts.length > 1) {
       parts.pop();
       const shorter = encodeURIComponent(parts.join('-'));
+      responseText = await httpGet(`${SEARCH_BASE}?q=${shorter}`, pkgbase, token);
+      if (responseText === CANCELLED) return CANCELLED;
       val = parseLastUpdate(
-        await httpGet(`${SEARCH_BASE}?q=${shorter}`),
+        responseText,
         pkgbase,
       );
       if (val) return val;
@@ -134,14 +179,16 @@
 
   function fetchLastUpdate(pkgbase) {
     if (cache.has(pkgbase)) return Promise.resolve(cache.get(pkgbase));
-    if (pending.has(pkgbase)) return pending.get(pkgbase);
+    if (pending.has(pkgbase)) return pending.get(pkgbase).promise;
 
-    const promise = doFetch(pkgbase).then((val) => {
-      cache.set(pkgbase, val);
-      pending.delete(pkgbase);
+    const token = { cancelled: false };
+    const promise = doFetch(pkgbase, token).then((val) => {
+      const entry = pending.get(pkgbase);
+      if (entry && entry.token === token) pending.delete(pkgbase);
+      if (val !== CANCELLED && !token.cancelled) cache.set(pkgbase, val);
       return val;
     });
-    pending.set(pkgbase, promise);
+    pending.set(pkgbase, { promise, token });
     return promise;
   }
 
@@ -179,6 +226,29 @@
     return document.querySelector('table.results, table.dataTable');
   }
 
+  function isVisibleRow(row) {
+    return row.getClientRects().length > 0 && getComputedStyle(row).display !== 'none';
+  }
+
+  function updateRow(pkgbase, versionCell) {
+    let span = versionCell.querySelector('.bb-last-updated');
+    if (!span) {
+      span = document.createElement('span');
+      span.className = 'bb-last-updated';
+      span.style.cssText = 'margin-left:0.4em; font-size:0.85em; color:#888;';
+      span.textContent = '(…)';
+      versionCell.appendChild(span);
+    }
+
+    if (cache.has(pkgbase)) {
+      renderSpan(span, cache.get(pkgbase));
+    } else {
+      fetchLastUpdate(pkgbase).then((val) => {
+        if (val !== CANCELLED) renderSpan(span, val);
+      });
+    }
+  }
+
   function processVisibleRows(table) {
     if (processing) return;
     processing = true;
@@ -188,28 +258,27 @@
 
     const packageColumn = findColumnIndex(table, ['package', 'pkgbase'], 0);
     const localVersionColumn = findColumnIndex(table, ['local version'], 1);
+    const visibleRows = [];
+    const nextVisiblePkgbases = new Set();
 
     tbody.querySelectorAll('tr').forEach((row) => {
+      if (!isVisibleRow(row)) return;
+
       const cells = row.querySelectorAll('td');
       if (cells.length <= Math.max(packageColumn, localVersionColumn)) return;
 
       const pkgbase = cells[packageColumn].textContent.trim();
       if (!pkgbase) return;
 
-      const versionCell = cells[localVersionColumn];
-      if (versionCell.querySelector('.bb-last-updated')) return; // already injected
+      visibleRows.push({ pkgbase, versionCell: cells[localVersionColumn] });
+      nextVisiblePkgbases.add(pkgbase);
+    });
 
-      const span = document.createElement('span');
-      span.className = 'bb-last-updated';
-      span.style.cssText = 'margin-left:0.4em; font-size:0.85em; color:#888;';
-      span.textContent = '(…)';
-      versionCell.appendChild(span);
+    visiblePkgbases = nextVisiblePkgbases;
+    cancelQueuedFetches();
 
-      if (cache.has(pkgbase)) {
-        renderSpan(span, cache.get(pkgbase));
-      } else {
-        fetchLastUpdate(pkgbase).then((val) => renderSpan(span, val));
-      }
+    visibleRows.forEach(({ pkgbase, versionCell }) => {
+      updateRow(pkgbase, versionCell);
     });
 
     processing = false;
@@ -239,14 +308,20 @@
 
     const debouncedProcess = debounce(() => processVisibleRows(table), 150);
 
-    // Only react when the table widget replaces rows (adds TR nodes directly under tbody).
-    // Our own SPAN appends are inside TD nodes — they won't trigger this.
+    // React when the table widget replaces rows or changes row visibility.
+    // Our own SPAN appends are inside TD nodes, so they won't trigger this.
     new MutationObserver((mutations) => {
       const isRedraw = mutations.some((m) =>
-        Array.from(m.addedNodes).some((n) => n.nodeName === 'TR')
+        Array.from(m.addedNodes).some((n) => n.nodeName === 'TR') ||
+        (m.type === 'attributes' && m.target.nodeName === 'TR')
       );
       if (isRedraw) debouncedProcess();
-    }).observe(tbody, { childList: true, subtree: false });
+    }).observe(tbody, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['class', 'style'],
+    });
   }
 
   function waitForTable() {
