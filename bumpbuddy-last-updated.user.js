@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bumpbuddy: Last Updated from archlinux.org
 // @namespace    https://github.com/felixonmars/archlinux-futils
-// @version      1.4.2
+// @version      1.4.3
 // @description  Appends last_update time (from archlinux.org) after the local version on bumpbuddy.archlinux.org
 // @author       Felix Yan <felixonmars@archlinux.org>
 // @homepageURL  https://github.com/felixonmars/archlinux-futils
@@ -10,6 +10,7 @@
 // @updateURL    https://raw.githubusercontent.com/felixonmars/archlinux-futils/master/bumpbuddy-last-updated.user.js
 // @match        https://bumpbuddy.archlinux.org/*
 // @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
 // @connect      archlinux.org
 // ==/UserScript==
 
@@ -210,6 +211,7 @@
   // ── DOM manipulation ─────────────────────────────────────────────────────────
 
   let processing = false;
+  let visibleKey = '';
 
   function normalizedHeaderText(cell) {
     return cell.textContent.trim().replace(/\s+/g, ' ').toLowerCase();
@@ -226,8 +228,10 @@
     return document.querySelector('table.results, table.dataTable');
   }
 
-  function isVisibleRow(row) {
-    return row.getClientRects().length > 0 && getComputedStyle(row).display !== 'none';
+  function queryVisibleRows(tbody) {
+    return tbody.querySelectorAll(
+      'tr:not(.filtered):not([style*="display: none"]):not([style*="display:none"])',
+    );
   }
 
   function updateRow(pkgbase, versionCell) {
@@ -258,26 +262,28 @@
 
     const packageColumn = findColumnIndex(table, ['package', 'pkgbase'], 0);
     const localVersionColumn = findColumnIndex(table, ['local version'], 1);
-    const visibleRows = [];
+    const rows = [];
     const nextVisiblePkgbases = new Set();
 
-    tbody.querySelectorAll('tr').forEach((row) => {
-      if (!isVisibleRow(row)) return;
-
+    queryVisibleRows(tbody).forEach((row) => {
       const cells = row.querySelectorAll('td');
       if (cells.length <= Math.max(packageColumn, localVersionColumn)) return;
 
       const pkgbase = cells[packageColumn].textContent.trim();
       if (!pkgbase) return;
 
-      visibleRows.push({ pkgbase, versionCell: cells[localVersionColumn] });
+      rows.push({ pkgbase, versionCell: cells[localVersionColumn] });
       nextVisiblePkgbases.add(pkgbase);
     });
 
+    const nextVisibleKey = rows.map(row => row.pkgbase).join('\n');
     visiblePkgbases = nextVisiblePkgbases;
-    cancelQueuedFetches();
+    if (nextVisibleKey !== visibleKey) {
+      visibleKey = nextVisibleKey;
+      cancelQueuedFetches();
+    }
 
-    visibleRows.forEach(({ pkgbase, versionCell }) => {
+    rows.forEach(({ pkgbase, versionCell }) => {
       updateRow(pkgbase, versionCell);
     });
 
@@ -306,22 +312,35 @@
     const tbody = table.querySelector('tbody');
     if (!tbody) return;
 
-    const debouncedProcess = debounce(() => processVisibleRows(table), 150);
+    const debouncedProcess = debounce(() => processVisibleRows(table), 250);
 
-    // React when the table widget replaces rows or changes row visibility.
+    // React when the table widget replaces rows.
     // Our own SPAN appends are inside TD nodes, so they won't trigger this.
     new MutationObserver((mutations) => {
       const isRedraw = mutations.some((m) =>
-        Array.from(m.addedNodes).some((n) => n.nodeName === 'TR') ||
-        (m.type === 'attributes' && m.target.nodeName === 'TR')
+        Array.from(m.addedNodes).some((n) => n.nodeName === 'TR')
       );
       if (isRedraw) debouncedProcess();
-    }).observe(tbody, {
-      childList: true,
-      subtree: true,
-      attributes: true,
-      attributeFilter: ['class', 'style'],
+    }).observe(tbody, { childList: true, subtree: false });
+
+    document.querySelector('#pkg-search')?.addEventListener('input', debouncedProcess);
+    document.querySelector('#pkg-search')?.addEventListener('search', debouncedProcess);
+    document.querySelector('#pkg-search')?.addEventListener('change', debouncedProcess);
+    document.querySelector('#pkg-sort-by')?.addEventListener('change', debouncedProcess);
+    document.querySelector('#pkg-sort-order')?.addEventListener('change', debouncedProcess);
+    document.querySelector('#pkg-per-page')?.addEventListener('change', debouncedProcess);
+
+    table.querySelector('thead')?.addEventListener('click', debouncedProcess);
+    document.querySelectorAll('.pager button').forEach((button) => {
+      button.addEventListener('click', debouncedProcess);
     });
+
+    if (typeof unsafeWindow !== 'undefined' && unsafeWindow.jQuery) {
+      unsafeWindow.jQuery(table).on(
+        'filterEnd sortEnd pageMoved pageSize pagerComplete',
+        debouncedProcess,
+      );
+    }
   }
 
   function waitForTable() {
