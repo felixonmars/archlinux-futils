@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bumpbuddy: Last Updated from archlinux.org
 // @namespace    https://github.com/felixonmars/archlinux-futils
-// @version      1.4.0
+// @version      1.4.1
 // @description  Appends last_update time (from archlinux.org) after the local version on bumpbuddy.archlinux.org
 // @author       Felix Yan <felixonmars@archlinux.org>
 // @homepageURL  https://github.com/felixonmars/archlinux-futils
@@ -164,6 +164,21 @@
 
   let processing = false;
 
+  function normalizedHeaderText(cell) {
+    return cell.textContent.trim().replace(/\s+/g, ' ').toLowerCase();
+  }
+
+  function findColumnIndex(table, labels, fallback) {
+    const headers = Array.from(table.querySelectorAll('thead th'));
+    const wanted = labels.map(label => label.toLowerCase());
+    const index = headers.findIndex(header => wanted.includes(normalizedHeaderText(header)));
+    return index === -1 ? fallback : index;
+  }
+
+  function findPackageTable() {
+    return document.querySelector('table.results, table.dataTable');
+  }
+
   function processVisibleRows(table) {
     if (processing) return;
     processing = true;
@@ -171,14 +186,17 @@
     const tbody = table.querySelector('tbody');
     if (!tbody) { processing = false; return; }
 
+    const packageColumn = findColumnIndex(table, ['package', 'pkgbase'], 0);
+    const localVersionColumn = findColumnIndex(table, ['local version'], 1);
+
     tbody.querySelectorAll('tr').forEach((row) => {
       const cells = row.querySelectorAll('td');
-      if (cells.length < 2) return;
+      if (cells.length <= Math.max(packageColumn, localVersionColumn)) return;
 
-      const pkgbase = cells[0].textContent.trim();
+      const pkgbase = cells[packageColumn].textContent.trim();
       if (!pkgbase) return;
 
-      const versionCell = cells[1]; // "Local version" column
+      const versionCell = cells[localVersionColumn];
       if (versionCell.querySelector('.bb-last-updated')) return; // already injected
 
       const span = document.createElement('span');
@@ -221,7 +239,7 @@
 
     const debouncedProcess = debounce(() => processVisibleRows(table), 150);
 
-    // Only react when DataTables replaces rows (adds TR nodes directly under tbody).
+    // Only react when the table widget replaces rows (adds TR nodes directly under tbody).
     // Our own SPAN appends are inside TD nodes — they won't trigger this.
     new MutationObserver((mutations) => {
       const isRedraw = mutations.some((m) =>
@@ -233,7 +251,7 @@
 
   function waitForTable() {
     const interval = setInterval(() => {
-      const table = document.querySelector('table.dataTable');
+      const table = findPackageTable();
       if (!table) return;
       const firstTd = table.querySelector('tbody tr td');
       if (!firstTd || !firstTd.textContent.trim()) return;
