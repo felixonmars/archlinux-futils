@@ -4,6 +4,7 @@
 // @version      1.4.3
 // @description  Appends last_update time (from archlinux.org) after the local version on bumpbuddy.archlinux.org
 // @author       Felix Yan <felixonmars@archlinux.org>
+// @license      MIT
 // @homepageURL  https://github.com/felixonmars/archlinux-futils
 // @supportURL   https://github.com/felixonmars/archlinux-futils/issues
 // @downloadURL  https://raw.githubusercontent.com/felixonmars/archlinux-futils/master/bumpbuddy-last-updated.user.js
