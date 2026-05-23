@@ -132,11 +132,15 @@ if [[ "$_pkgver" == "HEAD" ]]; then
   fi
 fi
 
-# root workaround
-if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
-  env EUID=1000 updpkgsums
+if grep -q '^source=' PKGBUILD; then
+  # root workaround
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    env EUID=1000 updpkgsums
+  else
+    updpkgsums
+  fi
 else
-  updpkgsums
+  echo "Skipping updpkgsums: no source in PKGBUILD."
 fi
 
 git --no-pager diff
