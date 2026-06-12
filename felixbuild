@@ -14,7 +14,7 @@ CMD="$@"
 # makepkg -Sf --skipchecksums --skippgpcheck || exit 1
 # SRCPKG=$(ls *.src.tar.gz)
 PKGNAME=$(source PKGBUILD; [[ -z $pkgbase ]] && echo $pkgname || echo $pkgbase)
-ARCH=$(source PKGBUILD; echo $arch)
+ARCH=$(source PKGBUILD; echo "${arch[@]}")
 msg "Checking for remote environment..."
 ssh $BUILDHOST "mkdir -p packages; test -e .makepkg.conf" || exit 1
 msg "Syncing package to remote host..."
