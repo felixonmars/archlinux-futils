@@ -5,6 +5,7 @@ import colorlog
 from collections import defaultdict
 import logging
 import pyalpm
+import re
 import signal
 import sys
 
@@ -37,6 +38,23 @@ if args.log:
     fh = logging.FileHandler(args.log)
     fh.setFormatter(formatter)
     logger.addHandler(fh)
+
+_TERMINAL_ESCAPE_RE = re.compile(
+    r'\x1b(?:'
+    r'\][^\x07\x1b]*(?:\x07|\x1b\\)?|'  # OSC, including OSC 11 color queries
+    r'[P^_](?:[^\x1b]|\x1b(?!\\))*(?:\x1b\\)?|'
+    r'\[(?![0-9;:]*m)[0-?]*[ -/]*[@-~]|'
+    r'[@-Z\\-_]'
+    r')'
+)
+_CONTROL_CHAR_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0d-\x1a\x1c-\x1f\x7f]')
+
+
+def sanitize_subprocess_output(line):
+    text = line.decode("utf-8", "replace").rstrip('\n')
+    text = _TERMINAL_ESCAPE_RE.sub("", text)
+    return _CONTROL_CHAR_RE.sub("", text)
+
 
 package_db = defaultdict(dict)
 handle = pyalpm.Handle(".", "/var/lib/pacman")
@@ -88,7 +106,7 @@ async def main():
                     # Underlying asyncio.exceptions.LimitOverrunError
                     line = await proc.stdout.read(_BUFFER_SIZE)
                 if line:
-                    logger.debug(f'{cmd[-1]}: ' + line.decode("utf-8", "ignore").rstrip('\n'))
+                    logger.debug(f'{cmd[-1]}: ' + sanitize_subprocess_output(line))
                 else:
                     break
             return await proc.wait()
