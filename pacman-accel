@@ -30,7 +30,7 @@ get '/*' do |path|
         # Find a faster mirror with the requested file present
         mirrors[..-2].each { |m|
             begin
-                response = HTTP.head(m + path)
+                response = HTTP.timeout(connect: 2, read: 2).head(m + path)
             rescue => e
                 logger.error "skipping mirror #{m}, failed to HEAD: #{e}"
                 next
