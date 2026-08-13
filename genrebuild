@@ -127,14 +127,14 @@ def resolve_pkg(pkg):
 
 # Expand reverse dependencies
 while len(pkglist) != len(reverse_deps):
-    for pkg in list(pkglist):
+    for pkg in sorted(pkglist):
         if pkg not in reverse_deps:
             pkglist |= resolve_pkg(pkg)
 
 
 G.add_nodes_from(reverse_deps.keys())
 for dep, pkgs in reverse_deps.items():
-    for pkg in pkgs:
+    for pkg in sorted(pkgs):
         if pkg in pkglist:
             G.add_edge(dep, pkg)
 
