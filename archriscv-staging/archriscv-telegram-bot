@@ -1,0 +1,212 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'cgi'
+require 'fileutils'
+require 'json'
+require 'net/http'
+require 'time'
+require 'uri'
+
+BASE_URL = ENV.fetch('ARCHRISCV_BOT_BASE_URL', 'https://archriscv.felixc.at').sub(%r{/+\z}, '')
+STATE_DIR = ENV.fetch('ARCHRISCV_BOT_STATE_DIR', File.join(Dir.home, '.local/state/archriscv-telegram-bot'))
+CACHE_DIR = ENV.fetch('ARCHRISCV_BOT_CACHE_DIR', File.join(Dir.home, '.cache/archriscv-telegram-bot'))
+STATE_FILE = File.join(STATE_DIR, 'state.json')
+INTERVAL = ENV.fetch('ARCHRISCV_BOT_INTERVAL', '180').to_i
+TRUE_VALUES = %w[1 true yes on].freeze
+DRY_RUN = TRUE_VALUES.include?(ENV['ARCHRISCV_BOT_DRY_RUN'].to_s.downcase)
+RUN_ONCE = TRUE_VALUES.include?(ENV['ARCHRISCV_BOT_ONCE'].to_s.downcase)
+NOTIFY_EXISTING = TRUE_VALUES.include?(ENV['ARCHRISCV_BOT_NOTIFY_EXISTING'].to_s.downcase)
+
+ISSUE_PATTERNS = [
+  ['patch failed', /==> Applying RISC-V patches\.\.\./],
+  ['source download failed', /==> ERROR: Failure while downloading/],
+  ['checksum mismatch', /==> ERROR: One or more files did not pass the validity check/],
+  ['gpg failed', /==> ERROR: One or more PGP signatures/],
+  ['dependency missing', /==> ERROR: Could not resolve all dependencies\.?/],
+  ['prepare() failed', /==> ERROR: A failure occurred in prepare\(\)\./],
+  ['build() failed', /==> ERROR: A failure occurred in build\(\)\./],
+  ['check() failed', /==> ERROR: A failure occurred in check\(\)\./],
+  ['package() failed', /==> ERROR: A failure occurred in package/],
+  ['old config.guess', /configure: error: cannot guess build type; you must specify one/],
+  ['broken rust target', /Error loading target specification: Could not find specification for target "riscv64-unknown-linux-gnu"/]
+].freeze
+
+class NotFound < StandardError; end
+
+def fetch(url, cache_file = nil, optional: false, limit: 3)
+  raise "too many redirects for #{url}" if limit.zero?
+
+  uri = URI(url)
+  response = Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == 'https', open_timeout: 15, read_timeout: 30) do |http|
+    http.get(uri.request_uri)
+  end
+
+  case response
+  when Net::HTTPSuccess
+    if cache_file
+      FileUtils.mkdir_p(File.dirname(cache_file))
+      File.binwrite("#{cache_file}.tmp", response.body)
+      File.rename("#{cache_file}.tmp", cache_file)
+    end
+    response.body
+  when Net::HTTPRedirection
+    fetch(URI.join(url, response['location']).to_s, cache_file, optional: optional, limit: limit - 1)
+  when Net::HTTPNotFound
+    raise NotFound
+  else
+    raise "GET #{url} failed: HTTP #{response.code}"
+  end
+rescue NotFound
+  optional ? nil : raise
+rescue StandardError
+  return File.read(cache_file) if cache_file && File.exist?(cache_file) && !optional
+
+  raise
+end
+
+def parse_index(text)
+  text.each_line.filter_map do |line|
+    line = line.strip
+    next if line.empty?
+
+    date, clock, path = line.split(/\s+/, 3)
+    next unless date && clock && path
+
+    { raw: line, stamp: "#{date} #{clock}", path: path, time: Time.parse("#{date} #{clock}") }
+  rescue ArgumentError
+    { raw: line, stamp: "#{date} #{clock}", path: path, time: Time.at(0) }
+  end
+end
+
+def detect_issue(log)
+  issue = nil
+  log.each_line do |line|
+    clean = line.gsub(/\e\[[0-?]*[ -\/]*[@-~]/, '').delete("\x0f").delete("\r")
+    ISSUE_PATTERNS.each { |label, pattern| issue = label if clean.match?(pattern) }
+  end
+  issue
+end
+
+def h(text)
+  CGI.escapeHTML(text.to_s)
+end
+
+def send_message(text)
+  if DRY_RUN
+    puts "\n--- telegram dry run ---"
+    puts text
+    return
+  end
+
+  token = ENV['TELEGRAM_BOT_TOKEN']
+  chat_id = ENV['TELEGRAM_CHAT_ID']
+  raise 'TELEGRAM_BOT_TOKEN is required' if token.to_s.empty?
+  raise 'TELEGRAM_CHAT_ID is required' if chat_id.to_s.empty?
+
+  uri = URI("https://api.telegram.org/bot#{token}/sendMessage")
+  request = Net::HTTP::Post.new(uri, 'Content-Type' => 'application/json')
+  request.body = JSON.generate(chat_id: chat_id, text: text, parse_mode: 'HTML', disable_web_page_preview: true)
+  response = Net::HTTP.start(uri.host, uri.port, use_ssl: true, open_timeout: 15, read_timeout: 30) do |http|
+    http.request(request)
+  end
+  raise "Telegram send failed: HTTP #{response.code} #{response.body}" unless response.is_a?(Net::HTTPSuccess)
+end
+
+FileUtils.mkdir_p([STATE_DIR, CACHE_DIR])
+state = File.exist?(STATE_FILE) ? JSON.parse(File.read(STATE_FILE)) : {}
+state['latestlogs'] ||= {}
+state['lastupdates'] ||= {}
+state['failures'] ||= {}
+state['resolved'] ||= {}
+
+loop do
+  begin
+    first_run = state['latestlogs'].empty? && state['lastupdates'].empty? && !NOTIFY_EXISTING
+
+    latestlogs_url = "#{BASE_URL}/.status/latestlogs.txt"
+    lastupdate_url = "#{BASE_URL}/.status/lastupdate.txt"
+    latestlogs = parse_index(fetch(latestlogs_url, File.join(CACHE_DIR, 'latestlogs.txt')))
+    lastupdates = parse_index(fetch(lastupdate_url, File.join(CACHE_DIR, 'lastupdate.txt')))
+
+    latestlogs.reject { |item| state['latestlogs'].key?(item[:raw]) }.sort_by { |item| item[:time] }.each do |item|
+      log_path = item[:path].sub(%r{\A\./}, '').sub(%r{\A/+}, '')
+      pkgbase = log_path.split('/')[-2] || File.basename(log_path, '.log')
+      log_name = File.basename(log_path, '.log')
+      version = log_name.start_with?("#{pkgbase}-") ? log_name.delete_prefix("#{pkgbase}-") : nil
+      log_url = "#{BASE_URL}/#{log_path}"
+      log = fetch(log_url, File.join(CACHE_DIR, log_path))
+      issue = detect_issue(log) || 'unknown failure'
+
+      send_message([
+        "<b>[archriscv]</b> failed: #{h("#{pkgbase} #{version || 'unknown'}")}",
+        %(issue: #{h(issue)} (<a href="#{h(log_url)}">log</a>))
+      ].join("\n")) unless first_run
+
+      state['failures'][pkgbase] = {
+        'version' => version,
+        'issue' => issue,
+        'log_path' => log_path,
+        'log_url' => log_url,
+        'failed_at' => item[:stamp],
+        'event_id' => item[:raw]
+      }
+      state['latestlogs'][item[:raw]] = { 'path' => item[:path], 'stamp' => item[:stamp], 'seen_at' => Time.now.utc.iso8601 }
+    end
+
+    lastupdates.reject { |item| state['lastupdates'].key?(item[:raw]) }.sort_by { |item| item[:time] }.each do |item|
+      state['lastupdates'][item[:raw]] = { 'path' => item[:path], 'stamp' => item[:stamp], 'seen_at' => Time.now.utc.iso8601 }
+      next if first_run
+
+      package_path = item[:path].sub(%r{\A\./}, '').sub(%r{\A/+}, '')
+      package_file = File.basename(package_path)
+      match = package_file.match(/\A(.+)-([^-]+)-([^-]+)-([^-]+)\.pkg\.tar(?:\..+)?\z/)
+      pkgname = match ? match[1] : package_file
+      version = match ? "#{match[2]}-#{match[3]}" : nil
+      pkgbase = `expac -S -1 %e #{pkgname} 2>/dev/null`.strip
+      pkgbase = pkgname if pkgbase.empty?
+      failure = state['failures'][pkgbase]
+      next unless failure
+      nocheck_url = "#{BASE_URL}/.status/logs/#{pkgbase}/.nocheck"
+      nocheck_version = fetch(nocheck_url, optional: true)&.strip
+
+      if nocheck_version
+        nocheck_key = [version, nocheck_version].compact.join('|')
+        next if failure['nocheck_key'] == nocheck_key
+
+        send_message([
+          "<b>[archriscv]</b> nocheck: #{h("#{pkgbase} #{version || 'unknown'}")}",
+          %(previous: #{h(failure['issue'] || 'unknown failure')} (<a href="#{h(nocheck_url)}">marker</a>))
+        ].join("\n"))
+        failure['nocheck_key'] = nocheck_key
+        next
+      end
+
+      send_message([
+        "<b>[archriscv]</b> fixed: #{h("#{pkgbase} #{version || 'unknown'}")}",
+        %(previous: #{h(failure['issue'] || 'unknown failure')} (<a href="#{h("#{BASE_URL}/#{package_path}")}">package</a>))
+      ].join("\n"))
+
+      state['resolved'][pkgbase] = failure.merge('resolved_at' => item[:stamp], 'resolved_by' => package_path)
+      state['failures'].delete(pkgbase)
+    end
+
+    %w[latestlogs lastupdates].each do |key|
+      next if state[key].size <= 1000
+
+      state[key] = state[key].sort_by { |_id, event| event['seen_at'] }.last(1000).to_h
+    end
+
+    FileUtils.mkdir_p(STATE_DIR)
+    File.write("#{STATE_FILE}.tmp", JSON.pretty_generate(state))
+    File.rename("#{STATE_FILE}.tmp", STATE_FILE)
+    puts 'Seeded current status; future changes will be reported.' if first_run
+  rescue StandardError => e
+    warn "#{Time.now.utc.iso8601} #{e.class}: #{e.message}"
+    warn e.backtrace.first(5).join("\n") if ENV['ARCHRISCV_BOT_DEBUG']
+  end
+
+  break if RUN_ONCE
+
+  sleep INTERVAL
+end

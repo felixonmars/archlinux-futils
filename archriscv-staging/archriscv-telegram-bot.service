@@ -1,0 +1,19 @@
+[Unit]
+Description=Arch Linux RISC-V Telegram failure bot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=ARCHRISCV_BOT_STATE_DIR=/var/lib/archriscv-telegram-bot
+Environment=ARCHRISCV_BOT_CACHE_DIR=/var/cache/archriscv-telegram-bot
+EnvironmentFile=/etc/conf.d/archriscv-telegram-bot
+ExecStart=/usr/local/bin/archriscv-telegram-bot
+Restart=always
+RestartSec=30
+DynamicUser=yes
+StateDirectory=archriscv-telegram-bot
+CacheDirectory=archriscv-telegram-bot
+
+[Install]
+WantedBy=multi-user.target
