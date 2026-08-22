@@ -1,0 +1,55 @@
+#!/usr/bin/ruby
+# Update one repo entry in .mirrorz/mirrorz.json after a sync run.
+# Usage from mirror root: update-mirrorz-status <repo> <sync-exit-code>
+
+require "json"
+require "shellwords"
+
+repo = ARGV[0]
+exit_code = Integer(ARGV[1] || "") rescue nil
+
+unless repo && exit_code
+  warn "usage: #{File.basename($0)} <repo> <sync-exit-code>"
+  exit 2
+end
+
+json_path = ".mirrorz/mirrorz.json"
+data = JSON.parse(File.read(json_path))
+
+mirror = data.fetch("mirrors").find do |m|
+  names = [m["cname"], m["url"].to_s.sub(%r{^/}, "")]
+  names.include?(repo)
+end
+
+unless mirror
+  warn "repo not found in #{json_path}: #{repo}"
+  exit 2
+end
+
+now = Time.now.to_i
+old_status = mirror["status"].to_s
+last_success = old_status[/^S(\d+)/, 1] || old_status[/O(\d+)/, 1]
+
+mirror["status"] = if exit_code.zero?
+  "S#{now}"
+else
+  "F#{now}#{last_success ? "O#{last_success}" : ""}"
+end
+
+repo_path = mirror["url"].to_s.sub(%r{^/}, "")
+repo_path = repo if repo_path.empty?
+if mirror.key?("size") && File.exist?(repo_path)
+  mirror["size"] = `du -sh -- #{repo_path.shellescape}`.split.first
+end
+
+if data["site"].is_a?(Hash) && data["site"].key?("disk")
+  fields = `df -hP .`.lines[1]&.split
+  data["site"]["disk"] = "#{fields[2]} / #{fields[1]} (#{fields[4]})" if fields && fields.size >= 5
+end
+
+tmp_path = "#{json_path}.#{$$}.tmp"
+File.write(tmp_path, JSON.pretty_generate(data) + "\n")
+File.chmod(0644, tmp_path)
+File.rename(tmp_path, json_path)
+
+puts "#{repo}: #{old_status.inspect} -> #{mirror["status"].inspect}"
