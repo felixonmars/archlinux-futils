@@ -92,9 +92,10 @@ def h(text)
   CGI.escapeHTML(text.to_s)
 end
 
-def send_message(text)
+def send_message(text, reply_to_message_id: nil)
   if DRY_RUN
     puts "\n--- telegram dry run ---"
+    puts "reply_to: #{reply_to_message_id}" if reply_to_message_id
     puts text
     return
   end
@@ -106,11 +107,16 @@ def send_message(text)
 
   uri = URI("https://api.telegram.org/bot#{token}/sendMessage")
   request = Net::HTTP::Post.new(uri, 'Content-Type' => 'application/json')
-  request.body = JSON.generate(chat_id: chat_id, text: text, parse_mode: 'HTML', disable_web_page_preview: true)
+  body = { chat_id: chat_id, text: text, parse_mode: 'HTML', disable_web_page_preview: true }
+  body[:reply_to_message_id] = reply_to_message_id if reply_to_message_id
+  body[:allow_sending_without_reply] = true if reply_to_message_id
+  request.body = JSON.generate(body)
   response = Net::HTTP.start(uri.host, uri.port, use_ssl: true, open_timeout: 15, read_timeout: 30) do |http|
     http.request(request)
   end
   raise "Telegram send failed: HTTP #{response.code} #{response.body}" unless response.is_a?(Net::HTTPSuccess)
+
+  JSON.parse(response.body).dig('result', 'message_id')
 end
 
 FileUtils.mkdir_p([STATE_DIR, CACHE_DIR])
@@ -138,12 +144,12 @@ loop do
       log = fetch(log_url, File.join(CACHE_DIR, log_path))
       issue = detect_issue(log) || 'unknown failure'
 
-      send_message([
-        "<b>[archriscv]</b> failed: #{h("#{pkgbase} #{version || 'unknown'}")}",
+      message_id = send_message([
+        "❌ <b>[archriscv]</b> failed: #{h("#{pkgbase} #{version || 'unknown'}")}",
         %(issue: #{h(issue)} (<a href="#{h(log_url)}">log</a>))
       ].join("\n")) unless first_run
 
-      state['failures'][pkgbase] = {
+      failure = {
         'version' => version,
         'issue' => issue,
         'log_path' => log_path,
@@ -151,6 +157,8 @@ loop do
         'failed_at' => item[:stamp],
         'event_id' => item[:raw]
       }
+      failure['message_id'] = message_id if message_id
+      state['failures'][pkgbase] = failure
       state['latestlogs'][item[:raw]] = { 'path' => item[:path], 'stamp' => item[:stamp], 'seen_at' => Time.now.utc.iso8601 }
     end
 
@@ -174,18 +182,27 @@ loop do
         nocheck_key = [version, nocheck_version].compact.join('|')
         next if failure['nocheck_key'] == nocheck_key
 
-        send_message([
-          "<b>[archriscv]</b> nocheck: #{h("#{pkgbase} #{version || 'unknown'}")}",
-          %(previous: #{h(failure['issue'] || 'unknown failure')} (<a href="#{h(nocheck_url)}">marker</a>))
-        ].join("\n"))
+        nocheck_message_id = send_message([
+          "⚠️ <b>[archriscv]</b> nocheck: #{h("#{pkgbase} #{version || 'unknown'}")}",
+          %(previous: #{h(failure['issue'] || 'unknown failure')})
+        ].join("\n"), reply_to_message_id: failure['message_id'])
         failure['nocheck_key'] = nocheck_key
+        failure['nocheck_at'] = item[:stamp]
+        failure['nocheck_message_id'] = nocheck_message_id if nocheck_message_id
         next
       end
 
-      send_message([
-        "<b>[archriscv]</b> fixed: #{h("#{pkgbase} #{version || 'unknown'}")}",
-        %(previous: #{h(failure['issue'] || 'unknown failure')} (<a href="#{h("#{BASE_URL}/#{package_path}")}">package</a>))
-      ].join("\n"))
+      if failure['nocheck_key']
+        send_message([
+          "🧪 <b>[archriscv]</b> checked: #{h("#{pkgbase} #{version || 'unknown'}")}",
+          %(previously nocheck; previous: #{h(failure['issue'] || 'unknown failure')})
+        ].join("\n"), reply_to_message_id: failure['nocheck_message_id'] || failure['message_id'])
+      else
+        send_message([
+          "✅ <b>[archriscv]</b> fixed: #{h("#{pkgbase} #{version || 'unknown'}")}",
+          %(previous: #{h(failure['issue'] || 'unknown failure')})
+        ].join("\n"), reply_to_message_id: failure['message_id'])
+      end
 
       state['resolved'][pkgbase] = failure.merge('resolved_at' => item[:stamp], 'resolved_by' => package_path)
       state['failures'].delete(pkgbase)
