@@ -1,0 +1,22 @@
+[Unit]
+Description=Arch Linux RISC-V build scheduler
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/conf.d/archriscv-buildd
+Environment=HOME=/root
+Environment=GNUPGHOME=/root/.gnupg
+Environment=ARCHRISCV_BUILDD_STATE_DIR=/var/lib/archriscv-buildd
+Environment=ARCHRISCV_BUILDD_LOG_DIR=/var/lib/archriscv-buildd/logs
+ExecStart=/usr/local/bin/archriscv-buildd
+Restart=always
+RestartSec=15
+StateDirectory=archriscv-buildd
+WorkingDirectory=/root
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target

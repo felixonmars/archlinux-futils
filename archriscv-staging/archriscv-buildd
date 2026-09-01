@@ -1,0 +1,1229 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'cgi'
+require 'fileutils'
+require 'json'
+require 'pty'
+require 'shellwords'
+require 'time'
+require 'webrick'
+
+APP_NAME = 'archriscv-buildd'
+APP_TITLE = 'Arch Linux RISC-V Build Scheduler'
+STATE_DIR = ENV.fetch('ARCHRISCV_BUILDD_STATE_DIR', File.join(Dir.home, '.local/state/archriscv-buildd'))
+LOG_DIR = ENV.fetch('ARCHRISCV_BUILDD_LOG_DIR', File.join(STATE_DIR, 'logs'))
+STATE_FILE = File.join(STATE_DIR, 'state.json')
+BUILD_COMMAND = ENV.fetch('ARCHRISCV_BUILDD_BUILD_COMMAND', 'riscvu')
+REFRESH_COMMAND = ENV.fetch('ARCHRISCV_BUILDD_REFRESH_COMMAND', 'archrv-refresh')
+BUILD_WORKDIR = ENV['ARCHRISCV_BUILDD_WORKDIR']
+BIND = ENV.fetch('ARCHRISCV_BUILDD_BIND', '127.0.0.1')
+PORT = ENV.fetch('ARCHRISCV_BUILDD_PORT', '9181').to_i
+MAX_HISTORY = ENV.fetch('ARCHRISCV_BUILDD_MAX_HISTORY', '10000').to_i
+RECENT_PAGE_SIZE = 30
+PROMPT_PATTERN = /(?:\A|[\r\n])Upload log\? \[y\/N\] \z/.freeze
+HOST_PATTERN = /(?:\A|[\r\n])==> Building on ([A-Za-z0-9._-]+)/.freeze
+ANSI_PATTERN = /\e(?:\][^\a]*(?:\a|\e\\)|\[[0-?]*[ -\/]*[@-~])/.freeze
+COMMAND_PATTERN = /\A[A-Za-z0-9][A-Za-z0-9@._+-]*(?::nocheck)?\z/.freeze
+ACTIVE_STATUSES = %w[queued running waiting_upload].freeze
+TERMINAL_STATUSES = %w[succeeded failed interrupted].freeze
+
+def h(value)
+  CGI.escapeHTML(value.to_s)
+end
+
+def safe_filename(value)
+  value.to_s.gsub(/[^A-Za-z0-9._+-]+/, '_').sub(/\A_+/, '').sub(/_+\z/, '')
+end
+
+def parse_time(value)
+  return unless value
+
+  Time.parse(value)
+rescue ArgumentError, TypeError
+  nil
+end
+
+def fmt_time(value)
+  return 'not yet' unless value
+
+  value.utc.strftime('%Y-%m-%d %H:%M:%S UTC')
+end
+
+def duration(build)
+  return '-' unless build.started_at
+
+  finished = build.finished_at || Time.now.utc
+  seconds = [(finished - build.started_at).to_i, 0].max
+  minutes, secs = seconds.divmod(60)
+  hours, minutes = minutes.divmod(60)
+  hours.positive? ? format('%dh%02dm%02ds', hours, minutes, secs) : format('%dm%02ds', minutes, secs)
+end
+
+def read_log(path, offset = 0, max_bytes = nil)
+  return ['', 0] unless File.exist?(path)
+
+  size = File.size(path)
+  offset = [[offset, 0].max, size].min
+  max_bytes ||= size - offset
+  data = +''
+  File.open(path, 'rb') do |file|
+    file.seek(offset)
+    data = file.read(max_bytes).to_s
+    offset = file.pos
+  end
+  [data, offset]
+end
+
+def utf8(value)
+  value.to_s.encode('UTF-8', invalid: :replace, undef: :replace)
+end
+
+def status_class(status)
+  case status
+  when 'running' then 'is-info'
+  when 'waiting_upload' then 'is-warning'
+  when 'failed', 'interrupted' then 'is-danger'
+  when 'succeeded' then 'is-success'
+  else 'is-light'
+  end
+end
+
+def status_tag(status, id: nil)
+  id_attr = id ? %( id="#{h(id)}") : ''
+  %(<span#{id_attr} class="tag #{status_class(status)}">#{h(status.tr('_', ' '))}</span>)
+end
+
+class Build
+  attr_accessor :id, :command_line, :argv, :pkgbase, :log_path, :status,
+                :created_at, :started_at, :finished_at, :exit_status,
+                :upload_prompt_seen, :upload_decision, :prompt_answered_at,
+                :build_host, :note, :pid, :stdin, :prompt_tail, :discard_after_finish
+
+  def initialize(id:, command_line:, argv:, pkgbase:, log_path:, status: 'queued',
+                 created_at: Time.now.utc, started_at: nil, finished_at: nil,
+                 exit_status: nil, upload_prompt_seen: false, upload_decision: nil,
+                 prompt_answered_at: nil, build_host: nil, note: nil)
+    @id = id
+    @command_line = command_line
+    @argv = argv
+    @pkgbase = pkgbase
+    @log_path = log_path
+    @status = status
+    @created_at = created_at
+    @started_at = started_at
+    @finished_at = finished_at
+    @exit_status = exit_status
+    @upload_prompt_seen = upload_prompt_seen
+    @upload_decision = upload_decision
+    @prompt_answered_at = prompt_answered_at
+    @build_host = build_host
+    @note = note
+    @pid = nil
+    @stdin = nil
+    @prompt_tail = +''
+    @discard_after_finish = false
+  end
+
+  def self.from_h(hash)
+    new(
+      id: hash.fetch('id'),
+      command_line: hash.fetch('command_line'),
+      argv: hash.fetch('argv'),
+      pkgbase: hash['pkgbase'],
+      log_path: hash.fetch('log_path'),
+      status: hash.fetch('status', 'queued'),
+      created_at: parse_time(hash['created_at']) || Time.now.utc,
+      started_at: parse_time(hash['started_at']),
+      finished_at: parse_time(hash['finished_at']),
+      exit_status: hash['exit_status'],
+      upload_prompt_seen: hash['upload_prompt_seen'] || false,
+      upload_decision: hash['upload_decision'],
+      prompt_answered_at: parse_time(hash['prompt_answered_at']),
+      build_host: hash['build_host'],
+      note: hash['note']
+    )
+  end
+
+  def to_h
+    {
+      'id' => id,
+      'command_line' => command_line,
+      'argv' => argv,
+      'pkgbase' => pkgbase,
+      'log_path' => log_path,
+      'status' => status,
+      'created_at' => created_at&.utc&.iso8601,
+      'started_at' => started_at&.utc&.iso8601,
+      'finished_at' => finished_at&.utc&.iso8601,
+      'exit_status' => exit_status,
+      'upload_prompt_seen' => upload_prompt_seen,
+      'upload_decision' => upload_decision,
+      'prompt_answered_at' => prompt_answered_at&.utc&.iso8601,
+      'build_host' => build_host,
+      'note' => note
+    }
+  end
+
+  def active?
+    ACTIVE_STATUSES.include?(status)
+  end
+
+  def terminal?
+    TERMINAL_STATUSES.include?(status)
+  end
+end
+
+class BuildManager
+  def initialize
+    @mutex = Mutex.new
+    @builds = {}
+    @refresh_pending = []
+    @threads = []
+    @shutting_down = false
+
+    FileUtils.mkdir_p([STATE_DIR, LOG_DIR])
+    load_state
+  end
+
+  def start
+    @mutex.synchronize { @builds.values.select { |build| build.status == 'queued' } }.each do |build|
+      start_build_thread(build)
+    end
+  end
+
+  def all_builds
+    @mutex.synchronize { @builds.values.sort_by(&:created_at).reverse }
+  end
+
+  def find(id)
+    @mutex.synchronize { @builds[id] }
+  end
+
+  def refresh_pending
+    @mutex.synchronize { @refresh_pending.dup }
+  end
+
+  def enqueue(command_line, ignore_active_id: nil)
+    command_line = command_line.to_s.strip
+    raise ArgumentError, 'enter a package name, optionally ending with :nocheck' unless command_line.match?(COMMAND_PATTERN)
+
+    pkgbase = command_line.sub(/:nocheck\z/, '')
+    id = "#{Time.now.utc.strftime('%Y%m%d%H%M%S')}-#{format('%06x', Random.rand(0x1000000))}"
+    log_path = File.join(LOG_DIR, "#{id}-#{safe_filename(pkgbase)}.log")
+    build = Build.new(
+      id: id,
+      command_line: command_line,
+      argv: [BUILD_COMMAND, command_line],
+      pkgbase: pkgbase,
+      log_path: log_path
+    )
+
+    @mutex.synchronize do
+      if @builds.values.any? { |existing| existing.id != ignore_active_id && existing.active? && existing.pkgbase == pkgbase }
+        raise ArgumentError, "#{pkgbase} is already queued or building"
+      end
+
+      @builds[id] = build
+      prune_history_locked
+      persist_locked
+    end
+    start_build_thread(build)
+    build
+  rescue ArgumentError
+    raise
+  rescue StandardError => e
+    raise ArgumentError, e.message
+  end
+
+  def refresh_from_remote
+    output = `#{REFRESH_COMMAND} 2>&1`
+    raise ArgumentError, "#{REFRESH_COMMAND} failed: #{output.lines.last.to_s.strip}" unless $?.success?
+
+    candidates = output.lines.map(&:strip).select { |line| line.match?(COMMAND_PATTERN) }.uniq
+    added = []
+    @mutex.synchronize do
+      added = candidates.reject { |pkgbase| @refresh_pending.include?(pkgbase) }
+      @refresh_pending.concat(added)
+      persist_locked if added.any?
+    end
+    added
+  end
+
+  def enqueue_refresh(pkgbases)
+    queued = []
+    errors = []
+    selected = Array(pkgbases).map(&:to_s).map(&:strip).uniq.select do |pkgbase|
+      pkgbase.match?(COMMAND_PATTERN) && @mutex.synchronize { @refresh_pending.include?(pkgbase) }
+    end
+
+    unless selected.empty?
+      output = `pacman -Sy 2>&1`
+      raise ArgumentError, "pacman -Sy failed: #{output.lines.last.to_s.strip}" unless $?.success?
+    end
+
+    selected.each do |pkgbase|
+      begin
+        build = enqueue(pkgbase)
+        queued << build
+        @mutex.synchronize do
+          @refresh_pending.delete(pkgbase)
+          persist_locked
+        end
+      rescue ArgumentError => e
+        errors << "#{pkgbase}: #{e.message}"
+      end
+    end
+
+    [queued, errors]
+  end
+
+  def clear_refresh(pkgbases)
+    selected = Array(pkgbases).map(&:to_s).map(&:strip)
+    @mutex.synchronize do
+      selected = @refresh_pending if selected.empty?
+      before = @refresh_pending.size
+      @refresh_pending -= selected
+      persist_locked if @refresh_pending.size != before
+      before - @refresh_pending.size
+    end
+  end
+
+  def answer_upload(id, upload:)
+    build = nil
+    writer = nil
+
+    @mutex.synchronize do
+      build = @builds[id] || raise(ArgumentError, 'unknown build')
+      raise ArgumentError, 'build is not waiting for an upload decision' unless build.status == 'waiting_upload'
+
+      build.upload_decision = upload ? 'upload' : 'skip'
+      build.prompt_answered_at = Time.now.utc
+      build.status = 'running'
+      writer = build.stdin
+      persist_locked
+    end
+
+    raise ArgumentError, 'build prompt is no longer connected' unless writer
+
+    writer.write(upload ? "y\n" : "n\n")
+    writer.flush
+    return if upload
+
+    @mutex.synchronize do
+      build.discard_after_finish = true
+      @builds.delete(id)
+      persist_locked
+    end
+    FileUtils.rm_f(build.log_path)
+  rescue IOError, Errno::EPIPE => e
+    raise ArgumentError, "could not answer upload prompt: #{e.message}"
+  end
+
+  def stop_build(id)
+    pid = nil
+
+    @mutex.synchronize do
+      build = @builds[id] || raise(ArgumentError, 'unknown build')
+      raise ArgumentError, 'build is not active' unless build.active?
+
+      build.status = 'interrupted'
+      build.finished_at = Time.now.utc
+      build.note = 'stopped by user'
+      pid = build.pid
+      persist_locked
+    end
+
+    return unless pid
+
+    begin
+      Process.kill('TERM', -pid)
+    rescue Errno::ESRCH, Errno::EPERM
+      Process.kill('TERM', pid)
+    end
+  rescue Errno::ESRCH
+    nil
+  end
+
+  def delete_build(id)
+    log_path = nil
+
+    @mutex.synchronize do
+      build = @builds[id] || raise(ArgumentError, 'unknown build')
+      raise ArgumentError, 'cannot delete an active build' if build.active?
+
+      log_path = build.log_path
+      @builds.delete(id)
+      persist_locked
+    end
+
+    FileUtils.rm_f(log_path) if log_path
+  end
+
+  def shutdown
+    @mutex.synchronize do
+      @shutting_down = true
+      @builds.each_value do |build|
+        next unless build.pid
+
+        begin
+          Process.kill('TERM', build.pid)
+        rescue Errno::ESRCH
+          nil
+        end
+      end
+    end
+  end
+
+  private
+
+  def load_state
+    return unless File.exist?(STATE_FILE)
+
+    changed = false
+    data = JSON.parse(File.read(STATE_FILE))
+    data.fetch('builds', []).each do |entry|
+      build = Build.from_h(entry)
+      if %w[running waiting_upload].include?(build.status)
+        build.status = 'interrupted'
+        build.finished_at ||= Time.now.utc
+        build.note = 'daemon restarted while this build was active'
+        changed = true
+      end
+      @builds[build.id] = build
+    end
+    @refresh_pending = data.fetch('refresh_pending', []).select { |pkgbase| pkgbase.to_s.match?(COMMAND_PATTERN) }
+    persist_locked if changed
+  rescue JSON::ParserError => e
+    warn "#{APP_NAME}: ignoring unreadable state file: #{e.message}"
+  end
+
+  def persist_locked
+    FileUtils.mkdir_p(STATE_DIR)
+    tmp = "#{STATE_FILE}.tmp"
+    File.write(tmp, JSON.pretty_generate(
+      'builds' => @builds.values.sort_by(&:created_at).map(&:to_h),
+      'refresh_pending' => @refresh_pending
+    ))
+    File.rename(tmp, STATE_FILE)
+  end
+
+  def prune_history_locked
+    return unless MAX_HISTORY.positive?
+
+    completed = @builds.values.reject(&:active?).sort_by { |build| build.finished_at || build.created_at }.reverse
+    completed.drop(MAX_HISTORY).each { |build| @builds.delete(build.id) }
+  end
+
+  def start_build_thread(build)
+    thread = Thread.new do
+      run_build(build)
+    rescue StandardError => e
+      warn "#{APP_NAME}: build #{build.id}: #{e.class}: #{e.message}"
+      warn e.backtrace.first(5).join("\n") if ENV['ARCHRISCV_BUILDD_DEBUG']
+      finish_build(build, 'failed', exit_status: nil, note: e.message)
+    end
+    @mutex.synchronize do
+      @threads.reject! { |existing| !existing.alive? }
+      @threads << thread
+    end
+  end
+
+  def run_build(build)
+    append_log(build, "$ #{build.argv.shelljoin}\n")
+    append_log(build, "started: #{Time.now.utc.iso8601}\n\n")
+    set_status(build, 'running', started_at: Time.now.utc)
+
+    reader = nil
+    writer = nil
+    wait_status = nil
+    options = {}
+    options[:chdir] = BUILD_WORKDIR if BUILD_WORKDIR && !BUILD_WORKDIR.empty?
+
+    begin
+      spawn_args = options.empty? ? build.argv : [*build.argv, options]
+      reader, writer, pid = PTY.spawn(*spawn_args)
+      writer.sync = true
+      @mutex.synchronize do
+        build.pid = pid
+        build.stdin = writer
+      end
+
+      begin
+        loop do
+          chunk = reader.readpartial(4096)
+          append_log(build, chunk)
+          observe_prompt(build, chunk)
+        end
+      rescue EOFError, Errno::EIO
+        nil
+      end
+
+      _, wait_status = Process.wait2(pid)
+    rescue StandardError => e
+      append_log(build, "\n#{APP_NAME}: #{e.class}: #{e.message}\n")
+      finish_build(build, 'failed', exit_status: nil, note: e.message)
+      return
+    ensure
+      reader&.close unless reader&.closed?
+      writer&.close unless writer&.closed?
+      @mutex.synchronize do
+        build.pid = nil
+        build.stdin = nil
+      end
+    end
+
+    exit_code = wait_status.exitstatus || (wait_status.termsig ? 128 + wait_status.termsig : nil)
+    append_log(build, "\nfinished: #{Time.now.utc.iso8601} exit=#{exit_code || 'unknown'}\n")
+    finish_build(build, wait_status.success? ? 'succeeded' : 'failed', exit_status: exit_code)
+  end
+
+  def append_log(build, chunk)
+    FileUtils.mkdir_p(File.dirname(build.log_path))
+    File.open(build.log_path, 'ab') { |file| file.write(chunk) }
+  end
+
+  def observe_prompt(build, chunk)
+    @mutex.synchronize do
+      changed = false
+      tail = build.prompt_tail + chunk.to_s
+      build.prompt_tail = tail.bytesize > 512 ? tail.byteslice(tail.bytesize - 512, 512) : tail
+      clean_tail = build.prompt_tail.gsub(ANSI_PATTERN, '')
+      if !build.build_host && (match = clean_tail.match(HOST_PATTERN))
+        build.build_host = match[1]
+        changed = true
+      end
+
+      if !build.upload_prompt_seen && clean_tail.match?(PROMPT_PATTERN)
+        build.upload_prompt_seen = true
+        build.status = 'waiting_upload'
+        changed = true
+      end
+
+      persist_locked if changed
+    end
+  end
+
+  def set_status(build, status, started_at: nil)
+    @mutex.synchronize do
+      build.status = status
+      build.started_at = started_at if started_at
+      persist_locked
+    end
+  end
+
+  def finish_build(build, status, exit_status:, note: nil)
+    remove_log = false
+    @mutex.synchronize do
+      if build.discard_after_finish
+        @builds.delete(build.id)
+        persist_locked
+        remove_log = true
+      else
+        status = 'interrupted' if build.status == 'interrupted'
+        build.status = status
+        build.exit_status = exit_status
+        build.finished_at = Time.now.utc
+        build.note = note if note
+        prune_history_locked
+        persist_locked
+      end
+    end
+    FileUtils.rm_f(build.log_path) if remove_log
+  end
+end
+
+class WebApp
+  def initialize(manager)
+    @manager = manager
+  end
+
+  def call(req, res)
+    case [req.request_method, req.path]
+    when ['GET', '/']
+      html(res, render_index(req))
+    when ['POST', '/builds']
+      create_build(req, res)
+    when ['POST', '/refresh']
+      refresh_remote(req, res)
+    when ['POST', '/refresh/add']
+      add_refresh(req, res)
+    when ['POST', '/refresh/clear']
+      clear_refresh(req, res)
+    else
+      route_build(req, res)
+    end
+  rescue ArgumentError => e
+    html(res, render_index(req, error: e.message), status: 400)
+  rescue StandardError => e
+    warn "#{APP_NAME}: web: #{e.class}: #{e.message}"
+    warn e.backtrace.first(5).join("\n") if ENV['ARCHRISCV_BUILDD_DEBUG']
+    html(res, layout('error', %(<section class="notification is-danger"><h2 class="title is-5">Internal error</h2><p>#{h(e.message)}</p></section>)), status: 500)
+  end
+
+  private
+
+  def route_build(req, res)
+    case req.path
+    when %r{\A/builds/([^/]+)/log\z}
+      show_log(req, res, Regexp.last_match(1))
+    when %r{\A/builds/([^/]+)/raw\z}
+      raw_log(res, Regexp.last_match(1))
+    when %r{\A/builds/([^/]+)/events\z}
+      stream_events(req, res, Regexp.last_match(1))
+    when %r{\A/builds/([^/]+)/upload\z}
+      answer_upload(req, res, Regexp.last_match(1))
+    when %r{\A/builds/([^/]+)/retry\z}
+      retry_build(req, res, Regexp.last_match(1))
+    when %r{\A/builds/([^/]+)/stop\z}
+      stop_build(req, res, Regexp.last_match(1))
+    when %r{\A/builds/([^/]+)/delete\z}
+      delete_build(req, res, Regexp.last_match(1))
+    else
+      not_found(res)
+    end
+  end
+
+  def create_build(req, res)
+    @manager.enqueue(req.query['command'])
+    redirect(res, '/')
+  end
+
+  def refresh_remote(_req, res)
+    added = @manager.refresh_from_remote
+    message = added.empty? ? "#{REFRESH_COMMAND} found no new packages" : "#{REFRESH_COMMAND} added #{added.size} pending package(s)"
+    redirect(res, "/?notice=#{CGI.escape(message)}")
+  end
+
+  def add_refresh(req, res)
+    selected = Array(req.query['pkgbase'])
+    raise ArgumentError, 'select at least one pending package' if selected.empty?
+
+    queued, errors = @manager.enqueue_refresh(selected)
+    message = "queued #{queued.size} build(s)"
+    message += "; #{errors.join('; ')}" if errors.any?
+    redirect(res, "/?notice=#{CGI.escape(message)}")
+  end
+
+  def clear_refresh(req, res)
+    selected = Array(req.query['pkgbase'])
+    raise ArgumentError, 'select at least one pending package' if selected.empty?
+
+    count = @manager.clear_refresh(selected)
+    redirect(res, "/?notice=#{CGI.escape("cleared #{count} pending package(s)")}")
+  end
+
+  def answer_upload(req, res, id)
+    not_found(res) && return unless req.request_method == 'POST'
+
+    @manager.answer_upload(id, upload: req.query['decision'] == 'yes')
+    redirect(res, '/')
+  end
+
+  def retry_build(req, res, id)
+    not_found(res) && return unless req.request_method == 'POST'
+
+    build = @manager.find(id)
+    return not_found(res) unless build
+    unless %w[failed interrupted waiting_upload].include?(build.status)
+      raise ArgumentError, 'only failed, interrupted, or upload-waiting builds can be retried'
+    end
+
+    @manager.answer_upload(id, upload: false) if build.status == 'waiting_upload'
+    @manager.enqueue(build.command_line, ignore_active_id: id)
+    redirect(res, '/')
+  end
+
+  def stop_build(req, res, id)
+    not_found(res) && return unless req.request_method == 'POST'
+
+    @manager.stop_build(id)
+    redirect(res, '/')
+  end
+
+  def delete_build(req, res, id)
+    not_found(res) && return unless req.request_method == 'POST'
+
+    @manager.delete_build(id)
+    redirect(res, '/')
+  end
+
+  def show_log(_req, res, id)
+    build = @manager.find(id)
+    return not_found(res) unless build
+
+    log, offset = read_log(build.log_path)
+    host_style = build.build_host ? '' : ' style="display:none"'
+    host_text = build.build_host.to_s
+
+    html(res, layout("log #{build.id}", <<~HTML))
+      <section class="box mb-3">
+        <div class="level mb-2">
+          <div class="level-left">
+            <div>
+              <div class="build-title mb-1">
+                #{status_tag(build.status)}
+                <h1 class="title is-4 mb-0">#{h(build.pkgbase || build.command_line)}</h1>
+                <span id="build-host" class="tag is-light"#{host_style}>#{h(host_text)}</span>
+              </div>
+              <p class="command is-family-monospace" title="#{h(build.argv.shelljoin)}">#{h(build.argv.shelljoin)}</p>
+            </div>
+          </div>
+          <div class="level-right">
+            <div class="buttons are-small mb-0">
+              <a class="button is-light" href="/">Dashboard</a>
+              <a class="button is-light" href="/builds/#{h(build.id)}/raw">Raw log</a>
+              #{retry_button(build) unless build.status == 'waiting_upload'}
+              #{stop_button(build)}
+            </div>
+          </div>
+        </div>
+        <div class="build-toolbar is-size-7 has-text-grey">
+          <span>started #{h(fmt_time(build.started_at))}</span>
+          <span>duration <span id="duration">#{h(duration(build))}</span></span>
+        </div>
+      </section>
+
+      #{decision_panel(build, live: true)}
+
+      <section class="box log-panel p-3">
+        <div class="build-toolbar mb-2">
+          #{status_tag(build.status, id: 'status')}
+          <span class="is-size-7 has-text-grey">live log</span>
+        </div>
+        <pre id="log" class="is-size-7">#{h(utf8(log))}</pre>
+      </section>
+      <a class="button is-medium is-warning top-link" href="#top" title="Back to top">&uarr; Top</a>
+      <button id="end-link" class="button is-medium is-info end-link" type="button" title="Back to end">&darr; End</button>
+
+      <script>
+        const buildId = #{JSON.generate(build.id)};
+        const statusEl = document.querySelector('#status');
+        const hostEl = document.querySelector('#build-host');
+        const decisionEl = document.querySelector('#decision');
+        const durationEl = document.querySelector('#duration');
+        const logEl = document.querySelector('#log');
+        const endLink = document.querySelector('#end-link');
+        let offset = #{offset};
+
+        let ansiFg = null;
+        let ansiBold = false;
+        let ansiTail = '';
+        const ansiColors = {
+          30: '#667085', 31: '#ff6b6b', 32: '#9ece6a', 33: '#f9c74f',
+          34: '#7aa2f7', 35: '#bb9af7', 36: '#7dcfff', 37: '#d8dee9',
+          90: '#8992a3', 91: '#ff8b8b', 92: '#b9f27c', 93: '#ffd166',
+          94: '#9dbbff', 95: '#d2a8ff', 96: '#9be7ff', 97: '#ffffff'
+        };
+
+        function statusClass(status) {
+          if (status === 'running') return 'is-info';
+          if (status === 'waiting_upload') return 'is-warning';
+          if (status === 'failed' || status === 'interrupted') return 'is-danger';
+          if (status === 'succeeded') return 'is-success';
+          return 'is-light';
+        }
+
+        function escapeHTML(value) {
+          return value.replace(/[&<>"']/g, (char) => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+          }[char]));
+        }
+
+        function styledText(text) {
+          if (!text) return '';
+          const escaped = escapeHTML(text.replace(/\x0f/g, ''));
+          const style = [ansiFg ? `color:${ansiFg}` : '', ansiBold ? 'font-weight:700' : ''].filter(Boolean).join(';');
+          return style ? `<span style="${style}">${escaped}</span>` : escaped;
+        }
+
+        function applyAnsi(params) {
+          if (params.length === 0) params = [0];
+          for (let i = 0; i < params.length; i++) {
+            const code = params[i];
+            if (code === 0) { ansiFg = null; ansiBold = false; }
+            else if (code === 1) ansiBold = true;
+            else if (code === 22) ansiBold = false;
+            else if (code === 39) ansiFg = null;
+            else if (ansiColors[code]) ansiFg = ansiColors[code];
+          }
+        }
+
+        function ansiToHTML(text) {
+          const ESC = String.fromCharCode(27);
+          const CSI = String.fromCharCode(155);
+          text = ansiTail + text;
+          ansiTail = '';
+          let html = '';
+          let index = 0;
+
+          while (index < text.length) {
+            const escAt = text.indexOf(ESC, index);
+            const csiAt = text.indexOf(CSI, index);
+            let start = -1;
+            if (escAt === -1) start = csiAt;
+            else if (csiAt === -1) start = escAt;
+            else start = Math.min(escAt, csiAt);
+
+            if (start === -1) {
+              html += styledText(text.slice(index));
+              break;
+            }
+
+            html += styledText(text.slice(index, start));
+
+            let paramsAt;
+            if (text[start] === CSI) {
+              paramsAt = start + 1;
+            } else if (text[start + 1] === '[') {
+              paramsAt = start + 2;
+            } else if (text[start + 1] === ']') {
+              const bel = text.indexOf(String.fromCharCode(7), start + 2);
+              const st = text.indexOf(ESC + String.fromCharCode(92), start + 2);
+              const stop = [bel, st].filter((pos) => pos !== -1).sort((a, b) => a - b)[0];
+              if (stop === undefined) { ansiTail = text.slice(start); break; }
+              index = stop === st ? stop + 2 : stop + 1;
+              continue;
+            } else {
+              if (start + 1 >= text.length) { ansiTail = text.slice(start); break; }
+              index = start + 2;
+              continue;
+            }
+
+            let finalAt = paramsAt;
+            while (finalAt < text.length) {
+              const code = text.charCodeAt(finalAt);
+              if (code >= 0x40 && code <= 0x7e) break;
+              finalAt++;
+            }
+            if (finalAt >= text.length) { ansiTail = text.slice(start); break; }
+
+            if (text[finalAt] === 'm') {
+              let rawParams = text.slice(paramsAt, finalAt);
+              if (rawParams[0] === '?') rawParams = rawParams.slice(1);
+              applyAnsi(rawParams.split(';').filter(Boolean).map((part) => parseInt(part, 10)));
+            }
+            index = finalAt + 1;
+          }
+
+          return html;
+        }
+
+        function appendLog(text) {
+          if (!text) return;
+          const wasNearBottom = nearBottom();
+          logEl.insertAdjacentHTML('beforeend', ansiToHTML(text));
+          if (wasNearBottom) window.scrollTo(0, document.body.scrollHeight);
+          updateEndLink();
+        }
+
+        function nearBottom() {
+          return window.innerHeight + window.scrollY >= document.body.offsetHeight - 120;
+        }
+
+        function updateEndLink() {
+          endLink.style.display = nearBottom() ? 'none' : '';
+        }
+
+        logEl.innerHTML = ansiToHTML(logEl.textContent);
+        requestAnimationFrame(() => window.scrollTo(0, document.body.scrollHeight));
+        requestAnimationFrame(updateEndLink);
+        window.addEventListener('scroll', updateEndLink, { passive: true });
+        endLink.addEventListener('click', () => {
+          window.scrollTo(0, document.body.scrollHeight);
+          updateEndLink();
+        });
+
+        const events = new EventSource(`/builds/${encodeURIComponent(buildId)}/events?offset=${offset}`);
+        events.addEventListener('log', (event) => appendLog(event.data + "\\n"));
+        events.addEventListener('status', (event) => {
+          const data = JSON.parse(event.data);
+          statusEl.textContent = data.status.replace(/_/g, ' ');
+          statusEl.className = `tag ${statusClass(data.status)}`;
+          if (hostEl && data.build_host) {
+            hostEl.textContent = data.build_host;
+            hostEl.style.display = '';
+          }
+          durationEl.textContent = data.duration;
+          if (decisionEl) decisionEl.style.display = data.status === 'waiting_upload' ? '' : 'none';
+          if (data.done) events.close();
+        });
+      </script>
+    HTML
+  end
+
+  def raw_log(res, id)
+    build = @manager.find(id)
+    return not_found(res) unless build
+
+    res.status = 200
+    res['Content-Type'] = 'text/plain; charset=utf-8'
+    res.body = File.exist?(build.log_path) ? File.open(build.log_path, 'rb') : ''
+  end
+
+  def stream_events(req, res, id)
+    build = @manager.find(id)
+    return not_found(res) unless build
+
+    res.status = 200
+    res['Content-Type'] = 'text/event-stream; charset=utf-8'
+    res['Cache-Control'] = 'no-cache'
+    res.chunked = true
+    res.body = proc do |out|
+      offset = req.query['offset'].to_i
+      last_status = nil
+      loop do
+        log, offset = read_log(build.log_path, offset)
+        sse(out, 'log', utf8(log)) unless log.empty?
+
+        current = @manager.find(id)
+        break unless current
+
+        payload = {
+          status: current.status,
+          build_host: current.build_host,
+          duration: duration(current),
+          done: current.terminal?
+        }
+        encoded = JSON.generate(payload)
+        if encoded != last_status
+          sse(out, 'status', encoded)
+          last_status = encoded
+        end
+        break if current.terminal? && log.empty?
+
+        sleep 1
+      end
+    rescue IOError, Errno::EPIPE, Errno::ECONNRESET
+      nil
+    end
+  end
+
+  def render_index(req, error: nil)
+    builds = @manager.all_builds
+    active = builds.select(&:active?)
+    recent = builds.reject(&:active?).sort_by do |build|
+      build.finished_at || build.prompt_answered_at || build.started_at || build.created_at
+    end.reverse
+    search = req.query['q'].to_s.strip
+    unless search.empty?
+      needle = search.downcase
+      recent = recent.select do |build|
+        [build.pkgbase, build.command_line, build.status, build.build_host, build.note, build.exit_status].compact.any? do |value|
+          value.to_s.downcase.include?(needle)
+        end
+      end
+    end
+    page_count = [(recent.size + RECENT_PAGE_SIZE - 1) / RECENT_PAGE_SIZE, 1].max
+    page = [[req.query['page'].to_i, 1].max, page_count].min
+    recent_page = recent[((page - 1) * RECENT_PAGE_SIZE), RECENT_PAGE_SIZE] || []
+    search_query = search.empty? ? '' : "&q=#{CGI.escape(search)}"
+    pagination = if page_count > 1
+                   <<~HTML
+                     <div class="buttons are-small mb-0">
+                       #{%(<a class="button is-small is-light" href="/?page=#{page - 1}#{search_query}">Prev</a>) if page > 1}
+                       <span class="button is-small is-static">#{page} / #{page_count}</span>
+                       #{%(<a class="button is-small is-light" href="/?page=#{page + 1}#{search_query}">Next</a>) if page < page_count}
+                     </div>
+                   HTML
+                 else
+                   ''
+                 end
+    recent_empty = search.empty? ? 'Completed builds will appear here.' : 'No matching completed builds.'
+    pending = @manager.refresh_pending
+    notice = req.query['notice']
+
+    layout('dashboard', <<~HTML)
+      <section class="box mb-3">
+        <h1 class="title is-3 mb-1">#{APP_TITLE}</h1>
+        <p class="subtitle is-6">Runs <span class="is-family-monospace">#{h(BUILD_COMMAND)}</span>.</p>
+      </section>
+
+      #{flash('error', error) if error}
+      #{flash('notice', notice) if notice}
+
+      <section class="box mb-3">
+        <form action="/builds" method="post">
+          <label class="label" for="command">Start a build</label>
+          <div class="field has-addons">
+            <div class="control is-expanded">
+              <input class="input" id="command" name="command" type="text" autofocus placeholder="pkgbase[:nocheck]" autocomplete="off" pattern="[A-Za-z0-9][A-Za-z0-9@._+\-]*(:nocheck)?">
+            </div>
+            <div class="control">
+              <button class="button is-primary" type="submit">Start build</button>
+            </div>
+          </div>
+          <p class="help">Examples: <span class="is-family-monospace">openssl</span>, <span class="is-family-monospace">rust:nocheck</span></p>
+        </form>
+      </section>
+
+      #{refresh_panel(pending)}
+
+      <section class="columns">
+        <div class="column">
+          <div class="box p-3">
+            <div class="level is-mobile mb-2">
+              <h2 class="title is-5 mb-0">Running builds</h2>
+              <span class="tag is-light">#{active.size}</span>
+            </div>
+            #{active.empty? ? empty_state('No builds are running.') : active.map { |build| build_card(build) }.join}
+          </div>
+        </div>
+
+        <div class="column">
+          <div class="box p-3">
+            <div class="level mb-2">
+              <div class="level-left">
+                <h2 class="title is-5 mb-0">Recent builds</h2>
+                <span class="tag is-light ml-2">#{recent.size}</span>
+              </div>
+              <div class="level-right">#{pagination}</div>
+            </div>
+            <form class="field has-addons mb-2" action="/" method="get">
+              <div class="control is-expanded">
+                <input class="input is-small" name="q" type="search" value="#{h(search)}" placeholder="Search recent builds">
+              </div>
+              <div class="control"><button class="button is-small is-light" type="submit">Search</button></div>
+              #{%(<div class="control"><a class="button is-small is-light" href="/">Clear</a></div>) unless search.empty?}
+            </form>
+            #{recent_page.empty? ? empty_state(recent_empty) : recent_page.map { |build| build_card(build) }.join}
+            #{pagination}
+          </div>
+        </div>
+      </section>
+    HTML
+  end
+
+  def build_card(build)
+    host = build.build_host
+    unless host
+      log, = read_log(build.log_path, 0, 65_536)
+      match = log.gsub(ANSI_PATTERN, '').match(HOST_PATTERN)
+      host = match[1] if match
+    end
+
+    <<~HTML
+      <article class="box build-card #{h(build.status)} p-3 mb-2">
+        #{delete_button(build)}
+        <div class="build-head">
+          <div class="build-title">
+            #{status_tag(build.status)}
+            <h3 class="title is-6 mb-0">#{h(build.pkgbase || build.command_line)}</h3>
+            #{%(<span class="tag is-light">#{h(host)}</span>) if host}
+          </div>
+          <span class="is-size-7 has-text-grey">#{h(duration(build))}#{%( - exit #{h(build.exit_status)}) if build.exit_status}</span>
+        </div>
+        <p class="command is-family-monospace" title="#{h(build.argv.shelljoin)}">#{h(build.argv.shelljoin)}</p>
+        #{decision_panel(build)}
+        #{%(<p class="help is-danger mb-1">#{h(build.note)}</p>) if build.note}
+        <div class="buttons are-small mb-0">
+          <a class="button is-small" href="/builds/#{h(build.id)}/log">Log</a>
+          <a class="button is-small is-light" href="/builds/#{h(build.id)}/raw">Raw</a>
+          #{stop_button(build)}
+          #{retry_button(build) unless build.status == 'waiting_upload'}
+        </div>
+      </article>
+    HTML
+  end
+
+  def delete_button(build)
+    return '' if build.active?
+
+    <<~HTML
+      <form class="delete-build" action="/builds/#{h(build.id)}/delete" method="post">
+        <button class="delete is-small" type="submit" title="Delete build and log" aria-label="delete" onclick="return confirm('Delete this build and its log?')"></button>
+      </form>
+    HTML
+  end
+
+  def refresh_panel(pending)
+    pending_tags = pending.map do |pkgbase|
+      <<~HTML
+        <label class="tag is-light pending-tag">
+          <input type="checkbox" name="pkgbase" value="#{h(pkgbase)}" checked>
+          <span>#{h(pkgbase)}</span>
+        </label>
+      HTML
+    end.join
+
+    pending_form = if pending.empty?
+                     %(<p class="has-text-grey is-size-7 mb-0">No pending packages from #{h(REFRESH_COMMAND)}.</p>)
+                   else
+                     <<~HTML
+                       <form action="/refresh/add" method="post">
+                         <div class="tags mb-2">#{pending_tags}</div>
+                         <div class="buttons are-small mb-0">
+                           <button class="button is-small is-primary" type="submit">Add selected</button>
+                           <button class="button is-small is-light" type="submit" formaction="/refresh/clear" onclick="return confirm('Dismiss selected pending packages?')">Dismiss selected</button>
+                         </div>
+                       </form>
+                     HTML
+                   end
+
+    <<~HTML
+      <section class="box mb-3">
+        <div class="level is-mobile mb-2">
+          <div>
+            <h2 class="title is-5 mb-0">Pending refresh</h2>
+            <p class="help">Run <span class="is-family-monospace">#{h(REFRESH_COMMAND)}</span>; confirm before adding builds.</p>
+          </div>
+          <form action="/refresh" method="post">
+            <button class="button is-small is-light" type="submit">Refresh</button>
+          </form>
+        </div>
+        #{pending_form}
+      </section>
+    HTML
+  end
+
+  def retry_button(build)
+    return '' unless %w[failed interrupted waiting_upload].include?(build.status)
+
+    label = build.status == 'waiting_upload' ? 'Skip upload + retry' : 'Retry'
+    button_class = build.status == 'waiting_upload' ? 'button is-small is-warning' : 'button is-small is-primary'
+
+    <<~HTML
+      <form class="inline" action="/builds/#{h(build.id)}/retry" method="post">
+        <button class="#{button_class}" type="submit">#{label}</button>
+      </form>
+    HTML
+  end
+
+  def stop_button(build)
+    return '' unless build.active?
+
+    <<~HTML
+      <form class="inline" action="/builds/#{h(build.id)}/stop" method="post">
+        <button class="button is-small is-danger" type="submit">Stop</button>
+      </form>
+    HTML
+  end
+
+  def decision_panel(build, live: false)
+    return '' unless live || build.status == 'waiting_upload'
+
+    id_attr = live ? ' id="decision"' : ''
+    style = build.status == 'waiting_upload' ? '' : ' style="display:none"'
+
+    <<~HTML
+      <div#{id_attr} class="notification is-warning is-light py-2 px-3 mb-2"#{style}>
+        <div class="build-head">
+          <p class="mb-0"><strong>Upload log?</strong> Paused at <span class="is-family-monospace">Upload log? [y/N]</span>.</p>
+          <div class="buttons are-small mb-0">
+            <form class="inline" action="/builds/#{h(build.id)}/upload" method="post">
+              <button class="button is-small is-warning" name="decision" value="yes" type="submit">Upload</button>
+              <button class="button is-small is-light" name="decision" value="no" type="submit">Skip</button>
+            </form>
+            #{retry_button(build)}
+          </div>
+        </div>
+      </div>
+    HTML
+  end
+
+  def empty_state(message)
+    %(<p class="has-text-grey is-size-7 mb-0">#{h(message)}</p>)
+  end
+
+  def flash(type, message)
+    bulma_type = type == 'error' ? 'is-danger' : 'is-success'
+    %(<div class="notification #{bulma_type} py-2 px-3 mb-3">#{h(message)}</div>)
+  end
+
+  def sse(out, event, data)
+    out.write("event: #{event}\n")
+    text = data.to_s
+    if text.empty?
+      out.write("data:\n")
+    else
+      text.each_line(chomp: true) { |line| out.write("data: #{line}\n") }
+    end
+    out.write("\n")
+  end
+
+  def html(res, body, status: 200)
+    res.status = status
+    res['Content-Type'] = 'text/html; charset=utf-8'
+    res.body = body
+  end
+
+  def redirect(res, location)
+    res.status = 303
+    res['Location'] = location
+    res.body = ''
+  end
+
+  def not_found(res)
+    html(res, layout('not found', '<section class="notification is-warning">Not found</section>'), status: 404)
+  end
+
+  def layout(title, body)
+    <<~HTML
+      <!doctype html>
+      <html lang="en">
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>#{h(title)} - #{APP_NAME}</title>
+        <link rel="stylesheet" href="https://cdnjs.snrat.com/ajax/libs/bulma/1.0.3/css/bulma.min.css" integrity="sha384-DtLgkgZWuBalGogBkye1PTBvXKCD/hnA8vHqpqfcGCf/FOa1heAyeHExO8JNtVM/" crossorigin="anonymous">
+        <style>
+          :root { --red: #a93c2f; --amber: #b86b19; --blue: #2d5d88; --moss: #315c45; }
+          body { background: #f6f1e5; color: #1e241d; }
+          main { width: min(1180px, calc(100% - 24px)); margin: 0 auto; padding: 1rem 0 2rem; }
+          .box, .notification { background-color: rgba(255, 252, 242, 0.94); }
+          .build-card { border-left: 5px solid #d8cdb7; position: relative; padding-right: 2.5rem !important; }
+          .build-card.running { border-left-color: var(--blue); }
+          .build-card.waiting_upload { border-left-color: var(--amber); }
+          .build-card.failed, .build-card.interrupted { border-left-color: var(--red); }
+          .build-card.succeeded { border-left-color: var(--moss); }
+          .build-head { display: flex; justify-content: space-between; gap: .5rem; align-items: center; }
+          .build-title, .build-toolbar, form.inline { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; min-width: 0; }
+          .build-title h1, .build-title h3, .command { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+          .command { margin: .25rem 0 .45rem; color: #697267; font-size: .82rem; }
+          .pending-tag { gap: .35rem; height: auto; padding: .35rem .55rem; }
+          .delete-build { position: absolute; right: .7rem; top: .7rem; margin: 0; }
+          form.inline, .buttons form { margin-bottom: 0; }
+          pre#log { min-height: 62vh; padding: 1rem; border-radius: 12px; color: #eaf5dc; background: #172018; white-space: pre-wrap; word-break: break-word; }
+          .top-link, .end-link { position: fixed; right: 1.25rem; z-index: 20; box-shadow: 0 .35rem 1rem rgba(0, 0, 0, .2); font-weight: 700; }
+          .top-link { bottom: 4.5rem; }
+          .end-link { bottom: 1.25rem; }
+          @media (max-width: 820px) { .build-head { align-items: flex-start; flex-direction: column; } }
+        </style>
+      </head>
+      <body id="top">
+        <main>
+          #{body}
+        </main>
+      </body>
+      </html>
+    HTML
+  end
+end
+
+manager = BuildManager.new
+manager.start
+
+server = WEBrick::HTTPServer.new(
+  BindAddress: BIND,
+  Port: PORT,
+  ServerSoftware: APP_NAME,
+  AccessLog: [],
+  Logger: WEBrick::Log.new($stderr, ENV['ARCHRISCV_BUILDD_DEBUG'] ? WEBrick::Log::DEBUG : WEBrick::Log::INFO)
+)
+
+app = WebApp.new(manager)
+server.mount_proc('/') { |req, res| app.call(req, res) }
+
+signal_reader, signal_writer = IO.pipe
+Thread.new do
+  signal_reader.read(1)
+  manager.shutdown
+  server.shutdown
+end
+
+%w[INT TERM].each do |signal|
+  trap(signal) { signal_writer.write_nonblock('.') rescue nil }
+end
+
+warn "#{APP_NAME}: listening on http://#{BIND}:#{PORT}"
+server.start
