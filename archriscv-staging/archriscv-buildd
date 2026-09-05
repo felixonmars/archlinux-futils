@@ -442,7 +442,8 @@ class BuildManager
 
     begin
       spawn_args = options.empty? ? build.argv : [*build.argv, options]
-      reader, writer, pid = PTY.spawn(*spawn_args)
+      # Match the basic ANSI support of the web log viewer.
+      reader, writer, pid = PTY.spawn({'TERM' => 'xterm'}, *spawn_args)
       writer.sync = true
       @mutex.synchronize do
         build.pid = pid
