@@ -4,7 +4,9 @@
 require 'cgi'
 require 'fileutils'
 require 'json'
+require 'open3'
 require 'pty'
+require 'rbconfig'
 require 'shellwords'
 require 'time'
 require 'webrick'
@@ -14,17 +16,19 @@ APP_TITLE = 'Arch Linux RISC-V Build Scheduler'
 STATE_DIR = ENV.fetch('ARCHRISCV_BUILDD_STATE_DIR', File.join(Dir.home, '.local/state/archriscv-buildd'))
 LOG_DIR = ENV.fetch('ARCHRISCV_BUILDD_LOG_DIR', File.join(STATE_DIR, 'logs'))
 STATE_FILE = File.join(STATE_DIR, 'state.json')
+WORKER_DIR = File.expand_path(File.join(STATE_DIR, 'workers'))
 BUILD_COMMAND = ENV.fetch('ARCHRISCV_BUILDD_BUILD_COMMAND', 'riscvu')
+BUILDER_USER = ENV.fetch('ARCHRISCV_BUILDD_BUILDER_USER', '').strip
 REFRESH_COMMAND = ENV.fetch('ARCHRISCV_BUILDD_REFRESH_COMMAND', 'archrv-refresh')
 BUILD_WORKDIR = ENV['ARCHRISCV_BUILDD_WORKDIR']
 BIND = ENV.fetch('ARCHRISCV_BUILDD_BIND', '127.0.0.1')
 PORT = ENV.fetch('ARCHRISCV_BUILDD_PORT', '9181').to_i
-MAX_HISTORY = ENV.fetch('ARCHRISCV_BUILDD_MAX_HISTORY', '10000').to_i
 RECENT_PAGE_SIZE = 30
 PROMPT_PATTERN = /(?:\A|[\r\n])Upload log\? \[y\/N\] \z/.freeze
 HOST_PATTERN = /(?:\A|[\r\n])==> Building on ([A-Za-z0-9._-]+)/.freeze
-ANSI_PATTERN = /\e(?:\][^\a]*(?:\a|\e\\)|\[[0-?]*[ -\/]*[@-~])/.freeze
+ANSI_PATTERN = /\e(?:\][^\a]*?(?:\a|\e\\)|\[[0-?]*[ -\/]*[@-~]|[ -\/]*[0-~])/.freeze
 COMMAND_PATTERN = /\A[A-Za-z0-9][A-Za-z0-9@._+-]*(?::nocheck)?\z/.freeze
+TARGET_BUILDER_PATTERN = /\A(?:[A-Za-z0-9_][A-Za-z0-9._-]*@)?[A-Za-z0-9][A-Za-z0-9._-]*\z/.freeze
 ACTIVE_STATUSES = %w[queued running waiting_upload].freeze
 TERMINAL_STATUSES = %w[succeeded failed interrupted].freeze
 
@@ -98,12 +102,13 @@ class Build
   attr_accessor :id, :command_line, :argv, :pkgbase, :log_path, :status,
                 :created_at, :started_at, :finished_at, :exit_status,
                 :upload_prompt_seen, :upload_decision, :prompt_answered_at,
-                :build_host, :note, :pid, :stdin, :prompt_tail, :discard_after_finish
+                :build_host, :target_builder, :note, :unit_name, :discard_after_finish
 
   def initialize(id:, command_line:, argv:, pkgbase:, log_path:, status: 'queued',
                  created_at: Time.now.utc, started_at: nil, finished_at: nil,
                  exit_status: nil, upload_prompt_seen: false, upload_decision: nil,
-                 prompt_answered_at: nil, build_host: nil, note: nil)
+                 prompt_answered_at: nil, build_host: nil, target_builder: nil, note: nil,
+                 unit_name: nil, discard_after_finish: false)
     @id = id
     @command_line = command_line
     @argv = argv
@@ -118,11 +123,10 @@ class Build
     @upload_decision = upload_decision
     @prompt_answered_at = prompt_answered_at
     @build_host = build_host
+    @target_builder = target_builder
     @note = note
-    @pid = nil
-    @stdin = nil
-    @prompt_tail = +''
-    @discard_after_finish = false
+    @unit_name = unit_name
+    @discard_after_finish = discard_after_finish
   end
 
   def self.from_h(hash)
@@ -141,7 +145,10 @@ class Build
       upload_decision: hash['upload_decision'],
       prompt_answered_at: parse_time(hash['prompt_answered_at']),
       build_host: hash['build_host'],
-      note: hash['note']
+      target_builder: hash['target_builder'],
+      note: hash['note'],
+      unit_name: hash['unit_name'],
+      discard_after_finish: hash['discard_after_finish'] || false
     )
   end
 
@@ -161,7 +168,10 @@ class Build
       'upload_decision' => upload_decision,
       'prompt_answered_at' => prompt_answered_at&.utc&.iso8601,
       'build_host' => build_host,
-      'note' => note
+      'target_builder' => target_builder,
+      'note' => note,
+      'unit_name' => unit_name,
+      'discard_after_finish' => discard_after_finish
     }
   end
 
@@ -174,61 +184,282 @@ class Build
   end
 end
 
+def write_json(path, data)
+  tmp = "#{path}.tmp"
+  File.write(tmp, JSON.pretty_generate(data), mode: 'w', perm: 0o600)
+  File.rename(tmp, path)
+end
+
+class SystemdBuildService
+  def start(build, directory)
+    output, status = Open3.capture2e(
+      'systemd-run', '--quiet', '--collect', '--service-type=exec',
+      "--unit=#{build.unit_name}", "--description=Build #{build.command_line}",
+      "--property=User=#{Process.uid}", "--property=Group=#{Process.gid}",
+      '--property=KillMode=control-group', '--property=TimeoutStopSec=10s',
+      '--property=UMask=0077',
+      '--', RbConfig.ruby, File.realpath(__FILE__), '--worker', directory
+    )
+    raise "could not start build worker: #{output.strip}" unless status.success? || active?(build)
+  end
+
+  def active?(build)
+    output, status = Open3.capture2e('systemctl', 'show', '--property=LoadState,ActiveState', build.unit_name)
+    properties = output.lines.filter_map do |line|
+      key, value = line.strip.split('=', 2)
+      [key, value] if value
+    end.to_h
+    return false if properties['LoadState'] == 'not-found'
+
+    raise "could not query build worker: #{output.strip}" unless status.success?
+
+    %w[active activating reloading deactivating].include?(properties['ActiveState'])
+  end
+
+  def stop(build)
+    output, status = Open3.capture2e('systemctl', 'stop', build.unit_name)
+    raise "could not stop build worker: #{output.strip}" unless status.success? || !active?(build)
+  end
+end
+
+class BuildWorker
+  def initialize(directory)
+    @directory = directory
+    @request = JSON.parse(File.read(File.join(directory, 'request.json')))
+    @build = Build.from_h(@request.fetch('build'))
+    @prompt_tail = +''
+    @stopping = false
+  end
+
+  def run
+    File.open(File.join(@directory, 'lock'), 'w', 0o600) do |lock|
+      raise 'build worker is already running' unless lock.flock(File::LOCK_EX | File::LOCK_NB)
+      # A worker may be reattached to, but must never rerun a started build.
+      return 0 if File.exist?(status_path)
+
+      run_build
+    end
+    @build.status == 'succeeded' ? 0 : 1
+  end
+
+  private
+
+  def status_path
+    File.join(@directory, 'status.json')
+  end
+
+  def persist
+    write_json(status_path, @build.to_h)
+  end
+
+  def append_log(chunk)
+    File.open(@build.log_path, 'ab') { |file| file.write(chunk) }
+  end
+
+  def run_build
+    handlers = %w[INT TERM].to_h { |signal| [signal, trap(signal) { @stopping = true }] }
+    @build.status = 'running'
+    @build.started_at = Time.now.utc
+    persist
+    append_log("$ #{@build.argv.shelljoin}\n")
+    append_log("target builder: #{@build.target_builder}\n") if @build.target_builder
+    append_log("started: #{@build.started_at.iso8601}\n\n")
+
+    env = @request.fetch('environment').merge('TERM' => 'xterm')
+    env['SERVER'] = @build.target_builder if @build.target_builder
+    options = {chdir: @request.fetch('workdir'), unsetenv_others: true}
+    @reader, @writer, @pid = PTY.spawn(env, *@build.argv, options)
+    @writer.sync = true
+    eof = false
+    until @wait_status || @stopping
+      if IO.select(eof ? [] : [@reader], nil, nil, 0.25)
+        eof = !read_output
+      end
+      answer_upload unless @stopping
+      _, @wait_status = Process.wait2(@pid, Process::WNOHANG)
+    end
+    while !eof && IO.select([@reader], nil, nil, 0)
+      eof = !read_output
+    end
+  rescue StandardError => e
+    @build.note = e.message
+    append_log("\n#{APP_NAME}: #{e.class}: #{e.message}\n")
+  ensure
+    reap_child
+    @reader&.close unless @reader&.closed?
+    @writer&.close unless @writer&.closed?
+    @build.exit_status = @wait_status&.exitstatus || (@wait_status&.termsig && 128 + @wait_status.termsig)
+    @build.finished_at = Time.now.utc
+    @build.status = if @stopping
+                      @build.note ||= 'build worker stopped'
+                      'interrupted'
+                    elsif @wait_status&.success? && !@build.note
+                      'succeeded'
+                    else
+                      'failed'
+                    end
+    append_log("\nfinished: #{@build.finished_at.iso8601} exit=#{@build.exit_status || 'unknown'}\n")
+    persist
+    handlers&.each { |signal, handler| trap(signal, handler) }
+  end
+
+  def read_output
+    chunk = @reader.read_nonblock(16_384, exception: false)
+    return false unless chunk
+    return true if chunk == :wait_readable
+
+    append_log(chunk)
+    observe_prompt(chunk)
+    true
+  rescue EOFError, Errno::EIO
+    false
+  end
+
+  def observe_prompt(chunk)
+    tail = @prompt_tail + chunk
+    @prompt_tail = tail.bytesize > 512 ? tail.byteslice(-512, 512) : tail
+    clean_tail = @prompt_tail.gsub(ANSI_PATTERN, '')
+    changed = false
+    if !@build.build_host && (match = clean_tail.match(HOST_PATTERN))
+      @build.build_host = match[1]
+      changed = true
+    end
+    if !@build.upload_prompt_seen && clean_tail.match?(PROMPT_PATTERN)
+      @build.upload_prompt_seen = true
+      @build.status = 'waiting_upload'
+      changed = true
+    end
+    persist if changed
+  end
+
+  def answer_upload
+    return unless @build.status == 'waiting_upload'
+
+    path = File.join(@directory, 'upload.json')
+    return unless File.exist?(path)
+
+    decision = JSON.parse(File.read(path)).fetch('decision')
+    raise 'invalid upload decision' unless %w[upload skip].include?(decision)
+
+    @writer.write(decision == 'upload' ? "y\n" : "n\n")
+    @writer.flush
+    @build.upload_decision = decision
+    @build.prompt_answered_at = Time.now.utc
+    @build.discard_after_finish = decision == 'skip'
+    @build.status = 'running'
+    persist
+  end
+
+  def reap_child
+    return unless @pid && !@wait_status
+
+    Process.kill('TERM', -@pid)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 3
+    loop do
+      _, @wait_status = Process.wait2(@pid, Process::WNOHANG)
+      return if @wait_status
+      break if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+
+      sleep 0.05
+    end
+    Process.kill('KILL', -@pid)
+    _, @wait_status = Process.wait2(@pid)
+  rescue Errno::ESRCH, Errno::ECHILD
+    nil
+  end
+end
+
 class BuildManager
-  def initialize
+  def initialize(service: SystemdBuildService.new)
+    @service = service
     @mutex = Mutex.new
     @builds = {}
     @refresh_pending = []
-    @threads = []
     @shutting_down = false
 
-    FileUtils.mkdir_p([STATE_DIR, LOG_DIR])
+    FileUtils.mkdir_p([STATE_DIR, LOG_DIR, WORKER_DIR])
     load_state
   end
 
   def start
-    @mutex.synchronize { @builds.values.select { |build| build.status == 'queued' } }.each do |build|
-      start_build_thread(build)
+    @mutex.synchronize do
+      @builds.values.select { |build| build.status == 'queued' }.each do |build|
+        unless build.unit_name
+          prepare_worker(build)
+          persist_locked
+        end
+        launch_worker(build) unless File.exist?(worker_status_path(build)) || @service.active?(build)
+      end
+      refresh_workers_locked(check_units: true)
+    end
+    @monitor = Thread.new do
+      tick = 0
+      loop do
+        sleep 1
+        break if @shutting_down
+
+        @mutex.synchronize { refresh_workers_locked(check_units: (tick % 10).zero?) }
+        tick += 1
+      rescue StandardError => e
+        warn "#{APP_NAME}: worker monitor: #{e.message}"
+      end
     end
   end
 
   def all_builds
-    @mutex.synchronize { @builds.values.sort_by(&:created_at).reverse }
+    @mutex.synchronize do
+      refresh_workers_locked
+      @builds.values.sort_by(&:created_at).reverse
+    end
   end
 
   def find(id)
-    @mutex.synchronize { @builds[id] }
+    @mutex.synchronize do
+      refresh_workers_locked
+      @builds[id]
+    end
   end
 
   def refresh_pending
     @mutex.synchronize { @refresh_pending.dup }
   end
 
-  def enqueue(command_line, ignore_active_id: nil)
+  def enqueue(command_line, target_builder: nil, ignore_active_id: nil)
     command_line = command_line.to_s.strip
     raise ArgumentError, 'enter a package name, optionally ending with :nocheck' unless command_line.match?(COMMAND_PATTERN)
 
+    target_builder = target_builder.to_s.strip
+    if !target_builder.empty? && !target_builder.include?('@') && !BUILDER_USER.empty?
+      target_builder = "#{BUILDER_USER}@#{target_builder}"
+    end
+    unless target_builder.empty? || target_builder.match?(TARGET_BUILDER_PATTERN)
+      raise ArgumentError, 'enter a target builder as host or user@host, or leave it blank for automatic selection'
+    end
+    target_builder = nil if target_builder.empty?
+
     pkgbase = command_line.sub(/:nocheck\z/, '')
     id = "#{Time.now.utc.strftime('%Y%m%d%H%M%S')}-#{format('%06x', Random.rand(0x1000000))}"
-    log_path = File.join(LOG_DIR, "#{id}-#{safe_filename(pkgbase)}.log")
+    log_path = File.expand_path(File.join(LOG_DIR, "#{id}-#{safe_filename(pkgbase)}.log"))
     build = Build.new(
       id: id,
       command_line: command_line,
       argv: [BUILD_COMMAND, command_line],
       pkgbase: pkgbase,
+      target_builder: target_builder,
       log_path: log_path
     )
 
     @mutex.synchronize do
+      refresh_workers_locked
       if @builds.values.any? { |existing| existing.id != ignore_active_id && existing.active? && existing.pkgbase == pkgbase }
         raise ArgumentError, "#{pkgbase} is already queued or building"
       end
 
       @builds[id] = build
-      prune_history_locked
+      prepare_worker(build)
       persist_locked
+      launch_worker(build)
     end
-    start_build_thread(build)
     build
   rescue ArgumentError
     raise
@@ -290,89 +521,67 @@ class BuildManager
   end
 
   def answer_upload(id, upload:)
-    build = nil
-    writer = nil
-
+    decision = upload ? 'upload' : 'skip'
     @mutex.synchronize do
+      refresh_workers_locked
       build = @builds[id] || raise(ArgumentError, 'unknown build')
       raise ArgumentError, 'build is not waiting for an upload decision' unless build.status == 'waiting_upload'
 
-      build.upload_decision = upload ? 'upload' : 'skip'
-      build.prompt_answered_at = Time.now.utc
-      build.status = 'running'
-      writer = build.stdin
-      persist_locked
+      path = File.join(worker_directory(build), 'upload.json')
+      if File.exist?(path) && JSON.parse(File.read(path))['decision'] != decision
+        raise ArgumentError, 'an upload decision has already been submitted'
+      end
+      write_json(path, 'decision' => decision)
     end
 
-    raise ArgumentError, 'build prompt is no longer connected' unless writer
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
+    loop do
+      build = find(id)
+      return if !build || build.upload_decision == decision
+      raise ArgumentError, 'build finished before accepting the upload decision' if build.terminal?
+      break if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
 
-    writer.write(upload ? "y\n" : "n\n")
-    writer.flush
-    return if upload
-
-    @mutex.synchronize do
-      build.discard_after_finish = true
-      @builds.delete(id)
-      persist_locked
+      sleep 0.05
     end
-    FileUtils.rm_f(build.log_path)
-  rescue IOError, Errno::EPIPE => e
-    raise ArgumentError, "could not answer upload prompt: #{e.message}"
+    raise ArgumentError, 'upload decision saved; the build worker has not acknowledged it yet'
   end
 
   def stop_build(id)
-    pid = nil
+    build = find(id) || raise(ArgumentError, 'unknown build')
+    raise ArgumentError, 'build is not active' unless build.active?
 
+    @service.stop(build)
     @mutex.synchronize do
-      build = @builds[id] || raise(ArgumentError, 'unknown build')
-      raise ArgumentError, 'build is not active' unless build.active?
+      refresh_workers_locked
+      build = @builds[id]
+      return unless build
 
       build.status = 'interrupted'
-      build.finished_at = Time.now.utc
+      build.finished_at ||= Time.now.utc
       build.note = 'stopped by user'
-      pid = build.pid
       persist_locked
     end
-
-    return unless pid
-
-    begin
-      Process.kill('TERM', -pid)
-    rescue Errno::ESRCH, Errno::EPERM
-      Process.kill('TERM', pid)
-    end
-  rescue Errno::ESRCH
-    nil
   end
 
   def delete_build(id)
-    log_path = nil
-
     @mutex.synchronize do
+      refresh_workers_locked
       build = @builds[id] || raise(ArgumentError, 'unknown build')
       raise ArgumentError, 'cannot delete an active build' if build.active?
 
-      log_path = build.log_path
       @builds.delete(id)
       persist_locked
+      remove_build_files(build)
     end
-
-    FileUtils.rm_f(log_path) if log_path
   end
 
   def shutdown
-    @mutex.synchronize do
-      @shutting_down = true
-      @builds.each_value do |build|
-        next unless build.pid
+    @shutting_down = true
+    @monitor&.join
+  end
 
-        begin
-          Process.kill('TERM', build.pid)
-        rescue Errno::ESRCH
-          nil
-        end
-      end
-    end
+  def shutting_down?
+    @shutting_down
   end
 
   private
@@ -384,7 +593,7 @@ class BuildManager
     data = JSON.parse(File.read(STATE_FILE))
     data.fetch('builds', []).each do |entry|
       build = Build.from_h(entry)
-      if %w[running waiting_upload].include?(build.status)
+      if !build.unit_name && %w[running waiting_upload].include?(build.status)
         build.status = 'interrupted'
         build.finished_at ||= Time.now.utc
         build.note = 'daemon restarted while this build was active'
@@ -400,137 +609,90 @@ class BuildManager
 
   def persist_locked
     FileUtils.mkdir_p(STATE_DIR)
-    tmp = "#{STATE_FILE}.tmp"
-    File.write(tmp, JSON.pretty_generate(
+    write_json(STATE_FILE,
       'builds' => @builds.values.sort_by(&:created_at).map(&:to_h),
       'refresh_pending' => @refresh_pending
-    ))
-    File.rename(tmp, STATE_FILE)
+    )
   end
 
-  def prune_history_locked
-    return unless MAX_HISTORY.positive?
-
-    completed = @builds.values.reject(&:active?).sort_by { |build| build.finished_at || build.created_at }.reverse
-    completed.drop(MAX_HISTORY).each { |build| @builds.delete(build.id) }
+  def worker_directory(build)
+    File.join(WORKER_DIR, build.id)
   end
 
-  def start_build_thread(build)
-    thread = Thread.new do
-      run_build(build)
-    rescue StandardError => e
-      warn "#{APP_NAME}: build #{build.id}: #{e.class}: #{e.message}"
-      warn e.backtrace.first(5).join("\n") if ENV['ARCHRISCV_BUILDD_DEBUG']
-      finish_build(build, 'failed', exit_status: nil, note: e.message)
+  def worker_status_path(build)
+    File.join(worker_directory(build), 'status.json')
+  end
+
+  def prepare_worker(build)
+    build.unit_name = "#{APP_NAME}-build-#{build.id}.service"
+    build.log_path = File.expand_path(build.log_path)
+    directory = worker_directory(build)
+    FileUtils.mkdir_p(directory, mode: 0o700)
+    # Preserve the build environment without forwarding the web service's systemd identity.
+    environment = ENV.to_h.reject do |key, _|
+      %w[NOTIFY_SOCKET WATCHDOG_PID WATCHDOG_USEC INVOCATION_ID JOURNAL_STREAM SYSTEMD_EXEC_PID].include?(key)
     end
-    @mutex.synchronize do
-      @threads.reject! { |existing| !existing.alive? }
-      @threads << thread
-    end
+    write_json(File.join(directory, 'request.json'),
+      'build' => build.to_h,
+      'environment' => environment,
+      'workdir' => BUILD_WORKDIR.to_s.empty? ? Dir.pwd : File.expand_path(BUILD_WORKDIR)
+    )
   end
 
-  def run_build(build)
-    append_log(build, "$ #{build.argv.shelljoin}\n")
-    append_log(build, "started: #{Time.now.utc.iso8601}\n\n")
-    set_status(build, 'running', started_at: Time.now.utc)
+  def launch_worker(build)
+    @service.start(build, worker_directory(build))
+  rescue StandardError => e
+    build.status = 'failed'
+    build.finished_at = Time.now.utc
+    build.note = e.message
+    persist_locked
+    warn "#{APP_NAME}: build #{build.id}: #{e.message}"
+  end
 
-    reader = nil
-    writer = nil
-    wait_status = nil
-    options = {}
-    options[:chdir] = BUILD_WORKDIR if BUILD_WORKDIR && !BUILD_WORKDIR.empty?
+  def worker_status(build)
+    path = worker_status_path(build)
+    current = File.exist?(path) ? Build.from_h(JSON.parse(File.read(path))) : build
 
-    begin
-      spawn_args = options.empty? ? build.argv : [*build.argv, options]
-      # Match the basic ANSI support of the web log viewer.
-      reader, writer, pid = PTY.spawn({'TERM' => 'xterm'}, *spawn_args)
-      writer.sync = true
-      @mutex.synchronize do
-        build.pid = pid
-        build.stdin = writer
-      end
+    # Older workers may have missed the host announcement before an ANSI-parser fix.
+    current.build_host ||= build.build_host
+    unless current.build_host
+      log, = read_log(current.log_path, 0, 65_536)
+      current.build_host = log.gsub(ANSI_PATTERN, '').match(HOST_PATTERN)&.[](1)
+    end
+    current
+  end
 
-      begin
-        loop do
-          chunk = reader.readpartial(4096)
-          append_log(build, chunk)
-          observe_prompt(build, chunk)
+  def refresh_workers_locked(check_units: false)
+    changed = false
+    removed = []
+    @builds.values.select { |build| build.unit_name && (build.active? || build.discard_after_finish) }.each do |build|
+      before = build.to_h
+      current = worker_status(build)
+      if check_units && current.active? && !@service.active?(current)
+        # The worker can finish between reading its status and querying systemd.
+        current = worker_status(current)
+        if current.active?
+          current.status = 'interrupted'
+          current.finished_at ||= Time.now.utc
+          current.note = 'build worker exited without recording a result'
         end
-      rescue EOFError, Errno::EIO
-        nil
       end
-
-      _, wait_status = Process.wait2(pid)
-    rescue StandardError => e
-      append_log(build, "\n#{APP_NAME}: #{e.class}: #{e.message}\n")
-      finish_build(build, 'failed', exit_status: nil, note: e.message)
-      return
-    ensure
-      reader&.close unless reader&.closed?
-      writer&.close unless writer&.closed?
-      @mutex.synchronize do
-        build.pid = nil
-        build.stdin = nil
-      end
-    end
-
-    exit_code = wait_status.exitstatus || (wait_status.termsig ? 128 + wait_status.termsig : nil)
-    append_log(build, "\nfinished: #{Time.now.utc.iso8601} exit=#{exit_code || 'unknown'}\n")
-    finish_build(build, wait_status.success? ? 'succeeded' : 'failed', exit_status: exit_code)
-  end
-
-  def append_log(build, chunk)
-    FileUtils.mkdir_p(File.dirname(build.log_path))
-    File.open(build.log_path, 'ab') { |file| file.write(chunk) }
-  end
-
-  def observe_prompt(build, chunk)
-    @mutex.synchronize do
-      changed = false
-      tail = build.prompt_tail + chunk.to_s
-      build.prompt_tail = tail.bytesize > 512 ? tail.byteslice(tail.bytesize - 512, 512) : tail
-      clean_tail = build.prompt_tail.gsub(ANSI_PATTERN, '')
-      if !build.build_host && (match = clean_tail.match(HOST_PATTERN))
-        build.build_host = match[1]
-        changed = true
-      end
-
-      if !build.upload_prompt_seen && clean_tail.match?(PROMPT_PATTERN)
-        build.upload_prompt_seen = true
-        build.status = 'waiting_upload'
-        changed = true
-      end
-
-      persist_locked if changed
-    end
-  end
-
-  def set_status(build, status, started_at: nil)
-    @mutex.synchronize do
-      build.status = status
-      build.started_at = started_at if started_at
-      persist_locked
-    end
-  end
-
-  def finish_build(build, status, exit_status:, note: nil)
-    remove_log = false
-    @mutex.synchronize do
-      if build.discard_after_finish
+      if current.terminal? && current.discard_after_finish
         @builds.delete(build.id)
-        persist_locked
-        remove_log = true
-      else
-        status = 'interrupted' if build.status == 'interrupted'
-        build.status = status
-        build.exit_status = exit_status
-        build.finished_at = Time.now.utc
-        build.note = note if note
-        prune_history_locked
-        persist_locked
+        changed = true
+        removed << current
+      elsif current.to_h != before
+        @builds[build.id] = current
+        changed = true
       end
     end
-    FileUtils.rm_f(build.log_path) if remove_log
+    persist_locked if changed
+    removed.each { |build| remove_build_files(build) }
+  end
+
+  def remove_build_files(build)
+    FileUtils.rm_f(build.log_path)
+    FileUtils.rm_rf(worker_directory(build)) if build.unit_name
   end
 end
 
@@ -586,7 +748,7 @@ class WebApp
   end
 
   def create_build(req, res)
-    @manager.enqueue(req.query['command'])
+    @manager.enqueue(req.query['command'], target_builder: req.query['target_builder'])
     redirect(res, '/')
   end
 
@@ -631,7 +793,7 @@ class WebApp
     end
 
     @manager.answer_upload(id, upload: false) if build.status == 'waiting_upload'
-    @manager.enqueue(build.command_line, ignore_active_id: id)
+    @manager.enqueue(build.command_line, target_builder: build.target_builder, ignore_active_id: id)
     redirect(res, '/')
   end
 
@@ -786,8 +948,16 @@ class WebApp
               index = stop === st ? stop + 2 : stop + 1;
               continue;
             } else {
-              if (start + 1 >= text.length) { ansiTail = text.slice(start); break; }
-              index = start + 2;
+              // Other escapes can include intermediate bytes, as in ESC ( B.
+              let finalAt = start + 1;
+              while (finalAt < text.length) {
+                const code = text.charCodeAt(finalAt);
+                if (code < 0x20 || code > 0x2f) break;
+                finalAt++;
+              }
+              if (finalAt >= text.length) { ansiTail = text.slice(start); break; }
+              const code = text.charCodeAt(finalAt);
+              index = code >= 0x30 && code <= 0x7e ? finalAt + 1 : finalAt;
               continue;
             }
 
@@ -836,7 +1006,7 @@ class WebApp
         });
 
         const events = new EventSource(`/builds/${encodeURIComponent(buildId)}/events?offset=${offset}`);
-        events.addEventListener('log', (event) => appendLog(event.data + "\\n"));
+        events.addEventListener('log', (event) => appendLog(JSON.parse(event.data)));
         events.addEventListener('status', (event) => {
           const data = JSON.parse(event.data);
           statusEl.textContent = data.status.replace(/_/g, ' ');
@@ -871,11 +1041,13 @@ class WebApp
     res['Cache-Control'] = 'no-cache'
     res.chunked = true
     res.body = proc do |out|
-      offset = req.query['offset'].to_i
+      offset = (req['last-event-id'] || req.query['offset']).to_i
       last_status = nil
       loop do
+        break if @manager.shutting_down?
+
         log, offset = read_log(build.log_path, offset)
-        sse(out, 'log', utf8(log)) unless log.empty?
+        sse(out, 'log', JSON.generate(utf8(log)), id: offset) unless log.empty?
 
         current = @manager.find(id)
         break unless current
@@ -933,6 +1105,7 @@ class WebApp
     recent_empty = search.empty? ? 'Completed builds will appear here.' : 'No matching completed builds.'
     pending = @manager.refresh_pending
     notice = req.query['notice']
+    builder_hint = BUILDER_USER.empty? ? 'host or user@host' : "host (defaults to #{BUILDER_USER}@host) or user@host"
 
     layout('dashboard', <<~HTML)
       <section class="box mb-3">
@@ -946,15 +1119,18 @@ class WebApp
       <section class="box mb-3">
         <form action="/builds" method="post">
           <label class="label" for="command">Start a build</label>
-          <div class="field has-addons">
+          <div class="field has-addons build-inputs">
             <div class="control is-expanded">
               <input class="input" id="command" name="command" type="text" autofocus placeholder="pkgbase[:nocheck]" autocomplete="off" pattern="[A-Za-z0-9][A-Za-z0-9@._+\-]*(:nocheck)?">
+            </div>
+            <div class="control target-builder">
+              <input class="input" id="target-builder" name="target_builder" type="text" aria-label="Target builder (optional)" placeholder="Builder (optional)" title="#{h(builder_hint)}" autocomplete="off" spellcheck="false">
             </div>
             <div class="control">
               <button class="button is-primary" type="submit">Start build</button>
             </div>
           </div>
-          <p class="help">Examples: <span class="is-family-monospace">openssl</span>, <span class="is-family-monospace">rust:nocheck</span></p>
+          <p class="help">Examples: <span class="is-family-monospace">openssl</span>, <span class="is-family-monospace">rust:nocheck</span>. Leave builder blank for automatic selection.</p>
         </form>
       </section>
 
@@ -1131,7 +1307,8 @@ class WebApp
     %(<div class="notification #{bulma_type} py-2 px-3 mb-3">#{h(message)}</div>)
   end
 
-  def sse(out, event, data)
+  def sse(out, event, data, id: nil)
+    out.write("id: #{id}\n") if id
     out.write("event: #{event}\n")
     text = data.to_s
     if text.empty?
@@ -1181,6 +1358,8 @@ class WebApp
           .build-title, .build-toolbar, form.inline { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; min-width: 0; }
           .build-title h1, .build-title h3, .command { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
           .command { margin: .25rem 0 .45rem; color: #697267; font-size: .82rem; }
+          .build-inputs .control.is-expanded { min-width: 0; }
+          .target-builder { width: clamp(6rem, 25vw, 13rem); }
           .pending-tag { gap: .35rem; height: auto; padding: .35rem .55rem; }
           .delete-build { position: absolute; right: .7rem; top: .7rem; margin: 0; }
           form.inline, .buttons form { margin-bottom: 0; }
@@ -1201,30 +1380,38 @@ class WebApp
   end
 end
 
-manager = BuildManager.new
-manager.start
+if $PROGRAM_NAME == __FILE__
+  if ARGV.first == '--worker'
+    abort "usage: #{APP_NAME} --worker DIRECTORY" unless ARGV.size == 2
 
-server = WEBrick::HTTPServer.new(
-  BindAddress: BIND,
-  Port: PORT,
-  ServerSoftware: APP_NAME,
-  AccessLog: [],
-  Logger: WEBrick::Log.new($stderr, ENV['ARCHRISCV_BUILDD_DEBUG'] ? WEBrick::Log::DEBUG : WEBrick::Log::INFO)
-)
+    exit BuildWorker.new(ARGV[1]).run
+  end
 
-app = WebApp.new(manager)
-server.mount_proc('/') { |req, res| app.call(req, res) }
+  manager = BuildManager.new
+  manager.start
 
-signal_reader, signal_writer = IO.pipe
-Thread.new do
-  signal_reader.read(1)
-  manager.shutdown
-  server.shutdown
+  server = WEBrick::HTTPServer.new(
+    BindAddress: BIND,
+    Port: PORT,
+    ServerSoftware: APP_NAME,
+    AccessLog: [],
+    Logger: WEBrick::Log.new($stderr, ENV['ARCHRISCV_BUILDD_DEBUG'] ? WEBrick::Log::DEBUG : WEBrick::Log::INFO)
+  )
+
+  app = WebApp.new(manager)
+  server.mount_proc('/') { |req, res| app.call(req, res) }
+
+  signal_reader, signal_writer = IO.pipe
+  Thread.new do
+    signal_reader.read(1)
+    manager.shutdown
+    server.shutdown
+  end
+
+  %w[INT TERM].each do |signal|
+    trap(signal) { signal_writer.write_nonblock('.') rescue nil }
+  end
+
+  warn "#{APP_NAME}: listening on http://#{BIND}:#{PORT}"
+  server.start
 end
-
-%w[INT TERM].each do |signal|
-  trap(signal) { signal_writer.write_nonblock('.') rescue nil }
-end
-
-warn "#{APP_NAME}: listening on http://#{BIND}:#{PORT}"
-server.start
