@@ -1058,28 +1058,21 @@ class WebApp
     host_text = build.build_host.to_s
 
     html(res, layout("log #{build.id}", <<~HTML))
-      <section class="box mb-3">
-        <div class="level mb-2">
-          <div class="level-left">
-            <div>
-              <div class="build-title mb-1">
-                #{status_tag(build.status)}
-                <h1 class="title is-4 mb-0">#{h(build.pkgbase || build.command_line.sub(/:nocheck\z/, ''))}</h1>
-                #{nocheck_tag(build.command_line)}
-                <span id="build-host" class="tag is-light"#{builder_title(build.build_host)}#{host_style}>#{h(host_text)}</span>
-              </div>
-            </div>
+      <section class="box log-heading">
+        <div class="section-heading">
+          <div class="build-title">
+            <h1 class="title is-4 mb-0">#{h(build.pkgbase || build.command_line.sub(/:nocheck\z/, ''))}</h1>
+            #{nocheck_tag(build.command_line)}
           </div>
-          <div class="level-right">
-            <div class="buttons are-small mb-0">
-              <a class="button is-light" href="../../">Dashboard</a>
-              <a class="button is-light" href="raw">Raw log</a>
-              #{retry_button(build) unless build.status == 'waiting_upload'}
-              #{stop_button(build)}
-            </div>
+          <div class="build-actions">
+            <a class="button is-light" href="../../">Dashboard</a>
+            <a class="button is-light" href="raw">Raw log</a>
+            #{retry_button(build) unless build.status == 'waiting_upload'}
+            #{stop_button(build)}
           </div>
         </div>
         <div class="build-toolbar is-size-7 has-text-grey">
+          <span id="build-host" class="tag is-light"#{builder_title(build.build_host)}#{host_style}>#{h(host_text)}</span>
           <span>started #{h(fmt_time(build.started_at))}</span>
           <span>duration <span id="duration">#{h(duration(build))}</span></span>
         </div>
@@ -1254,10 +1247,10 @@ class WebApp
     notice = req.query['notice']
 
     layout('dashboard', <<~HTML)
-      <section class="box mb-3">
-        <h1 class="title is-3 mb-1">#{APP_TITLE}</h1>
-        <p class="subtitle is-6">Experimental</p>
-      </section>
+      <header class="masthead">
+        <h1>#{APP_TITLE}</h1>
+        <span class="experimental">Experimental</span>
+      </header>
 
       #{flash('error', error) if error}
       #{flash('notice', notice) if notice}
@@ -1265,48 +1258,45 @@ class WebApp
       #{start_build_form unless @read_only}
       #{refresh_panel(pending) unless @read_only}
 
-      <section class="columns">
-        <div class="column">
-          <div class="box p-3">
-            <div class="level is-mobile mb-2">
-              <h2 class="title is-5 mb-0">Running builds</h2>
-              <span class="tag is-light">#{active.size}</span>
+      <div class="build-columns">
+        <div>
+          <section class="build-section">
+            <div class="section-heading">
+              <h2>Running builds <span class="section-count">#{active.size}</span></h2>
             </div>
-            #{active.empty? ? empty_state('No builds are running.') : active.map { |build| build_card(build) }.join}
-          </div>
+            <div class="build-list">
+              #{active.empty? ? empty_state('No builds are running.') : active.map { |build| build_card(build) }.join}
+            </div>
+          </section>
           #{deferred_panel(@manager.deferred_retries)}
         </div>
 
-        <div class="column">
-          <div class="box p-3">
-            <div class="level mb-2">
-              <div class="level-left">
-                <h2 class="title is-5 mb-0">Recent builds</h2>
-                <span class="tag is-light ml-2">#{recent.size}</span>
-              </div>
-              <div class="level-right">#{pagination}</div>
-            </div>
-            <form class="field has-addons mb-2" action="#{h(dashboard_path)}" method="get">
+        <section class="build-section recent-builds">
+          <div class="section-heading">
+            <h2>Recent builds <span class="section-count">#{recent.size}</span></h2>
+            <form class="field has-addons history-search" action="#{h(dashboard_path)}" method="get">
               <div class="control is-expanded">
-                <input class="input is-small" name="q" type="search" value="#{h(search)}" placeholder="Search recent builds">
+                <input class="input is-small" name="q" type="search" value="#{h(search)}" aria-label="Search recent builds" placeholder="Search recent builds">
               </div>
               <div class="control"><button class="button is-small is-light" type="submit">Search</button></div>
               #{%(<div class="control"><a class="button is-small is-light" href="#{h(dashboard_path)}">Clear</a></div>) unless search.empty?}
             </form>
-            #{recent_page.empty? ? empty_state(recent_empty) : recent_page.map { |build| build_card(build) }.join}
-            #{pagination}
           </div>
-        </div>
-      </section>
+          <div class="build-list">
+            #{recent_page.empty? ? empty_state(recent_empty) : recent_page.map { |build| build_card(build) }.join}
+          </div>
+          #{%(<div class="history-pagination">#{pagination}</div>) unless pagination.empty?}
+        </section>
+      </div>
     HTML
   end
 
   def start_build_form
     builder_hint = BUILDER_USER.empty? ? 'host or user@host' : "host (defaults to #{BUILDER_USER}@host) or user@host"
     <<~HTML
-      <section class="box mb-3">
+      <section class="box start-panel">
         <form action="/builds" method="post">
-          <label class="label" for="command">Start a build</label>
+          <label class="label panel-label" for="command">Start a build</label>
           <div class="field has-addons build-inputs">
             <div class="control is-expanded">
               <input class="input" id="command" name="command" type="text" autofocus placeholder="pkgbase[:nocheck]" autocomplete="off" pattern="[A-Za-z0-9][A-Za-z0-9@._+\-]*(:nocheck)?">
@@ -1318,7 +1308,7 @@ class WebApp
               <button class="button is-primary" type="submit">Start build</button>
             </div>
           </div>
-          <p class="help">Examples: <span class="is-family-monospace">openssl</span>, <span class="is-family-monospace">rust:nocheck</span>. Leave builder blank for automatic selection.</p>
+          <p class="help">Use <span class="is-family-monospace">:nocheck</span> to skip checks. Leave builder blank for automatic selection.</p>
         </form>
       </section>
     HTML
@@ -1333,25 +1323,27 @@ class WebApp
     end
 
     <<~HTML
-      <article class="box build-card #{h(build.status)} p-3 mb-2">
+      <article class="build-card #{h(build.status)}">
         #{delete_button(build)}
-        <div class="build-head mb-2">
-          <div class="build-title">
+        <div class="build-title">
+          <h3><a href="#{h(dashboard_path("builds/#{build.id}/log"))}">#{h(build.pkgbase || build.command_line.sub(/:nocheck\z/, ''))}</a></h3>
+          #{nocheck_tag(build.command_line)}
+        </div>
+        <div class="build-details">
+          <div class="build-meta">
             #{status_tag(build.status)}
-            <h3 class="title is-6 mb-0">#{h(build.pkgbase || build.command_line.sub(/:nocheck\z/, ''))}</h3>
-            #{nocheck_tag(build.command_line)}
             #{%(<span class="tag is-light"#{builder_title(host)}>#{h(host)}</span>) if host}
+            <span class="build-duration">#{h(duration(build))}#{%( <span class="exit-status">exit #{h(build.exit_status)}</span>) if build.exit_status && build.exit_status != 0}</span>
           </div>
-          <span class="is-size-7 has-text-grey">#{h(duration(build))}#{%( - exit #{h(build.exit_status)}) if build.exit_status}</span>
+          <div class="build-actions">
+            <a class="log-link" href="#{h(dashboard_path("builds/#{build.id}/log"))}">Log</a>
+            <a class="raw-link" href="#{h(dashboard_path("builds/#{build.id}/raw"))}">Raw</a>
+            #{stop_button(build)}
+            #{retry_button(build) unless build.status == 'waiting_upload'}
+          </div>
         </div>
-        #{decision_panel(build)}
         #{%(<p class="help is-danger mb-1">#{h(build.note)}</p>) if build.note}
-        <div class="buttons are-small mb-0">
-          <a class="button is-small" href="#{h(dashboard_path("builds/#{build.id}/log"))}">Log</a>
-          <a class="button is-small is-light" href="#{h(dashboard_path("builds/#{build.id}/raw"))}">Raw</a>
-          #{stop_button(build)}
-          #{retry_button(build) unless build.status == 'waiting_upload'}
-        </div>
+        #{decision_panel(build)}
       </article>
     HTML
   end
@@ -1383,7 +1375,7 @@ class WebApp
     end.join
 
     pending_form = if pending.empty?
-                     %(<p class="has-text-grey is-size-7 mb-0">No pending packages from #{h(REFRESH_COMMAND)}.</p>)
+                     %(<p class="has-text-grey is-size-7 mb-0">No pending packages.</p>)
                    elsif @read_only
                      %(<div class="tags mb-2">#{pending_tags}</div>)
                    else
@@ -1410,11 +1402,10 @@ class WebApp
     HTML
 
     <<~HTML
-      <section class="box mb-3">
-        <div class="level is-mobile refresh-head mb-2">
+      <section class="box refresh-panel">
+        <div class="section-heading refresh-head">
           <div>
-            <h2 class="title is-5 mb-0">Pending refresh</h2>
-            #{%(<p class="help">Run <span class="is-family-monospace">#{h(REFRESH_COMMAND)}</span>; confirm before adding builds.</p>) unless @read_only}
+            <h2>Pending refresh <span class="section-count">#{pending.size}</span></h2>
           </div>
           #{refresh_form}
         </div>
@@ -1449,7 +1440,7 @@ class WebApp
         </form>
       HTML
       <<~HTML
-        <div class="build-head mb-2">
+        <div class="build-head deferred-row">
           <p class="is-size-7 mb-0">
             <strong class="is-family-monospace">#{h(build['pkgbase'] || build['command_line'].sub(/:nocheck\z/, ''))}</strong>
             #{nocheck_tag(build['command_line'])}
@@ -1461,9 +1452,9 @@ class WebApp
     end.join
 
     <<~HTML
-      <section class="box mb-3">
-        <h2 class="title is-5 mb-2">Deferred builds <span class="tag is-light">#{entries.size}</span></h2>
-        #{cards}
+      <section class="build-section deferred-section">
+        <div class="section-heading"><h2>Deferred builds <span class="section-count">#{entries.size}</span></h2></div>
+        <div class="build-list">#{cards}</div>
       </section>
     HTML
   end
@@ -1497,31 +1488,29 @@ class WebApp
     style = build.status == 'waiting_upload' ? '' : ' style="display:none"'
 
     if @read_only
-      return %(<div#{id_attr} class="notification is-warning is-light is-size-7 py-2 px-3 mb-2"#{style}>Waiting for an upload decision.</div>)
+      return %(<div#{id_attr} class="decision-notice"#{style}>Waiting for an upload decision.</div>)
     end
 
     <<~HTML
-      <div#{id_attr} class="notification is-warning is-light py-2 px-3 mb-2"#{style}>
-        <div class="build-head">
-          <p class="mb-0"><strong>Upload log?</strong> Paused at <span class="is-family-monospace">Upload log? [y/N]</span>.</p>
-          <div class="buttons are-small mb-0">
-            <form class="inline" action="/builds/#{h(build.id)}/upload" method="post">
-              <button class="button is-small is-warning" name="decision" value="yes" type="submit">Upload</button>
-              <button class="button is-small is-light" name="decision" value="no" type="submit">Skip</button>
-            </form>
-            #{retry_button(build, waiting_upload: true)}
-            <form class="inline defer-form" action="/builds/#{h(build.id)}/defer" method="post">
-              <input class="input is-small defer-package" name="wait_for" type="text" required aria-label="Package to wait for" placeholder="Wait for package" title="Retry after this package base next builds successfully" autocomplete="off" spellcheck="false">
-              <button class="button is-small is-warning" type="submit" title="Skip this log upload and retry after the named package builds successfully">Defer</button>
-            </form>
-          </div>
+      <div#{id_attr} class="decision-panel"#{style}>
+        <p class="decision-label">Upload log?</p>
+        <div class="decision-actions">
+          <form class="inline" action="/builds/#{h(build.id)}/upload" method="post">
+            <button class="button is-small is-warning" name="decision" value="yes" type="submit">Upload</button>
+            <button class="button is-small is-light" name="decision" value="no" type="submit">Skip</button>
+          </form>
+          #{retry_button(build, waiting_upload: true)}
+          <form class="inline defer-form" action="/builds/#{h(build.id)}/defer" method="post">
+            <input class="input is-small defer-package" name="wait_for" type="text" required aria-label="Package to wait for" placeholder="Wait for package" title="Retry after this package base next builds successfully" autocomplete="off" spellcheck="false">
+            <button class="button is-small is-warning" type="submit" title="Skip this log upload and retry after the named package builds successfully">Defer</button>
+          </form>
         </div>
       </div>
     HTML
   end
 
   def empty_state(message)
-    %(<p class="has-text-grey is-size-7 mb-0">#{h(message)}</p>)
+    %(<p class="empty-state">#{h(message)}</p>)
   end
 
   def flash(type, message)
@@ -1560,38 +1549,131 @@ class WebApp
   def layout(title, body)
     <<~HTML
       <!doctype html>
-      <html lang="en">
+      <html lang="en" data-theme="light">
       <head>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <title>#{h(title)} - #{APP_NAME}</title>
         <link rel="stylesheet" href="https://cdnjs.snrat.com/ajax/libs/bulma/1.0.3/css/bulma.min.css" integrity="sha384-DtLgkgZWuBalGogBkye1PTBvXKCD/hnA8vHqpqfcGCf/FOa1heAyeHExO8JNtVM/" crossorigin="anonymous">
         <style>
-          :root { --red: #a93c2f; --amber: #b86b19; --blue: #2d5d88; --moss: #315c45; }
-          body { background: #f6f1e5; color: #1e241d; }
-          main { width: min(1180px, calc(100% - 24px)); margin: 0 auto; padding: 1rem 0 2rem; }
-          .box, .notification { background-color: rgba(255, 252, 242, 0.94); }
-          .build-card { border-left: 5px solid #d8cdb7; position: relative; padding-right: 2.5rem !important; }
-          .build-card.running { border-left-color: var(--blue); }
-          .build-card.waiting_upload { border-left-color: var(--amber); }
-          .build-card.failed, .build-card.interrupted { border-left-color: var(--red); }
-          .build-card.succeeded { border-left-color: var(--moss); }
-          .build-head { display: flex; justify-content: space-between; gap: .5rem; align-items: center; }
-          .build-title, .build-toolbar, form.inline { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; min-width: 0; }
-          .build-title h1, .build-title h3 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-          .build-inputs .control.is-expanded { min-width: 0; }
+          :root {
+            --ink: #26372f; --muted: #72776e; --line: #dedfd4; --paper: #fffef9;
+            --red: #a14538; --amber: #93621c; --blue: #386681; --moss: #355f47;
+            --bulma-family-primary: "Fira Sans", "Source Sans 3", "Trebuchet MS", sans-serif;
+            --bulma-family-code: "Fira Mono", "DejaVu Sans Mono", monospace;
+            --bulma-text: var(--ink); --bulma-strong-color: var(--ink);
+            --bulma-link-text: var(--blue); --bulma-body-color: var(--ink);
+          }
+          body { min-height: 100vh; background: radial-gradient(ellipse at top left, #e7ecdf80, transparent 60%), #f5f3eb; color: var(--ink); font-family: var(--bulma-family-primary); font-size: 14px; }
+          main { width: min(1440px, calc(100% - 64px)); margin: 0 auto; padding: 2rem 0 3rem; }
+          a { color: var(--blue); }
+          a:hover { color: var(--moss); }
+          a:focus-visible, button:focus-visible, input:focus-visible { outline: 2px solid var(--blue); outline-offset: 3px; }
+          .masthead { display: flex; flex-wrap: wrap; align-items: center; gap: .65rem 1rem; border-bottom: 2px solid var(--ink); padding: 0 0 1.25rem; margin-bottom: 1.5rem; }
+          .masthead h1 { font-size: clamp(1.3rem, 2.3vw, 1.8rem); font-weight: 600; letter-spacing: -.035em; line-height: 1.2; }
+          .experimental { color: var(--muted); font-size: .65rem; font-weight: 500; letter-spacing: .1em; text-transform: uppercase; border: 1px solid #cdd1c4; border-radius: 4px; padding: .3rem .5rem; }
+          .box { padding: 1rem 1.25rem; background: var(--paper); border: 1px solid var(--line); border-radius: 8px; box-shadow: none; }
+          .start-panel, .refresh-panel { margin-bottom: 1rem !important; }
+          .panel-label, .section-heading h2 { color: var(--ink); font-size: .85rem; font-weight: 600; }
+          .section-heading { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: .5rem 1rem; min-height: 2rem; margin-bottom: .75rem; }
+          .section-heading h2 { display: flex; align-items: center; gap: .6rem; }
+          .section-count { font-size: .7rem; font-weight: 500; font-variant-numeric: tabular-nums; color: var(--muted); background: #e9ebe1; padding: .1rem .45rem; border-radius: 4px; }
+          .build-columns { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 1.75rem; margin-top: 1.75rem; align-items: start; }
+          .build-columns > *, .build-section { min-width: 0; }
+          .build-list { background: var(--paper); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+          .build-card { position: relative; padding: .95rem 1rem; border-bottom: 1px solid var(--line); }
+          .build-card:last-child { border-bottom: 0; }
+          .build-card::before { content: ""; position: absolute; left: 0; top: 1rem; bottom: 1rem; width: 2px; background: var(--line); }
+          .build-card.running::before { background: var(--blue); }
+          .build-card.waiting_upload::before { background: var(--amber); }
+          .build-card.failed::before, .build-card.interrupted::before { background: var(--red); }
+          .build-card.succeeded::before { background: var(--moss); }
+          .build-title, .build-toolbar, .build-meta, .build-actions, form.inline { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; min-width: 0; }
+          .build-card .build-title { margin-bottom: .55rem; padding-right: 1rem; gap: .4rem; }
+          .build-title h1, .build-title h3 { min-width: 0; overflow-wrap: anywhere; }
+          .build-title h3 { font-size: .96rem; font-weight: 600; line-height: 1.45; letter-spacing: -.01em; }
+          .build-title h3 a { color: var(--ink); }
+          .build-title h3 a:hover { text-decoration: underline; text-underline-offset: 3px; }
+          .build-details, .build-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: .5rem .75rem; align-items: center; }
+          .build-meta { gap: .35rem .5rem; }
+          .build-duration { color: var(--muted); font-size: .73rem; font-variant-numeric: tabular-nums; white-space: nowrap; }
+          .exit-status { margin-left: .4rem; color: var(--red); }
+          .tag { font-size: .72rem; font-weight: 500; height: 1.7em; border-radius: 4px; padding: 0 .45rem; }
+          .tag.is-light { color: #62695c; background: #eeefe7; }
+          .tag.is-info { color: var(--blue); background: #e6eef2; }
+          .tag.is-warning { color: var(--amber); background: #f6ecd5; }
+          .tag.is-danger { color: var(--red); background: #f6e8e2; }
+          .tag.is-success { color: var(--moss); background: #e6eee3; }
+          .build-meta .tag.is-light, #build-host { font-family: var(--bulma-family-code); overflow-wrap: anywhere; height: auto; min-height: 1.7em; }
+          .button, .input { font-family: inherit; font-size: .8rem; border-radius: 5px; box-shadow: none; }
+          .button { font-weight: 500; border-color: var(--line); color: var(--ink); background: var(--paper); }
+          .button:hover { border-color: #a7ae9f; background: #eef0e7; color: var(--ink); }
+          .button.is-small, .buttons.are-small .button { font-size: .72rem; }
+          .button.is-primary { color: #fffef9; background: var(--moss); border-color: var(--moss); }
+          .button.is-primary:hover { background: #264d37; }
+          .button.is-light, .button.is-static { color: #5d685b; background: #f0f1e9; border-color: transparent; }
+          .button.is-warning { color: #78501c; background: #f3e6c8; border-color: #e7d6b2; }
+          .button.is-danger { color: var(--red); background: #fbf3ef; border-color: #ebd9d1; }
+          .button.is-danger:hover { background: #f3e3dc; border-color: #d3afa2; }
+          .build-actions { gap: .65rem; margin-left: auto; font-size: .73rem; }
+          .build-actions .button { height: 1.85rem; padding: 0 .6rem; font-size: .72rem; }
+          .build-actions a:not(.button) { padding: .2rem 0; text-underline-offset: 3px; }
+          .build-actions a:not(.button):hover { text-decoration: underline; }
+          .raw-link { color: var(--muted); }
+          .input { background: #fffefb; border-color: #d9dccf; color: var(--ink); }
+          .input::placeholder { color: #848a7d; }
+          .input:focus { border-color: var(--moss); box-shadow: 0 0 0 2px #355f4714; }
+          .input.is-small { font-size: .75rem; }
+          .help, .has-text-grey { color: var(--muted) !important; }
+          .help { font-size: .7rem; }
+          .help.is-danger { color: var(--red) !important; overflow-wrap: anywhere; }
+          .build-inputs { margin-bottom: .5rem !important; }
+          .build-inputs .control.is-expanded, .history-search .control.is-expanded { min-width: 0; }
           .target-builder { width: clamp(6rem, 25vw, 13rem); }
-          .level.refresh-head { flex-wrap: wrap; gap: .75rem; }
           .extra-safe-deps { width: clamp(10rem, 25vw, 16rem); }
-          .defer-package { width: 11rem; max-width: 100%; }
-          .pending-tag { gap: .35rem; height: auto; padding: .35rem .55rem; }
-          .delete-build { position: absolute; right: .7rem; top: .7rem; margin: 0; }
+          .pending-tag { gap: .4rem; height: auto; padding: .35rem .55rem; cursor: pointer; border: 1px solid var(--line); }
+          input[type=checkbox] { accent-color: var(--moss); }
+          .checkbox { color: #656d5f; white-space: nowrap; }
+          .history-search { flex: 1 1 10rem; max-width: 17rem; margin: 0 !important; }
+          .history-pagination { display: flex; justify-content: flex-end; margin-top: .75rem; }
+          .delete-build { position: absolute; right: .7rem; top: .9rem; margin: 0; }
+          .delete-build .delete { background: #959c8d; opacity: .45; }
+          .delete-build .delete:hover, .delete-build .delete:focus-visible { opacity: 1; background: var(--red); }
           form.inline, .buttons form { margin-bottom: 0; }
-          pre#log { min-height: 62vh; padding: 1rem; border-radius: 12px; color: #eaf5dc; background: #172018; white-space: pre-wrap; word-break: break-word; }
-          .top-link, .end-link { position: fixed; right: 1.25rem; z-index: 20; box-shadow: 0 .35rem 1rem rgba(0, 0, 0, .2); font-weight: 700; }
+          .decision-panel { margin-top: .75rem; padding: .65rem .75rem; border: 1px solid #ece0c3; border-radius: 5px; background: #faf5e8; }
+          .decision-label { font-size: .72rem; font-weight: 600; color: #785c2e; margin-bottom: .5rem; }
+          .decision-actions { display: flex; flex-wrap: wrap; align-items: center; gap: .65rem 1rem; }
+          .decision-actions .button { height: 1.85rem; }
+          .decision-actions form.inline { gap: .4rem; }
+          .defer-form { flex: 1 1 14rem; }
+          .defer-package { flex: 1; width: 9rem; min-width: 0; }
+          .decision-notice { margin-top: .6rem; font-size: .72rem; color: var(--amber); }
+          .deferred-section { margin-top: 1.5rem; }
+          .deferred-row { padding: .8rem 1rem; border-bottom: 1px solid var(--line); }
+          .deferred-row:last-child { border-bottom: 0; }
+          .deferred-row p { flex: 1; min-width: 0; overflow-wrap: anywhere; color: var(--muted); }
+          .empty-state { color: var(--muted); font-size: .8rem; padding: 1.5rem 1rem; }
+          .log-heading { margin-bottom: 1rem; }
+          .log-panel { margin-top: 1rem; }
+          pre#log { min-height: 62vh; padding: 1rem; border-radius: 5px; color: #eaf5dc; background: #172018; white-space: pre-wrap; word-break: break-word; font-family: var(--bulma-family-code); }
+          .top-link, .end-link { position: fixed; right: 1.25rem; z-index: 20; box-shadow: 0 .2rem .75rem #17201820; font-weight: 600; }
           .top-link { bottom: 4.5rem; }
           .end-link { bottom: 1.25rem; }
-          @media (max-width: 820px) { .build-head { align-items: flex-start; flex-direction: column; } }
+          @media (max-width: 1000px) { .build-columns { grid-template-columns: minmax(0, 1fr); } }
+          @media (max-width: 540px) {
+            main { width: calc(100% - 24px); padding-top: 1.25rem; }
+            .masthead { padding-bottom: 1rem; margin-bottom: 1rem; }
+            .box { padding: .85rem; }
+            .build-columns { gap: 1.5rem; margin-top: 1.25rem; }
+            .build-card { padding: .85rem .75rem; }
+            .build-title h3 { font-size: .9rem; }
+            .build-inputs .input, .build-inputs .button { font-size: .73rem; padding-left: .5rem; padding-right: .5rem; }
+            .target-builder { width: 7rem; }
+            .refresh-head > form { width: 100%; }
+            .extra-safe-deps { flex: 1; width: auto; }
+            .build-actions { gap: .6rem; }
+            .log-heading .build-actions { margin-left: 0; }
+          }
         </style>
       </head>
       <body id="top">
