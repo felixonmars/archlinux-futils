@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 
-# Exercise the JavaScript emitted by the Ruby template using Node.js.
+# Exercise the renderer shared by the static viewer and live build logs.
 require 'minitest/autorun'
 require 'stringio'
 require 'tmpdir'
@@ -19,7 +19,7 @@ class AnsiLogTest < Minitest::Test
     res = WEBrick::HTTPResponse.new(WEBrick::Config::HTTP)
     @app.send(:show_log, nil, res, @build.id)
     script = res.body[/<script>(.*?)<\/script>/m, 1]
-    @parser = script[script.index('let ansiFg =')...script.index('function appendLog')]
+    @parser = File.read(File.expand_path('../archriscv-log.js', __dir__))
     @log_callback = script[/events\.addEventListener\('log', \(event\) => (.*?)\);/, 1]
   end
 
@@ -31,10 +31,9 @@ class AnsiLogTest < Minitest::Test
     program = @parser + <<~JS
       const cases = #{JSON.generate(cases)};
       const results = cases.map((chunks) => {
-        ansiFg = null;
-        ansiBold = false;
-        ansiTail = '';
-        return chunks.map(ansiToHTML).join('');
+        const terminal = new TerminalLog();
+        chunks.forEach(chunk => terminal.write(chunk));
+        return terminal.toHTML();
       });
       process.stdout.write(JSON.stringify(results));
     JS
@@ -46,7 +45,7 @@ class AnsiLogTest < Minitest::Test
   def test_charset_resets_leave_no_suffix_and_preserve_color
     input = "\e[1m\e[32m==>\e(B\e[m\e[1m Cloning tinymist ...\e(B\e[m\r\n"
     expected = '<span style="color:#9ece6a;font-weight:700">==&gt;</span>' \
-      "<span style=\"font-weight:700\"> Cloning tinymist ...</span>\r\n"
+      "<span style=\"font-weight:700\"> Cloning tinymist ...</span>\n"
     assert_equal [expected], render_cases([[input]])
     assert_equal "==> Cloning tinymist ...\r\n", input.gsub(ANSI_PATTERN, '')
   end
@@ -78,7 +77,7 @@ class AnsiLogTest < Minitest::Test
       "\e]3008;end=build\e\\"
     assert_equal "==> Building on houndour\r\n", input.gsub(ANSI_PATTERN, '')
     assert_equal 'houndour', input.gsub(ANSI_PATTERN, '').match(HOST_PATTERN)[1]
-    assert_equal ["==&gt; Building on houndour\r\n"], render_cases([[input]]).map { |html| html.gsub(/<[^>]*>/, '') }
+    assert_equal ["==&gt; Building on houndour\n"], render_cases([[input]]).map { |html| html.gsub(/<[^>]*>/, '') }
   end
 
   def test_live_log_transport_preserves_partial_escapes_and_newlines
@@ -90,22 +89,37 @@ class AnsiLogTest < Minitest::Test
       output.string.lines.filter_map { |line| line.delete_prefix('data: ').chomp if line.start_with?('data: ') }.join("\n")
     end
     program = @parser + <<~JS
-      const rendered = [];
+      const terminal = new TerminalLog();
       const received = [];
       function appendLog(text) {
         received.push(text);
-        rendered.push(ansiToHTML(text));
+        terminal.write(text);
       }
       for (const data of #{JSON.generate(encoded)}) {
         const event = {data};
         #{@log_callback};
       }
-      process.stdout.write(JSON.stringify({received, html: rendered.join('')}));
+      process.stdout.write(JSON.stringify({received, html: terminal.toHTML()}));
     JS
     output, errors, status = Open3.capture3('node', stdin_data: program)
     assert status.success?, errors
     result = JSON.parse(output)
     assert_equal chunks, result['received']
-    assert_equal "first second\r\nprogress\r42%\r\n\r\ntailB", result['html'].gsub(/<[^>]*>/, '')
+    assert_equal "first second\n42%gress\n\ntailB", result['html'].gsub(/<[^>]*>/, '')
+  end
+
+  def test_progress_updates_replace_lines_without_losing_other_output
+    input = "Cloning...\r\nResolving deltas: 0%\rResolving deltas: 50%\rResolving deltas: 100%, done.\r\n" \
+      "download: 10%\r\nkeep this line\r\n\e[2A\e[1G\e[2Kdownload: 100%\e[2B\r" \
+      "abcdef\b\bXY\r\e[3C\e[K\e[32mOK\e(B\e[m\r\n"
+    expected = "Cloning...\nResolving deltas: 100%, done.\ndownload: 100%\nkeep this line\nabcOK\n"
+    assert_equal [expected, expected], render_cases([[input], input.chars]).map { |html| html.gsub(/<[^>]*>/, '') }
+
+    File.write(@build.log_path, "0%\r100%\r\n</script>")
+    response = WEBrick::HTTPResponse.new(WEBrick::Config::HTTP)
+    @app.send(:show_log, nil, response, @build.id)
+    initial = response.body[/const initialLog = (.*);/, 1]
+    assert_equal File.read(@build.log_path), JSON.parse(initial)
+    refute_includes initial, '</script>'
   end
 end

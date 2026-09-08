@@ -842,6 +842,10 @@ class WebApp
     case [req.request_method, req.path]
     when ['GET', '/']
       html(res, render_index(req))
+    when ['GET', '/log-viewer.js']
+      res['Content-Type'] = 'text/javascript; charset=utf-8'
+      res['Cache-Control'] = 'no-cache'
+      res.body = File.read(File.join(__dir__, 'archriscv-log.js'))
     when ['POST', '/builds']
       create_build(req, res)
     when ['POST', '/refresh']
@@ -1010,11 +1014,12 @@ class WebApp
           #{status_tag(build.status, id: 'status')}
           <span class="is-size-7 has-text-grey">live log</span>
         </div>
-        <pre id="log" class="is-size-7">#{h(utf8(log))}</pre>
+        <pre id="log" class="is-size-7"></pre>
       </section>
       <a class="button is-medium is-warning top-link" href="#top" title="Back to top">&uarr; Top</a>
       <button id="end-link" class="button is-medium is-info end-link" type="button" title="Back to end">&darr; End</button>
 
+      <script src="/log-viewer.js?v=1"></script>
       <script>
         const buildId = #{JSON.generate(build.id)};
         const statusEl = document.querySelector('#status');
@@ -1025,15 +1030,7 @@ class WebApp
         const endLink = document.querySelector('#end-link');
         let offset = #{offset};
 
-        let ansiFg = null;
-        let ansiBold = false;
-        let ansiTail = '';
-        const ansiColors = {
-          30: '#667085', 31: '#ff6b6b', 32: '#9ece6a', 33: '#f9c74f',
-          34: '#7aa2f7', 35: '#bb9af7', 36: '#7dcfff', 37: '#d8dee9',
-          90: '#8992a3', 91: '#ff8b8b', 92: '#b9f27c', 93: '#ffd166',
-          94: '#9dbbff', 95: '#d2a8ff', 96: '#9be7ff', 97: '#ffffff'
-        };
+        const terminal = new TerminalLog(logEl);
 
         function statusClass(status) {
           if (status === 'running') return 'is-info';
@@ -1043,103 +1040,10 @@ class WebApp
           return 'is-light';
         }
 
-        function escapeHTML(value) {
-          return value.replace(/[&<>"']/g, (char) => ({
-            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-          }[char]));
-        }
-
-        function styledText(text) {
-          if (!text) return '';
-          const escaped = escapeHTML(text.replace(/\x0f/g, ''));
-          const style = [ansiFg ? `color:${ansiFg}` : '', ansiBold ? 'font-weight:700' : ''].filter(Boolean).join(';');
-          return style ? `<span style="${style}">${escaped}</span>` : escaped;
-        }
-
-        function applyAnsi(params) {
-          if (params.length === 0) params = [0];
-          for (let i = 0; i < params.length; i++) {
-            const code = params[i];
-            if (code === 0) { ansiFg = null; ansiBold = false; }
-            else if (code === 1) ansiBold = true;
-            else if (code === 22) ansiBold = false;
-            else if (code === 39) ansiFg = null;
-            else if (ansiColors[code]) ansiFg = ansiColors[code];
-          }
-        }
-
-        function ansiToHTML(text) {
-          const ESC = String.fromCharCode(27);
-          const CSI = String.fromCharCode(155);
-          text = ansiTail + text;
-          ansiTail = '';
-          let html = '';
-          let index = 0;
-
-          while (index < text.length) {
-            const escAt = text.indexOf(ESC, index);
-            const csiAt = text.indexOf(CSI, index);
-            let start = -1;
-            if (escAt === -1) start = csiAt;
-            else if (csiAt === -1) start = escAt;
-            else start = Math.min(escAt, csiAt);
-
-            if (start === -1) {
-              html += styledText(text.slice(index));
-              break;
-            }
-
-            html += styledText(text.slice(index, start));
-
-            let paramsAt;
-            if (text[start] === CSI) {
-              paramsAt = start + 1;
-            } else if (text[start + 1] === '[') {
-              paramsAt = start + 2;
-            } else if (text[start + 1] === ']') {
-              const bel = text.indexOf(String.fromCharCode(7), start + 2);
-              const st = text.indexOf(ESC + String.fromCharCode(92), start + 2);
-              const stop = [bel, st].filter((pos) => pos !== -1).sort((a, b) => a - b)[0];
-              if (stop === undefined) { ansiTail = text.slice(start); break; }
-              index = stop === st ? stop + 2 : stop + 1;
-              continue;
-            } else {
-              // Other escapes can include intermediate bytes, as in ESC ( B.
-              let finalAt = start + 1;
-              while (finalAt < text.length) {
-                const code = text.charCodeAt(finalAt);
-                if (code < 0x20 || code > 0x2f) break;
-                finalAt++;
-              }
-              if (finalAt >= text.length) { ansiTail = text.slice(start); break; }
-              const code = text.charCodeAt(finalAt);
-              index = code >= 0x30 && code <= 0x7e ? finalAt + 1 : finalAt;
-              continue;
-            }
-
-            let finalAt = paramsAt;
-            while (finalAt < text.length) {
-              const code = text.charCodeAt(finalAt);
-              if (code >= 0x40 && code <= 0x7e) break;
-              finalAt++;
-            }
-            if (finalAt >= text.length) { ansiTail = text.slice(start); break; }
-
-            if (text[finalAt] === 'm') {
-              let rawParams = text.slice(paramsAt, finalAt);
-              if (rawParams[0] === '?') rawParams = rawParams.slice(1);
-              applyAnsi(rawParams.split(';').filter(Boolean).map((part) => parseInt(part, 10)));
-            }
-            index = finalAt + 1;
-          }
-
-          return html;
-        }
-
         function appendLog(text) {
           if (!text) return;
           const wasNearBottom = nearBottom();
-          logEl.insertAdjacentHTML('beforeend', ansiToHTML(text));
+          terminal.write(text);
           if (wasNearBottom) window.scrollTo(0, document.body.scrollHeight);
           updateEndLink();
         }
@@ -1152,7 +1056,8 @@ class WebApp
           endLink.style.display = nearBottom() ? 'none' : '';
         }
 
-        logEl.innerHTML = ansiToHTML(logEl.textContent);
+        const initialLog = #{JSON.generate(utf8(log)).gsub('<') { '\\u003c' }};
+        terminal.write(initialLog);
         requestAnimationFrame(() => window.scrollTo(0, document.body.scrollHeight));
         requestAnimationFrame(updateEndLink);
         window.addEventListener('scroll', updateEndLink, { passive: true });
