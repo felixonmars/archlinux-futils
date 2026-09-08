@@ -21,6 +21,7 @@ WORKER_DIR = File.expand_path(File.join(STATE_DIR, 'workers'))
 BUILD_COMMAND = ENV.fetch('ARCHRISCV_BUILDD_BUILD_COMMAND', 'riscvu')
 BUILDER_USER = ENV.fetch('ARCHRISCV_BUILDD_BUILDER_USER', '').strip
 BUILDER_CACHE_DIR = ENV.fetch('ARCHRISCV_BUILDD_BUILDER_CACHE_DIR', '/tmp/felixbuild-server-select')
+MEMORY_KILLER_LIST = File.join(Dir.home, 'projects/archriscv/packages/memory-killer.txt')
 REFRESH_COMMAND = ENV.fetch('ARCHRISCV_BUILDD_REFRESH_COMMAND', 'archrv-refresh')
 BUILD_WORKDIR = ENV['ARCHRISCV_BUILDD_WORKDIR']
 BIND = ENV.fetch('ARCHRISCV_BUILDD_BIND', '127.0.0.1')
@@ -581,6 +582,29 @@ class BuildManager
     raise ArgumentError, 'upload decision saved; the build worker has not acknowledged it yet'
   end
 
+  def mark_memory_killer(id)
+    @mutex.synchronize do
+      refresh_workers_locked
+      build = @builds[id] || raise(ArgumentError, 'unknown build')
+      raise ArgumentError, 'build is not waiting for an upload decision' unless build.status == 'waiting_upload'
+
+      FileUtils.mkdir_p(File.dirname(MEMORY_KILLER_LIST))
+      File.open(MEMORY_KILLER_LIST, 'a+') do |file|
+        file.flock(File::LOCK_EX)
+        contents = file.read
+        packages = contents.lines.map { |line| line.split('#', 2).first.to_s.strip }
+        unless packages.include?(build.pkgbase)
+          file.write("\n") unless contents.empty? || contents.end_with?("\n")
+          file.puts(build.pkgbase)
+        end
+      end
+      clear_builder_cache(build.pkgbase)
+      build.pkgbase
+    end
+  rescue SystemCallError => e
+    raise ArgumentError, e.message
+  end
+
   def defer_build(id, wait_for:)
     wait_for = wait_for.to_s.strip
     unless wait_for.match?(COMMAND_PATTERN) && !wait_for.end_with?(':nocheck')
@@ -959,6 +983,8 @@ class WebApp
       retry_build(req, res, Regexp.last_match(1))
     when %r{\A/builds/([^/]+)/defer\z}
       defer_build(req, res, Regexp.last_match(1))
+    when %r{\A/builds/([^/]+)/memory-killer\z}
+      mark_memory_killer(req, res, Regexp.last_match(1))
     when %r{\A/deferred/([^/]+)/cancel\z}
       cancel_deferred(req, res, Regexp.last_match(1))
     when %r{\A/builds/([^/]+)/stop\z}
@@ -1004,6 +1030,14 @@ class WebApp
 
     @manager.answer_upload(id, upload: req.query['decision'] == 'yes')
     redirect(res, '/')
+  end
+
+  def mark_memory_killer(req, res, id)
+    not_found(res) && return unless req.request_method == 'POST'
+
+    pkgbase = @manager.mark_memory_killer(id)
+    message = "#{pkgbase} added to the memory killer list (requires at least 32 GiB RAM for automatic selection)"
+    redirect(res, "/?notice=#{CGI.escape(message)}")
   end
 
   def retry_build(req, res, id)
@@ -1500,6 +1534,9 @@ class WebApp
             <button class="button is-small is-light" name="decision" value="no" type="submit">Skip</button>
           </form>
           #{retry_button(build, waiting_upload: true)}
+          <form class="inline" action="/builds/#{h(build.id)}/memory-killer" method="post">
+            <button class="button is-small is-light" type="submit" title="Add this package to the memory killer list for future automatic builder selection">Require 32G+ RAM</button>
+          </form>
           <form class="inline defer-form" action="/builds/#{h(build.id)}/defer" method="post">
             <input class="input is-small defer-package" name="wait_for" type="text" required aria-label="Package to wait for" placeholder="Wait for package" title="Retry after this package base next builds successfully" autocomplete="off" spellcheck="false">
             <button class="button is-small is-warning" type="submit" title="Skip this log upload and retry after the named package builds successfully">Defer</button>

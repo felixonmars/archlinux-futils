@@ -18,6 +18,8 @@ ENV['ARCHRISCV_BUILDD_WORKDIR'] = TEST_ROOT
 ENV['ARCHRISCV_TEST_ROOT'] = TEST_ROOT
 ENV.delete('SERVER')
 load File.expand_path('../archriscv-buildd', __dir__)
+Object.send(:remove_const, :MEMORY_KILLER_LIST)
+MEMORY_KILLER_LIST = File.join(TEST_ROOT, 'packages', 'memory-killer.txt')
 
 Minitest.after_run { FileUtils.remove_entry(TEST_ROOT) }
 
@@ -211,7 +213,7 @@ class BuildRestartTest < Minitest::Test
     assert_equal 200, request.call('HEAD', '/').status
 
     actions = %w[/builds /refresh /refresh/add /refresh/clear /deferred/later/cancel] +
-      %w[upload retry defer stop delete].map { |action| "/builds/waiting_upload/#{action}" }
+      %w[upload retry defer memory-killer stop delete].map { |action| "/builds/waiting_upload/#{action}" }
     actions.each { |path| assert_equal 403, request.call('POST', path).status }
     %w[PUT PATCH DELETE].each { |method| assert_equal 403, request.call(method, '/').status }
     assert_equal 403, request.call('GET', '/builds/running/stop').status
@@ -232,6 +234,77 @@ class BuildRestartTest < Minitest::Test
     assert_equal 400, response.status
     assert_includes response.body, 'refresh failed'
     assert_equal %w[candidate-one candidate-two], @manager.refresh_pending
+  end
+
+  def test_memory_killer_action_records_pkgbase_once_and_keeps_upload_pending
+    build = @manager.enqueue('prompt-memory:nocheck')
+    wait_for { @manager.find(build.id).status == 'waiting_upload' }
+    FileUtils.mkdir_p(BUILDER_CACHE_DIR)
+    cache = File.join(BUILDER_CACHE_DIR, 'prompt-memory-riscv64')
+    other_cache = File.join(BUILDER_CACHE_DIR, 'other-riscv64')
+    [cache, other_cache].each { |path| File.write(path, 'builder@small-host') }
+
+    response = post_request("/builds/#{build.id}/memory-killer")
+    assert_equal 303, response.status
+    assert_includes CGI.unescape(response['Location']), 'prompt-memory added to the memory killer list'
+    assert_equal "prompt-memory\n", File.read(MEMORY_KILLER_LIST)
+    refute File.exist?(cache)
+    assert_equal 'builder@small-host', File.read(other_cache)
+    current = @manager.find(build.id)
+    assert_equal 'waiting_upload', current.status
+    assert_nil current.upload_decision
+    refute File.exist?(File.join(WORKER_DIR, build.id, 'upload.json'))
+    assert_equal [build.id], @manager.all_builds.map(&:id)
+
+    restart
+    assert_equal 303, post_request("/builds/#{build.id}/memory-killer").status
+    assert_equal "prompt-memory\n", File.read(MEMORY_KILLER_LIST)
+    assert_equal 303, post_request("/builds/#{build.id}/retry").status
+    retried = @manager.all_builds.find { |entry| entry.id != build.id }
+    wait_for { @manager.find(retried.id).status == 'waiting_upload' }
+    assert_includes File.read(retried.log_path), 'builder-cache=false'
+  end
+
+  def test_memory_killer_action_preserves_comments_and_handles_missing_final_newline
+    build = @manager.enqueue('prompt-memory')
+    wait_for { @manager.find(build.id).status == 'waiting_upload' }
+    FileUtils.mkdir_p(File.dirname(MEMORY_KILLER_LIST))
+    File.write(MEMORY_KILLER_LIST, "# Existing packages\nother-package")
+    assert_equal 303, post_request("/builds/#{build.id}/memory-killer").status
+    assert_equal "# Existing packages\nother-package\nprompt-memory\n", File.read(MEMORY_KILLER_LIST)
+
+    contents = "# Existing packages\n  prompt-memory # already listed\n"
+    File.write(MEMORY_KILLER_LIST, contents)
+    assert_equal 303, post_request("/builds/#{build.id}/memory-killer").status
+    assert_equal contents, File.read(MEMORY_KILLER_LIST)
+  end
+
+  def test_memory_killer_action_rejects_nonwaiting_builds_unknown_ids_and_get_requests
+    build = @manager.enqueue('wait-memory')
+    wait_for { @manager.find(build.id).status == 'running' }
+    response = post_request("/builds/#{build.id}/memory-killer")
+    assert_equal 400, response.status
+    assert_includes response.body, 'build is not waiting for an upload decision'
+    assert_equal 400, post_request('/builds/missing/memory-killer').status
+
+    req = WEBrick::HTTPRequest.new(WEBrick::Config::HTTP)
+    req.parse(StringIO.new("GET /builds/#{build.id}/memory-killer HTTP/1.1\r\nHost: localhost\r\n\r\n"))
+    res = WEBrick::HTTPResponse.new(WEBrick::Config::HTTP)
+    WebApp.new(@manager).call(req, res)
+    assert_equal 404, res.status
+    refute File.exist?(MEMORY_KILLER_LIST)
+  end
+
+  def test_memory_killer_write_error_leaves_upload_pending
+    build = @manager.enqueue('prompt-memory')
+    wait_for { @manager.find(build.id).status == 'waiting_upload' }
+    FileUtils.mkdir_p(MEMORY_KILLER_LIST)
+
+    response = post_request("/builds/#{build.id}/memory-killer")
+    assert_equal 400, response.status
+    assert_includes response.body, 'Is a directory'
+    assert_equal 'waiting_upload', @manager.find(build.id).status
+    refute File.exist?(File.join(WORKER_DIR, build.id, 'upload.json'))
   end
 
   def test_skip_upload_and_retry_preserves_builder_and_cache_by_default
@@ -317,6 +390,8 @@ class BuildRestartTest < Minitest::Test
     assert_includes res.body, "action=\"/builds/#{build.id}/defer\""
     assert_includes res.body, 'name="wait_for"'
     assert_includes res.body, '>Defer</button>'
+    assert_includes res.body, "action=\"/builds/#{build.id}/memory-killer\""
+    assert_includes res.body, '>Require 32G+ RAM</button>'
   end
 
   def test_defer_skips_log_and_retries_once_after_a_new_matching_success
