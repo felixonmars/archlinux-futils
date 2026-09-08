@@ -25,6 +25,8 @@ REFRESH_COMMAND = ENV.fetch('ARCHRISCV_BUILDD_REFRESH_COMMAND', 'archrv-refresh'
 BUILD_WORKDIR = ENV['ARCHRISCV_BUILDD_WORKDIR']
 BIND = ENV.fetch('ARCHRISCV_BUILDD_BIND', '127.0.0.1')
 PORT = ENV.fetch('ARCHRISCV_BUILDD_PORT', '9181').to_i
+VIEW_BIND = ENV.fetch('ARCHRISCV_BUILDD_VIEW_BIND', BIND)
+VIEW_PORT = ENV.fetch('ARCHRISCV_BUILDD_VIEW_PORT', '0').to_i
 RECENT_PAGE_SIZE = 30
 PROMPT_PATTERN = /(?:\A|[\r\n])Upload log\? \[y\/N\] \z/.freeze
 HOST_PATTERN = /(?:\A|[\r\n])==> Building on ([A-Za-z0-9._-]+)/.freeze
@@ -834,12 +836,19 @@ class BuildManager
 end
 
 class WebApp
-  def initialize(manager)
+  def initialize(manager, read_only: false)
     @manager = manager
+    @read_only = read_only
   end
 
   def call(req, res)
-    case [req.request_method, req.path]
+    if @read_only && (!%w[GET HEAD].include?(req.request_method) || !view_path?(req.path))
+      html(res, layout('view only', '<p class="notification is-warning">This listener is view only.</p>'), status: 403)
+      return
+    end
+
+    method = req.request_method == 'HEAD' ? 'GET' : req.request_method
+    case [method, req.path]
     when ['GET', '/']
       html(res, render_index(req))
     when ['GET', '/log-viewer.js']
@@ -866,6 +875,14 @@ class WebApp
   end
 
   private
+
+  def view_path?(path)
+    ['/', '/log-viewer.js'].include?(path) || path.match?(%r{\A/builds/[^/]+/(?:log|raw|events)\z})
+  end
+
+  def dashboard_path(path = '')
+    "#{@read_only ? './' : '/'}#{path}"
+  end
 
   def route_build(req, res)
     case req.path
@@ -986,16 +1003,16 @@ class WebApp
             <div>
               <div class="build-title mb-1">
                 #{status_tag(build.status)}
-                <h1 class="title is-4 mb-0">#{h(build.pkgbase || build.command_line)}</h1>
+                <h1 class="title is-4 mb-0">#{h(build.pkgbase || build.command_line.sub(/:nocheck\z/, ''))}</h1>
+                #{nocheck_tag(build.command_line)}
                 <span id="build-host" class="tag is-light"#{host_style}>#{h(host_text)}</span>
               </div>
-              <p class="command is-family-monospace" title="#{h(build.argv.shelljoin)}">#{h(build.argv.shelljoin)}</p>
             </div>
           </div>
           <div class="level-right">
             <div class="buttons are-small mb-0">
-              <a class="button is-light" href="/">Dashboard</a>
-              <a class="button is-light" href="/builds/#{h(build.id)}/raw">Raw log</a>
+              <a class="button is-light" href="../../">Dashboard</a>
+              <a class="button is-light" href="raw">Raw log</a>
               #{retry_button(build) unless build.status == 'waiting_upload'}
               #{stop_button(build)}
             </div>
@@ -1019,9 +1036,8 @@ class WebApp
       <a class="button is-medium is-warning top-link" href="#top" title="Back to top">&uarr; Top</a>
       <button id="end-link" class="button is-medium is-info end-link" type="button" title="Back to end">&darr; End</button>
 
-      <script src="/log-viewer.js?v=1"></script>
+      <script src="../../log-viewer.js?v=1"></script>
       <script>
-        const buildId = #{JSON.generate(build.id)};
         const statusEl = document.querySelector('#status');
         const hostEl = document.querySelector('#build-host');
         const decisionEl = document.querySelector('#decision');
@@ -1066,7 +1082,7 @@ class WebApp
           updateEndLink();
         });
 
-        const events = new EventSource(`/builds/${encodeURIComponent(buildId)}/events?offset=${offset}`);
+        const events = new EventSource(`events?offset=${offset}`);
         events.addEventListener('log', (event) => appendLog(JSON.parse(event.data)));
         events.addEventListener('status', (event) => {
           const data = JSON.parse(event.data);
@@ -1105,6 +1121,7 @@ class WebApp
     res.status = 200
     res['Content-Type'] = 'text/event-stream; charset=utf-8'
     res['Cache-Control'] = 'no-cache'
+    res['X-Accel-Buffering'] = 'no'
     res.chunked = true
     res.body = proc do |out|
       offset = (req['last-event-id'] || req.query['offset']).to_i
@@ -1161,9 +1178,9 @@ class WebApp
     pagination = if page_count > 1
                    <<~HTML
                      <div class="buttons are-small mb-0">
-                       #{%(<a class="button is-small is-light" href="/?page=#{page - 1}#{search_query}">Prev</a>) if page > 1}
+                       #{%(<a class="button is-small is-light" href="#{h(dashboard_path("?page=#{page - 1}#{search_query}"))}">Prev</a>) if page > 1}
                        <span class="button is-small is-static">#{page} / #{page_count}</span>
-                       #{%(<a class="button is-small is-light" href="/?page=#{page + 1}#{search_query}">Next</a>) if page < page_count}
+                       #{%(<a class="button is-small is-light" href="#{h(dashboard_path("?page=#{page + 1}#{search_query}"))}">Next</a>) if page < page_count}
                      </div>
                    HTML
                  else
@@ -1172,36 +1189,18 @@ class WebApp
     recent_empty = search.empty? ? 'Completed builds will appear here.' : 'No matching completed builds.'
     pending = @manager.refresh_pending
     notice = req.query['notice']
-    builder_hint = BUILDER_USER.empty? ? 'host or user@host' : "host (defaults to #{BUILDER_USER}@host) or user@host"
 
     layout('dashboard', <<~HTML)
       <section class="box mb-3">
         <h1 class="title is-3 mb-1">#{APP_TITLE}</h1>
-        <p class="subtitle is-6">Runs <span class="is-family-monospace">#{h(BUILD_COMMAND)}</span>.</p>
+        <p class="subtitle is-6">Experimental</p>
       </section>
 
       #{flash('error', error) if error}
       #{flash('notice', notice) if notice}
 
-      <section class="box mb-3">
-        <form action="/builds" method="post">
-          <label class="label" for="command">Start a build</label>
-          <div class="field has-addons build-inputs">
-            <div class="control is-expanded">
-              <input class="input" id="command" name="command" type="text" autofocus placeholder="pkgbase[:nocheck]" autocomplete="off" pattern="[A-Za-z0-9][A-Za-z0-9@._+\-]*(:nocheck)?">
-            </div>
-            <div class="control target-builder">
-              <input class="input" id="target-builder" name="target_builder" type="text" aria-label="Target builder (optional)" placeholder="Builder (optional)" title="#{h(builder_hint)}" autocomplete="off" spellcheck="false">
-            </div>
-            <div class="control">
-              <button class="button is-primary" type="submit">Start build</button>
-            </div>
-          </div>
-          <p class="help">Examples: <span class="is-family-monospace">openssl</span>, <span class="is-family-monospace">rust:nocheck</span>. Leave builder blank for automatic selection.</p>
-        </form>
-      </section>
-
-      #{refresh_panel(pending)}
+      #{start_build_form unless @read_only}
+      #{refresh_panel(pending) unless @read_only}
 
       <section class="columns">
         <div class="column">
@@ -1224,17 +1223,40 @@ class WebApp
               </div>
               <div class="level-right">#{pagination}</div>
             </div>
-            <form class="field has-addons mb-2" action="/" method="get">
+            <form class="field has-addons mb-2" action="#{h(dashboard_path)}" method="get">
               <div class="control is-expanded">
                 <input class="input is-small" name="q" type="search" value="#{h(search)}" placeholder="Search recent builds">
               </div>
               <div class="control"><button class="button is-small is-light" type="submit">Search</button></div>
-              #{%(<div class="control"><a class="button is-small is-light" href="/">Clear</a></div>) unless search.empty?}
+              #{%(<div class="control"><a class="button is-small is-light" href="#{h(dashboard_path)}">Clear</a></div>) unless search.empty?}
             </form>
             #{recent_page.empty? ? empty_state(recent_empty) : recent_page.map { |build| build_card(build) }.join}
             #{pagination}
           </div>
         </div>
+      </section>
+    HTML
+  end
+
+  def start_build_form
+    builder_hint = BUILDER_USER.empty? ? 'host or user@host' : "host (defaults to #{BUILDER_USER}@host) or user@host"
+    <<~HTML
+      <section class="box mb-3">
+        <form action="/builds" method="post">
+          <label class="label" for="command">Start a build</label>
+          <div class="field has-addons build-inputs">
+            <div class="control is-expanded">
+              <input class="input" id="command" name="command" type="text" autofocus placeholder="pkgbase[:nocheck]" autocomplete="off" pattern="[A-Za-z0-9][A-Za-z0-9@._+\-]*(:nocheck)?">
+            </div>
+            <div class="control target-builder">
+              <input class="input" id="target-builder" name="target_builder" type="text" aria-label="Target builder (optional)" placeholder="Builder (optional)" title="#{h(builder_hint)}" autocomplete="off" spellcheck="false">
+            </div>
+            <div class="control">
+              <button class="button is-primary" type="submit">Start build</button>
+            </div>
+          </div>
+          <p class="help">Examples: <span class="is-family-monospace">openssl</span>, <span class="is-family-monospace">rust:nocheck</span>. Leave builder blank for automatic selection.</p>
+        </form>
       </section>
     HTML
   end
@@ -1250,20 +1272,20 @@ class WebApp
     <<~HTML
       <article class="box build-card #{h(build.status)} p-3 mb-2">
         #{delete_button(build)}
-        <div class="build-head">
+        <div class="build-head mb-2">
           <div class="build-title">
             #{status_tag(build.status)}
-            <h3 class="title is-6 mb-0">#{h(build.pkgbase || build.command_line)}</h3>
+            <h3 class="title is-6 mb-0">#{h(build.pkgbase || build.command_line.sub(/:nocheck\z/, ''))}</h3>
+            #{nocheck_tag(build.command_line)}
             #{%(<span class="tag is-light">#{h(host)}</span>) if host}
           </div>
           <span class="is-size-7 has-text-grey">#{h(duration(build))}#{%( - exit #{h(build.exit_status)}) if build.exit_status}</span>
         </div>
-        <p class="command is-family-monospace" title="#{h(build.argv.shelljoin)}">#{h(build.argv.shelljoin)}</p>
         #{decision_panel(build)}
         #{%(<p class="help is-danger mb-1">#{h(build.note)}</p>) if build.note}
         <div class="buttons are-small mb-0">
-          <a class="button is-small" href="/builds/#{h(build.id)}/log">Log</a>
-          <a class="button is-small is-light" href="/builds/#{h(build.id)}/raw">Raw</a>
+          <a class="button is-small" href="#{h(dashboard_path("builds/#{build.id}/log"))}">Log</a>
+          <a class="button is-small is-light" href="#{h(dashboard_path("builds/#{build.id}/raw"))}">Raw</a>
           #{stop_button(build)}
           #{retry_button(build) unless build.status == 'waiting_upload'}
         </div>
@@ -1272,7 +1294,7 @@ class WebApp
   end
 
   def delete_button(build)
-    return '' if build.active?
+    return '' if @read_only || build.active?
 
     <<~HTML
       <form class="delete-build" action="/builds/#{h(build.id)}/delete" method="post">
@@ -1281,11 +1303,17 @@ class WebApp
     HTML
   end
 
+  def nocheck_tag(command_line)
+    return '' unless command_line.to_s.end_with?(':nocheck')
+
+    '<span class="tag is-light">nocheck</span>'
+  end
+
   def refresh_panel(pending)
     pending_tags = pending.map do |pkgbase|
       <<~HTML
         <label class="tag is-light pending-tag">
-          <input type="checkbox" name="pkgbase" value="#{h(pkgbase)}" checked>
+          #{%(<input type="checkbox" name="pkgbase" value="#{h(pkgbase)}" checked>) unless @read_only}
           <span>#{h(pkgbase)}</span>
         </label>
       HTML
@@ -1293,6 +1321,8 @@ class WebApp
 
     pending_form = if pending.empty?
                      %(<p class="has-text-grey is-size-7 mb-0">No pending packages from #{h(REFRESH_COMMAND)}.</p>)
+                   elsif @read_only
+                     %(<div class="tags mb-2">#{pending_tags}</div>)
                    else
                      <<~HTML
                        <form action="/refresh/add" method="post">
@@ -1305,21 +1335,25 @@ class WebApp
                      HTML
                    end
 
+    refresh_form = <<~HTML unless @read_only
+      <form class="field has-addons mb-0" action="/refresh" method="post">
+        <div class="control extra-safe-deps">
+          <input class="input is-small" id="extra-safe-deps" name="extra_safe_deps" type="text" aria-label="Add persisted safe dependencies (optional)" placeholder="Add safe deps (optional)" title="Comma-separated dependencies to keep safe until they leave the status page after updating" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="control">
+          <button class="button is-small is-light" type="submit">Refresh</button>
+        </div>
+      </form>
+    HTML
+
     <<~HTML
       <section class="box mb-3">
         <div class="level is-mobile refresh-head mb-2">
           <div>
             <h2 class="title is-5 mb-0">Pending refresh</h2>
-            <p class="help">Run <span class="is-family-monospace">#{h(REFRESH_COMMAND)}</span>; confirm before adding builds.</p>
+            #{%(<p class="help">Run <span class="is-family-monospace">#{h(REFRESH_COMMAND)}</span>; confirm before adding builds.</p>) unless @read_only}
           </div>
-          <form class="field has-addons mb-0" action="/refresh" method="post">
-            <div class="control extra-safe-deps">
-              <input class="input is-small" id="extra-safe-deps" name="extra_safe_deps" type="text" aria-label="Add persisted safe dependencies (optional)" placeholder="Add safe deps (optional)" title="Comma-separated dependencies to keep safe until they leave the status page after updating" autocomplete="off" spellcheck="false">
-            </div>
-            <div class="control">
-              <button class="button is-small is-light" type="submit">Refresh</button>
-            </div>
-          </form>
+          #{refresh_form}
         </div>
         #{pending_form}
       </section>
@@ -1327,6 +1361,7 @@ class WebApp
   end
 
   def retry_button(build, waiting_upload: build.status == 'waiting_upload')
+    return '' if @read_only
     return '' unless waiting_upload || %w[failed interrupted].include?(build.status)
 
     label = waiting_upload ? 'Skip upload + retry' : 'Retry'
@@ -1345,15 +1380,19 @@ class WebApp
 
     cards = entries.map do |entry|
       build = entry['build']
+      cancel_form = <<~HTML unless @read_only
+        <form class="inline" action="/deferred/#{h(build['id'])}/cancel" method="post">
+          <button class="button is-small is-light" type="submit">Cancel</button>
+        </form>
+      HTML
       <<~HTML
         <div class="build-head mb-2">
           <p class="is-size-7 mb-0">
-            <strong class="is-family-monospace">#{h(build['command_line'])}</strong>
+            <strong class="is-family-monospace">#{h(build['pkgbase'] || build['command_line'].sub(/:nocheck\z/, ''))}</strong>
+            #{nocheck_tag(build['command_line'])}
             #{entry['ready'] ? 'Ready to retry after the current attempt exits.' : "Waiting for <strong>#{h(entry['wait_for'])}</strong> to build successfully."}
           </p>
-          <form class="inline" action="/deferred/#{h(build['id'])}/cancel" method="post">
-            <button class="button is-small is-light" type="submit">Cancel</button>
-          </form>
+          #{cancel_form}
         </div>
       HTML
     end.join
@@ -1367,6 +1406,7 @@ class WebApp
   end
 
   def new_builder_checkbox(build)
+    return '' if @read_only
     return '' if build.started_at && Time.now - build.started_at >= 300
 
     expires_at = ((build.started_at.to_f + 300) * 1000).to_i if build.started_at
@@ -1378,7 +1418,7 @@ class WebApp
   end
 
   def stop_button(build)
-    return '' unless build.active?
+    return '' if @read_only || !build.active?
 
     <<~HTML
       <form class="inline" action="/builds/#{h(build.id)}/stop" method="post">
@@ -1392,6 +1432,10 @@ class WebApp
 
     id_attr = live ? ' id="decision"' : ''
     style = build.status == 'waiting_upload' ? '' : ' style="display:none"'
+
+    if @read_only
+      return %(<div#{id_attr} class="notification is-warning is-light is-size-7 py-2 px-3 mb-2"#{style}>Waiting for an upload decision.</div>)
+    end
 
     <<~HTML
       <div#{id_attr} class="notification is-warning is-light py-2 px-3 mb-2"#{style}>
@@ -1471,8 +1515,7 @@ class WebApp
           .build-card.succeeded { border-left-color: var(--moss); }
           .build-head { display: flex; justify-content: space-between; gap: .5rem; align-items: center; }
           .build-title, .build-toolbar, form.inline { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; min-width: 0; }
-          .build-title h1, .build-title h3, .command { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-          .command { margin: .25rem 0 .45rem; color: #697267; font-size: .82rem; }
+          .build-title h1, .build-title h3 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
           .build-inputs .control.is-expanded { min-width: 0; }
           .target-builder { width: clamp(6rem, 25vw, 13rem); }
           .level.refresh-head { flex-wrap: wrap; gap: .75rem; }
@@ -1516,30 +1559,33 @@ if $PROGRAM_NAME == __FILE__
   end
 
   manager = BuildManager.new
+  listeners = [[BIND, PORT, false]]
+  listeners << [VIEW_BIND, VIEW_PORT, true] if VIEW_PORT.positive?
+  servers = listeners.map do |bind, port, read_only|
+    server = WEBrick::HTTPServer.new(
+      BindAddress: bind,
+      Port: port,
+      ServerSoftware: APP_NAME,
+      AccessLog: [],
+      Logger: WEBrick::Log.new($stderr, ENV['ARCHRISCV_BUILDD_DEBUG'] ? WEBrick::Log::DEBUG : WEBrick::Log::INFO)
+    )
+    app = WebApp.new(manager, read_only: read_only)
+    server.mount_proc('/') { |req, res| app.call(req, res) }
+    warn "#{APP_NAME}: #{read_only ? 'view-only' : 'control'} listener on http://#{bind}:#{port}"
+    server
+  end
   manager.start
-
-  server = WEBrick::HTTPServer.new(
-    BindAddress: BIND,
-    Port: PORT,
-    ServerSoftware: APP_NAME,
-    AccessLog: [],
-    Logger: WEBrick::Log.new($stderr, ENV['ARCHRISCV_BUILDD_DEBUG'] ? WEBrick::Log::DEBUG : WEBrick::Log::INFO)
-  )
-
-  app = WebApp.new(manager)
-  server.mount_proc('/') { |req, res| app.call(req, res) }
 
   signal_reader, signal_writer = IO.pipe
   Thread.new do
     signal_reader.read(1)
     manager.shutdown
-    server.shutdown
+    servers.each(&:shutdown)
   end
 
   %w[INT TERM].each do |signal|
     trap(signal) { signal_writer.write_nonblock('.') rescue nil }
   end
 
-  warn "#{APP_NAME}: listening on http://#{BIND}:#{PORT}"
-  server.start
+  servers.map { |server| Thread.new { server.start } }.each(&:value)
 end

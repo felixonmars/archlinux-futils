@@ -171,6 +171,53 @@ class BuildRestartTest < Minitest::Test
     refute File.exist?(marker)
   end
 
+  def test_view_only_pages_keep_status_and_logs_but_reject_all_actions
+    builds = (ACTIVE_STATUSES + TERMINAL_STATUSES).map do |status|
+      Build.new(id: status, command_line: "package-#{status}", argv: ['riscvu', "package-#{status}"],
+        pkgbase: "package-#{status}", log_path: File.join(TEST_ROOT, 'view.log'), status: status)
+    end
+    File.write(builds.first.log_path, 'build output')
+    deferred = {'build' => {'id' => 'later', 'command_line' => 'deferred-package'}, 'wait_for' => 'dependency'}
+    manager = Struct.new(:all_builds, :refresh_pending, :deferred_retries).new(builds, ['pending-package'], [deferred])
+    manager.define_singleton_method(:find) { |id| all_builds.find { |build| build.id == id } }
+    view = WebApp.new(manager, read_only: true)
+    request = lambda do |method, path, app = view|
+      req = WEBrick::HTTPRequest.new(WEBrick::Config::HTTP)
+      req.parse(StringIO.new("#{method} #{path} HTTP/1.1\r\nHost: localhost:9181\r\nContent-Length: 0\r\n\r\n"))
+      res = WEBrick::HTTPResponse.new(WEBrick::Config::HTTP)
+      app.call(req, res)
+      res
+    end
+
+    ['/', '/builds/waiting_upload/log', '/builds/failed/log'].each do |path|
+      response = request.call('GET', path)
+      assert_equal 200, response.status
+      refute_includes response.body, 'View only'
+      refute_match(/method="post"|type="checkbox"|formaction=/, response.body)
+    end
+    dashboard = request.call('GET', '/').body
+    %w[deferred-package dependency].each { |name| assert_includes dashboard, name }
+    refute_includes dashboard, 'Pending refresh'
+    refute_includes dashboard, 'pending-package'
+    assert_includes dashboard, 'name="q"'
+    assert_includes dashboard, 'href="./builds/running/log"'
+    assert_includes dashboard, 'action="./" method="get"'
+    log_page = request.call('GET', '/builds/running/log').body
+    assert_includes log_page, 'src="../../log-viewer.js?v=1"'
+    assert_includes log_page, 'new EventSource(`events?offset=${offset}`)'
+    assert_equal 'build output', request.call('GET', '/builds/running/raw').body.read
+    assert_equal 200, request.call('GET', '/builds/running/events').status
+    assert_equal 200, request.call('GET', '/log-viewer.js').status
+    assert_equal 200, request.call('HEAD', '/').status
+
+    actions = %w[/builds /refresh /refresh/add /refresh/clear /deferred/later/cancel] +
+      %w[upload retry defer stop delete].map { |action| "/builds/waiting_upload/#{action}" }
+    actions.each { |path| assert_equal 403, request.call('POST', path).status }
+    %w[PUT PATCH DELETE].each { |method| assert_equal 403, request.call(method, '/').status }
+    assert_equal 403, request.call('GET', '/builds/running/stop').status
+    assert_includes request.call('GET', '/', WebApp.new(manager)).body, 'method="post"'
+  end
+
   def test_refresh_without_extra_safe_dependencies_preserves_default_invocation
     [nil, '', " \t "].each do |input|
       assert_equal 303, refresh_request(input).status

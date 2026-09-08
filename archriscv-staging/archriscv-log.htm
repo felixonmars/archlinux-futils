@@ -8,7 +8,7 @@
       const terminal = new TerminalLog(document.getElementById('terminal'));
       const url = new URLSearchParams(window.location.search).get('url');
       if (url) {
-        fetch(url + '?raw').then(response => {
+        fetch(url + '?raw', {headers: {'X-Requested-With': 'XMLHttpRequest'}}).then(response => {
           if (!response.ok) throw new Error(`HTTP ${response.status}`);
           return response.text();
         }).then(text => terminal.write(text)).catch(error => {
