@@ -17,6 +17,8 @@ TRUE_VALUES = %w[1 true yes on].freeze
 DRY_RUN = TRUE_VALUES.include?(ENV['ARCHRISCV_BOT_DRY_RUN'].to_s.downcase)
 RUN_ONCE = TRUE_VALUES.include?(ENV['ARCHRISCV_BOT_ONCE'].to_s.downcase)
 NOTIFY_EXISTING = TRUE_VALUES.include?(ENV['ARCHRISCV_BOT_NOTIFY_EXISTING'].to_s.downcase)
+TELEGRAM_MESSAGE_INTERVAL = 3.1
+ANSI_PATTERN = /\e(?:\][^\a]*?(?:\a|\e\\)|\[[0-?]*[ -\/]*[@-~]|[ -\/]*[0-~])/.freeze
 
 ISSUE_PATTERNS = [
   ['patch failed', /==> Applying RISC-V patches\.\.\./],
@@ -81,15 +83,44 @@ end
 
 def detect_issue(log)
   issue = nil
-  log.each_line do |line|
-    clean = line.gsub(/\e\[[0-?]*[ -\/]*[@-~]/, '').delete("\x0f").delete("\r")
-    ISSUE_PATTERNS.each { |label, pattern| issue = label if clean.match?(pattern) }
+  log.gsub(ANSI_PATTERN, '').delete("\x0f\r").each_line do |line|
+    ISSUE_PATTERNS.each { |label, pattern| issue = label if line.match?(pattern) }
   end
   issue
 end
 
 def h(text)
   CGI.escapeHTML(text.to_s)
+end
+
+def save_state(state)
+  FileUtils.mkdir_p(STATE_DIR)
+  File.write("#{STATE_FILE}.tmp", JSON.pretty_generate(state))
+  File.rename("#{STATE_FILE}.tmp", STATE_FILE)
+end
+
+def queue_events(state, key, items)
+  state['pending'] ||= {}
+  pending = ((state['pending'][key] || []) + items.map { |item| item[:raw] }).uniq
+  state['pending'][key] = pending.reject { |raw| state[key].key?(raw) }
+  parse_index(state['pending'][key].join("\n"))
+end
+
+def process_events(state, key, items)
+  items.reject { |item| state[key].key?(item[:raw]) }.sort_by { |item| item[:time] }.each do |item|
+    begin
+      yield item
+    rescue StandardError => e
+      warn "#{Time.now.utc.iso8601} #{key} #{item[:path]}: #{e.class}: #{e.message}"
+      warn e.backtrace.first(5).join("\n") if ENV['ARCHRISCV_BOT_DEBUG']
+      next
+    end
+
+    # Failed events stay pending; checkpoint completed notifications before continuing.
+    state[key][item[:raw]] = { 'path' => item[:path], 'stamp' => item[:stamp], 'seen_at' => Time.now.utc.iso8601 }
+    state.dig('pending', key)&.delete(item[:raw])
+    save_state(state)
+  end
 end
 
 def send_message(text, reply_to_message_id: nil)
@@ -111,119 +142,137 @@ def send_message(text, reply_to_message_id: nil)
   body[:reply_to_message_id] = reply_to_message_id if reply_to_message_id
   body[:allow_sending_without_reply] = true if reply_to_message_id
   request.body = JSON.generate(body)
-  response = Net::HTTP.start(uri.host, uri.port, use_ssl: true, open_timeout: 15, read_timeout: 30) do |http|
-    http.request(request)
-  end
-  raise "Telegram send failed: HTTP #{response.code} #{response.body}" unless response.is_a?(Net::HTTPSuccess)
+  retries = 0
+  loop do
+    delay = (@telegram_next_send_at || 0) - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    sleep delay if delay.positive?
+    response = Net::HTTP.start(uri.host, uri.port, use_ssl: true, open_timeout: 15, read_timeout: 30) do |http|
+      http.request(request)
+    end
+    if response.code == '429' && retries < 3
+      retry_after = [JSON.parse(response.body).dig('parameters', 'retry_after').to_i, 1].max
+      warn "#{Time.now.utc.iso8601} Telegram rate limited; retrying in #{retry_after}s"
+      @telegram_next_send_at = Process.clock_gettime(Process::CLOCK_MONOTONIC) + retry_after
+      retries += 1
+      next
+    end
+    raise "Telegram send failed: HTTP #{response.code} #{response.body}" unless response.is_a?(Net::HTTPSuccess)
 
-  JSON.parse(response.body).dig('result', 'message_id')
+    # Telegram groups allow at most 20 messages per minute.
+    @telegram_next_send_at = Process.clock_gettime(Process::CLOCK_MONOTONIC) + TELEGRAM_MESSAGE_INTERVAL
+    return JSON.parse(response.body).dig('result', 'message_id')
+  end
 end
 
-FileUtils.mkdir_p([STATE_DIR, CACHE_DIR])
-state = File.exist?(STATE_FILE) ? JSON.parse(File.read(STATE_FILE)) : {}
-state['latestlogs'] ||= {}
-state['lastupdates'] ||= {}
-state['failures'] ||= {}
-state['resolved'] ||= {}
+def run_bot
+  FileUtils.mkdir_p([STATE_DIR, CACHE_DIR])
+  state = File.exist?(STATE_FILE) ? JSON.parse(File.read(STATE_FILE)) : {}
+  state['latestlogs'] ||= {}
+  state['lastupdates'] ||= {}
+  state['failures'] ||= {}
+  state['resolved'] ||= {}
 
-loop do
-  begin
-    first_run = state['latestlogs'].empty? && state['lastupdates'].empty? && !NOTIFY_EXISTING
+  loop do
+    begin
+      first_run = state['latestlogs'].empty? && state['lastupdates'].empty? && !NOTIFY_EXISTING
 
-    latestlogs_url = "#{BASE_URL}/.status/latestlogs.txt"
-    lastupdate_url = "#{BASE_URL}/.status/lastupdate.txt"
-    latestlogs = parse_index(fetch(latestlogs_url, File.join(CACHE_DIR, 'latestlogs.txt')))
-    lastupdates = parse_index(fetch(lastupdate_url, File.join(CACHE_DIR, 'lastupdate.txt')))
+      latestlogs_url = "#{BASE_URL}/.status/latestlogs.txt"
+      lastupdate_url = "#{BASE_URL}/.status/lastupdate.txt"
+      latestlogs = parse_index(fetch(latestlogs_url, File.join(CACHE_DIR, 'latestlogs.txt')))
+      lastupdates = parse_index(fetch(lastupdate_url, File.join(CACHE_DIR, 'lastupdate.txt')))
+      # Keep retries and manually requeued events after they leave the rolling indexes.
+      latestlogs = queue_events(state, 'latestlogs', latestlogs)
+      lastupdates = queue_events(state, 'lastupdates', lastupdates)
+      save_state(state)
 
-    latestlogs.reject { |item| state['latestlogs'].key?(item[:raw]) }.sort_by { |item| item[:time] }.each do |item|
-      log_path = item[:path].sub(%r{\A\./}, '').sub(%r{\A/+}, '')
-      pkgbase = log_path.split('/')[-2] || File.basename(log_path, '.log')
-      log_name = File.basename(log_path, '.log')
-      version = log_name.start_with?("#{pkgbase}-") ? log_name.delete_prefix("#{pkgbase}-") : nil
-      log_url = "#{BASE_URL}/#{log_path}"
-      log = fetch(log_url, File.join(CACHE_DIR, log_path))
-      issue = detect_issue(log) || 'unknown failure'
+      process_events(state, 'latestlogs', latestlogs) do |item|
+        log_path = item[:path].sub(%r{\A\./}, '').sub(%r{\A/+}, '')
+        pkgbase = log_path.split('/')[-2] || File.basename(log_path, '.log')
+        log_name = File.basename(log_path, '.log')
+        version = log_name.start_with?("#{pkgbase}-") ? log_name.delete_prefix("#{pkgbase}-") : nil
+        log_url = "#{BASE_URL}/#{log_path}"
+        log = fetch(log_url, File.join(CACHE_DIR, log_path))
+        issue = detect_issue(log) || 'unknown failure'
 
-      message_id = send_message([
-        "❌ <b>[archriscv]</b> failed: #{h("#{pkgbase} #{version || 'unknown'}")}",
-        %(issue: #{h(issue)} (<a href="#{h(log_url)}">log</a>))
-      ].join("\n")) unless first_run
+        message_id = send_message([
+          "❌ <b>[archriscv]</b> failed: #{h("#{pkgbase} #{version || 'unknown'}")}",
+          %(issue: #{h(issue)} (<a href="#{h(log_url)}">log</a>))
+        ].join("\n")) unless first_run
 
-      failure = {
-        'version' => version,
-        'issue' => issue,
-        'log_path' => log_path,
-        'log_url' => log_url,
-        'failed_at' => item[:stamp],
-        'event_id' => item[:raw]
-      }
-      failure['message_id'] = message_id if message_id
-      state['failures'][pkgbase] = failure
-      state['latestlogs'][item[:raw]] = { 'path' => item[:path], 'stamp' => item[:stamp], 'seen_at' => Time.now.utc.iso8601 }
-    end
-
-    lastupdates.reject { |item| state['lastupdates'].key?(item[:raw]) }.sort_by { |item| item[:time] }.each do |item|
-      state['lastupdates'][item[:raw]] = { 'path' => item[:path], 'stamp' => item[:stamp], 'seen_at' => Time.now.utc.iso8601 }
-      next if first_run
-
-      package_path = item[:path].sub(%r{\A\./}, '').sub(%r{\A/+}, '')
-      package_file = File.basename(package_path)
-      match = package_file.match(/\A(.+)-([^-]+)-([^-]+)-([^-]+)\.pkg\.tar(?:\..+)?\z/)
-      pkgname = match ? match[1] : package_file
-      version = match ? "#{match[2]}-#{match[3]}" : nil
-      pkgbase = `expac -S -1 %e #{pkgname} 2>/dev/null`.strip
-      pkgbase = pkgname if pkgbase.empty?
-      failure = state['failures'][pkgbase]
-      next unless failure
-      nocheck_url = "#{BASE_URL}/.status/logs/#{pkgbase}/.nocheck"
-      nocheck_version = fetch(nocheck_url, optional: true)&.strip
-
-      if nocheck_version
-        nocheck_key = [version, nocheck_version].compact.join('|')
-        next if failure['nocheck_key'] == nocheck_key
-
-        nocheck_message_id = send_message([
-          "⚠️ <b>[archriscv]</b> nocheck: #{h("#{pkgbase} #{version || 'unknown'}")}",
-          %(previous: #{h(failure['issue'] || 'unknown failure')})
-        ].join("\n"), reply_to_message_id: failure['message_id'])
-        failure['nocheck_key'] = nocheck_key
-        failure['nocheck_at'] = item[:stamp]
-        failure['nocheck_message_id'] = nocheck_message_id if nocheck_message_id
-        next
+        failure = {
+          'version' => version,
+          'issue' => issue,
+          'log_path' => log_path,
+          'log_url' => log_url,
+          'failed_at' => item[:stamp],
+          'event_id' => item[:raw]
+        }
+        failure['message_id'] = message_id if message_id
+        state['failures'][pkgbase] = failure
       end
 
-      if failure['nocheck_key']
-        send_message([
-          "🧪 <b>[archriscv]</b> checked: #{h("#{pkgbase} #{version || 'unknown'}")}",
-          %(previously nocheck; previous: #{h(failure['issue'] || 'unknown failure')})
-        ].join("\n"), reply_to_message_id: failure['nocheck_message_id'] || failure['message_id'])
-      else
-        send_message([
-          "✅ <b>[archriscv]</b> fixed: #{h("#{pkgbase} #{version || 'unknown'}")}",
-          %(previous: #{h(failure['issue'] || 'unknown failure')})
-        ].join("\n"), reply_to_message_id: failure['message_id'])
+      process_events(state, 'lastupdates', lastupdates) do |item|
+        next if first_run
+
+        package_path = item[:path].sub(%r{\A\./}, '').sub(%r{\A/+}, '')
+        package_file = File.basename(package_path)
+        match = package_file.match(/\A(.+)-([^-]+)-([^-]+)-([^-]+)\.pkg\.tar(?:\..+)?\z/)
+        pkgname = match ? match[1] : package_file
+        version = match ? "#{match[2]}-#{match[3]}" : nil
+        pkgbase = `expac -S -1 %e #{pkgname} 2>/dev/null`.strip
+        pkgbase = pkgname if pkgbase.empty?
+        failure = state['failures'][pkgbase]
+        next unless failure
+        nocheck_url = "#{BASE_URL}/.status/logs/#{pkgbase}/.nocheck"
+        nocheck_version = fetch(nocheck_url, optional: true)&.strip
+
+        if nocheck_version
+          nocheck_key = [version, nocheck_version].compact.join('|')
+          next if failure['nocheck_key'] == nocheck_key
+
+          nocheck_message_id = send_message([
+            "⚠️ <b>[archriscv]</b> nocheck: #{h("#{pkgbase} #{version || 'unknown'}")}",
+            %(previous: #{h(failure['issue'] || 'unknown failure')})
+          ].join("\n"), reply_to_message_id: failure['message_id'])
+          failure['nocheck_key'] = nocheck_key
+          failure['nocheck_at'] = item[:stamp]
+          failure['nocheck_message_id'] = nocheck_message_id if nocheck_message_id
+          next
+        end
+
+        if failure['nocheck_key']
+          send_message([
+            "🧪 <b>[archriscv]</b> checked: #{h("#{pkgbase} #{version || 'unknown'}")}",
+            %(previously nocheck; previous: #{h(failure['issue'] || 'unknown failure')})
+          ].join("\n"), reply_to_message_id: failure['nocheck_message_id'] || failure['message_id'])
+        else
+          send_message([
+            "✅ <b>[archriscv]</b> fixed: #{h("#{pkgbase} #{version || 'unknown'}")}",
+            %(previous: #{h(failure['issue'] || 'unknown failure')})
+          ].join("\n"), reply_to_message_id: failure['message_id'])
+        end
+
+        state['resolved'][pkgbase] = failure.merge('resolved_at' => item[:stamp], 'resolved_by' => package_path)
+        state['failures'].delete(pkgbase)
       end
 
-      state['resolved'][pkgbase] = failure.merge('resolved_at' => item[:stamp], 'resolved_by' => package_path)
-      state['failures'].delete(pkgbase)
+      %w[latestlogs lastupdates].each do |key|
+        next if state[key].size <= 1000
+
+        state[key] = state[key].sort_by { |_id, event| event['seen_at'] }.last(1000).to_h
+      end
+
+      save_state(state)
+      puts 'Seeded current status; future changes will be reported.' if first_run
+    rescue StandardError => e
+      warn "#{Time.now.utc.iso8601} #{e.class}: #{e.message}"
+      warn e.backtrace.first(5).join("\n") if ENV['ARCHRISCV_BOT_DEBUG']
     end
 
-    %w[latestlogs lastupdates].each do |key|
-      next if state[key].size <= 1000
+    break if RUN_ONCE
 
-      state[key] = state[key].sort_by { |_id, event| event['seen_at'] }.last(1000).to_h
-    end
-
-    FileUtils.mkdir_p(STATE_DIR)
-    File.write("#{STATE_FILE}.tmp", JSON.pretty_generate(state))
-    File.rename("#{STATE_FILE}.tmp", STATE_FILE)
-    puts 'Seeded current status; future changes will be reported.' if first_run
-  rescue StandardError => e
-    warn "#{Time.now.utc.iso8601} #{e.class}: #{e.message}"
-    warn e.backtrace.first(5).join("\n") if ENV['ARCHRISCV_BOT_DEBUG']
+    sleep INTERVAL
   end
-
-  break if RUN_ONCE
-
-  sleep INTERVAL
 end
+
+run_bot if $PROGRAM_NAME == __FILE__
