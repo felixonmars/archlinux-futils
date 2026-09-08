@@ -467,9 +467,12 @@ class BuildManager
     raise ArgumentError, e.message
   end
 
-  def refresh_from_remote
-    output = `#{REFRESH_COMMAND} 2>&1`
-    raise ArgumentError, "#{REFRESH_COMMAND} failed: #{output.lines.last.to_s.strip}" unless $?.success?
+  def refresh_from_remote(extra_safe_deps: nil)
+    argv = Shellwords.split(REFRESH_COMMAND)
+    extra_safe_deps = extra_safe_deps.to_s.strip
+    argv << "--extra-safe-deps=#{extra_safe_deps}" unless extra_safe_deps.empty?
+    output, status = Open3.capture2e(*argv)
+    raise ArgumentError, "#{REFRESH_COMMAND} failed: #{output.lines.last.to_s.strip}" unless status.success?
 
     candidates = output.lines.map(&:strip).select { |line| line.match?(COMMAND_PATTERN) }.uniq
     added = []
@@ -752,8 +755,8 @@ class WebApp
     redirect(res, '/')
   end
 
-  def refresh_remote(_req, res)
-    added = @manager.refresh_from_remote
+  def refresh_remote(req, res)
+    added = @manager.refresh_from_remote(extra_safe_deps: req.query['extra_safe_deps'])
     message = added.empty? ? "#{REFRESH_COMMAND} found no new packages" : "#{REFRESH_COMMAND} added #{added.size} pending package(s)"
     redirect(res, "/?notice=#{CGI.escape(message)}")
   end
@@ -1239,13 +1242,18 @@ class WebApp
 
     <<~HTML
       <section class="box mb-3">
-        <div class="level is-mobile mb-2">
+        <div class="level is-mobile refresh-head mb-2">
           <div>
             <h2 class="title is-5 mb-0">Pending refresh</h2>
             <p class="help">Run <span class="is-family-monospace">#{h(REFRESH_COMMAND)}</span>; confirm before adding builds.</p>
           </div>
-          <form action="/refresh" method="post">
-            <button class="button is-small is-light" type="submit">Refresh</button>
+          <form class="field has-addons mb-0" action="/refresh" method="post">
+            <div class="control extra-safe-deps">
+              <input class="input is-small" id="extra-safe-deps" name="extra_safe_deps" type="text" aria-label="Add persisted safe dependencies (optional)" placeholder="Add safe deps (optional)" title="Comma-separated dependencies to keep safe until they leave the status page after updating" autocomplete="off" spellcheck="false">
+            </div>
+            <div class="control">
+              <button class="button is-small is-light" type="submit">Refresh</button>
+            </div>
           </form>
         </div>
         #{pending_form}
@@ -1360,6 +1368,8 @@ class WebApp
           .command { margin: .25rem 0 .45rem; color: #697267; font-size: .82rem; }
           .build-inputs .control.is-expanded { min-width: 0; }
           .target-builder { width: clamp(6rem, 25vw, 13rem); }
+          .level.refresh-head { flex-wrap: wrap; gap: .75rem; }
+          .extra-safe-deps { width: clamp(10rem, 25vw, 16rem); }
           .pending-tag { gap: .35rem; height: auto; padding: .35rem .55rem; }
           .delete-build { position: absolute; right: .7rem; top: .7rem; margin: 0; }
           form.inline, .buttons form { margin-bottom: 0; }

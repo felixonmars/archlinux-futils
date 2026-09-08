@@ -11,6 +11,7 @@ TEST_ROOT = Dir.mktmpdir('archriscv-buildd-test-')
 ENV['ARCHRISCV_BUILDD_STATE_DIR'] = TEST_ROOT
 ENV['ARCHRISCV_BUILDD_LOG_DIR'] = File.join(TEST_ROOT, 'logs')
 ENV['ARCHRISCV_BUILDD_BUILD_COMMAND'] = File.join(TEST_ROOT, 'build-command')
+ENV['ARCHRISCV_BUILDD_REFRESH_COMMAND'] = File.join(TEST_ROOT, 'refresh-command')
 ENV['ARCHRISCV_BUILDD_BUILDER_USER'] = 'builder'
 ENV['ARCHRISCV_BUILDD_WORKDIR'] = TEST_ROOT
 ENV['ARCHRISCV_TEST_ROOT'] = TEST_ROOT
@@ -79,6 +80,15 @@ class BuildRestartTest < Minitest::Test
       puts 'build completed'
     RUBY
     File.chmod(0o755, BUILD_COMMAND)
+    File.write(REFRESH_COMMAND, <<~'RUBY')
+      #!/usr/bin/env ruby
+      require 'json'
+      File.write(File.join(ENV.fetch('ARCHRISCV_TEST_ROOT'), 'refresh-args.json'), JSON.generate(ARGV))
+      abort 'refresh failed' if ARGV.include?('--extra-safe-deps=fail')
+      puts '# refresh stats'
+      puts 'candidate-one', 'candidate-two', 'candidate-one'
+    RUBY
+    File.chmod(0o755, REFRESH_COMMAND)
     @service = TestBuildService.new
     @managers = []
     @manager = new_manager
@@ -117,6 +127,43 @@ class BuildRestartTest < Minitest::Test
     @manager.shutdown
     @manager = new_manager
     @manager.start
+  end
+
+  def refresh_request(extra_safe_deps = nil)
+    body = extra_safe_deps.nil? ? '' : "extra_safe_deps=#{CGI.escape(extra_safe_deps)}"
+    req = WEBrick::HTTPRequest.new(WEBrick::Config::HTTP)
+    req.parse(StringIO.new("POST /refresh HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: #{body.bytesize}\r\n\r\n#{body}"))
+    res = WEBrick::HTTPResponse.new(WEBrick::Config::HTTP)
+    WebApp.new(@manager).call(req, res)
+    res
+  end
+
+  def test_refresh_passes_extra_safe_dependencies_as_one_literal_argument
+    assert_equal 303, refresh_request(' llvm, python ').status
+    assert_equal ['--extra-safe-deps=llvm, python'], JSON.parse(File.read(File.join(TEST_ROOT, 'refresh-args.json')))
+    assert_equal %w[candidate-one candidate-two], @manager.refresh_pending
+
+    marker = File.join(TEST_ROOT, 'shell-command-ran')
+    input = "llvm; touch #{marker}"
+    assert_equal 303, refresh_request(input).status
+    assert_equal ["--extra-safe-deps=#{input}"], JSON.parse(File.read(File.join(TEST_ROOT, 'refresh-args.json')))
+    refute File.exist?(marker)
+  end
+
+  def test_refresh_without_extra_safe_dependencies_preserves_default_invocation
+    [nil, '', " \t "].each do |input|
+      assert_equal 303, refresh_request(input).status
+      assert_empty JSON.parse(File.read(File.join(TEST_ROOT, 'refresh-args.json')))
+    end
+    assert_equal %w[candidate-one candidate-two], @manager.refresh_pending
+  end
+
+  def test_refresh_errors_leave_pending_packages_intact
+    refresh_request
+    response = refresh_request('fail')
+    assert_equal 400, response.status
+    assert_includes response.body, 'refresh failed'
+    assert_equal %w[candidate-one candidate-two], @manager.refresh_pending
   end
 
   def test_running_build_survives_restart_with_target_and_environment
