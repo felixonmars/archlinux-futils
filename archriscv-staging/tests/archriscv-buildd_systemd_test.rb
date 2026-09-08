@@ -23,13 +23,43 @@ class SystemdBuildRestartTest < Minitest::Test
     @command = File.join(@root, 'fake-build')
     File.write(@command, <<~'RUBY')
       #!/usr/bin/env ruby
+      require 'rbconfig'
+      require 'shellwords'
       STDOUT.sync = true
       root = ENV.fetch('ARCHRISCV_SYSTEMD_TEST_ROOT')
       name = ARGV.first
       File.write(File.join(root, "#{name}.pid"), Process.pid)
       puts "==> Building on test-builder"
       puts "target=#{ENV['SERVER']}"
-      if name.start_with?('wait')
+      if name.start_with?('ssh-owner')
+        exit 1 unless system('ssh', '-F', File.join(root, 'ssh_config'), 'test-peer', 'true')
+        File.write(File.join(root, "#{name}.ready"), '')
+        sleep 0.05 until File.exist?(File.join(root, "#{name}.release"))
+      elsif name.start_with?('ssh-client')
+        command = [RbConfig.ruby, '-e',
+          'File.write(ARGV[0], ""); sleep 0.05 until File.exist?(ARGV[1]); puts "shared session finished"',
+          File.join(root, "#{name}.ready"), File.join(root, "#{name}.release")].shelljoin
+        exit 1 unless system('ssh', '-F', File.join(root, 'ssh_config'), 'test-peer', command)
+      elsif name.start_with?('ssh-interrupt')
+        command = [RbConfig.ruby, '-e',
+          'STDOUT.sync = true; trap("INT") { File.write(ARGV[0], ""); exit 130 }; puts "waiting for remote Ctrl-C"; sleep 300',
+          File.join(root, 'remote-interrupted')].shelljoin
+        system('ssh', '-F', File.join(root, 'ssh_config'), '-tt', 'test-peer', command)
+        print 'Upload log? [y/N] '
+        puts "answer=#{STDIN.gets.to_s.strip}"
+        exit 1
+      elsif name.start_with?('interrupt')
+        interrupted = false
+        trap('INT') { interrupted = true }
+        child = Process.spawn('sleep', '300')
+        File.write(File.join(root, "#{name}.descendant"), child)
+        puts 'waiting for Ctrl-C'
+        sleep 0.05 until interrupted
+        puts 'interrupt received'
+        print 'Upload log? [y/N] '
+        puts "answer=#{STDIN.gets.to_s.strip}"
+        exit 1
+      elsif name.start_with?('wait')
         child = Process.spawn('sleep', '300')
         File.write(File.join(root, "#{name}.descendant"), child)
         puts 'waiting for release'
@@ -46,6 +76,10 @@ class SystemdBuildRestartTest < Minitest::Test
   end
 
   def teardown
+    if @ssh_unit
+      Open3.capture2e('ssh', '-F', File.join(@root, 'ssh_config'), '-O', 'exit', 'test-peer')
+      Open3.capture2e('systemctl', 'stop', @ssh_unit)
+    end
     if @root && File.exist?(File.join(@root, 'state.json'))
       @build_units.concat(builds.filter_map { |build| build['unit_name'] })
     end
@@ -138,6 +172,98 @@ class SystemdBuildRestartTest < Minitest::Test
     false
   end
 
+  def start_test_sshd
+    socket = TCPServer.new('127.0.0.1', 0)
+    port = socket.addr[1]
+    socket.close
+    key = File.join(@root, 'ssh_key')
+    run_command('ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', key)
+    File.write(File.join(@root, 'sshd_config'), <<~CONFIG)
+      Port #{port}
+      ListenAddress 127.0.0.1
+      HostKey #{key}
+      PidFile #{@root}/sshd.pid
+      AuthorizedKeysFile #{key}.pub
+      StrictModes no
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      UsePAM no
+      PermitRootLogin prohibit-password
+      MaxSessions 64
+    CONFIG
+    File.write(File.join(@root, 'ssh_config'), <<~CONFIG)
+      Host test-peer
+        HostName 127.0.0.1
+        Port #{port}
+        User root
+        IdentityFile #{key}
+        IdentitiesOnly yes
+        StrictHostKeyChecking no
+        UserKnownHostsFile /dev/null
+        BatchMode yes
+        ConnectTimeout 5
+        ControlMaster auto
+        ControlPath #{@root}/ssh-control
+        ControlPersist 60
+    CONFIG
+    @ssh_unit = "archriscv-buildd-test-sshd-#{Process.pid}.service"
+    run_command('systemd-run', '--quiet', '--collect', '--service-type=exec', "--unit=#{@ssh_unit}",
+      '--', '/usr/bin/sshd', '-D', '-e', '-f', File.join(@root, 'sshd_config'))
+    wait_for do
+      TCPSocket.new('127.0.0.1', port).close
+      true
+    rescue Errno::ECONNREFUSED
+      false
+    end
+  end
+
+  def test_shared_ssh_master_survives_owning_build_completion_and_stop
+    start_test_sshd
+    %w[finish stop].each do |action|
+      owner = enqueue("ssh-owner-#{action}")
+      wait_for { File.exist?(File.join(@root, "ssh-owner-#{action}.ready")) }
+      config = File.join(@root, 'ssh_config')
+      master_pid = run_command('ssh', '-F', config, '-O', 'check', 'test-peer')[/pid=(\d+)/, 1].to_i
+      assert_operator master_pid, :>, 0
+      assert_includes File.read("/proc/#{master_pid}/cgroup"), owner['unit_name']
+
+      client = enqueue("ssh-client-#{action}")
+      wait_for { File.exist?(File.join(@root, "ssh-client-#{action}.ready")) }
+      if action == 'finish'
+        File.write(File.join(@root, "ssh-owner-#{action}.release"), '')
+        status(owner['id'], 'succeeded')
+      else
+        run_command('systemctl', 'stop', owner['unit_name'])
+        status(owner['id'], 'interrupted')
+      end
+      wait_for { !Open3.capture2e('systemctl', 'is-active', owner['unit_name']).last.success? }
+
+      assert process_alive?(master_pid), 'ending the owner killed a shared SSH master'
+      assert_equal master_pid, run_command('ssh', '-F', config, '-O', 'check', 'test-peer')[/pid=(\d+)/, 1].to_i
+      assert_equal 'running', find(client['id'])['status']
+      File.write(File.join(@root, "ssh-client-#{action}.release"), '')
+      status(client['id'], 'succeeded')
+      assert_includes request("/builds/#{client['id']}/raw").body, 'shared session finished'
+      run_command('ssh', '-F', config, '-O', 'exit', 'test-peer')
+      wait_for { !process_alive?(master_pid) }
+    end
+
+    interrupted = enqueue('ssh-interrupt')
+    wait_for { request("/builds/#{interrupted['id']}/raw").body.include?('waiting for remote Ctrl-C') }
+    client = enqueue('ssh-client-interrupt')
+    wait_for { File.exist?(File.join(@root, 'ssh-client-interrupt.ready')) }
+    restart_dashboard
+    assert_equal '303', request("/builds/#{interrupted['id']}/stop", {}).code
+    status(interrupted['id'], 'waiting_upload')
+    assert File.exist?(File.join(@root, 'remote-interrupted')), 'Ctrl-C did not reach the remote terminal'
+    assert_equal 'running', find(client['id'])['status']
+    assert_equal '303', request("/builds/#{interrupted['id']}/upload", 'decision' => 'yes').code
+    assert_equal 'upload', status(interrupted['id'], 'failed')['upload_decision']
+    File.write(File.join(@root, 'ssh-client-interrupt.release'), '')
+    status(client['id'], 'succeeded')
+    assert_includes request("/builds/#{client['id']}/raw").body, 'shared session finished'
+  end
+
   def test_builds_and_controls_survive_real_systemd_restarts
     build = enqueue('wait-running', 'packager@articuno')
     status(build['id'], 'running')
@@ -193,14 +319,20 @@ class SystemdBuildRestartTest < Minitest::Test
     wait_for { find(retry_build['id']).nil? }
     refute File.exist?(retry_build['log_path'])
 
-    stopped = enqueue('wait-stop')
+    stopped = enqueue('interrupt-stop')
     status(stopped['id'], 'running')
-    wait_for { File.exist?(File.join(@root, 'wait-stop.descendant')) }
-    child_pid = File.read(File.join(@root, 'wait-stop.pid')).to_i
-    descendant_pid = File.read(File.join(@root, 'wait-stop.descendant')).to_i
+    wait_for { request("/builds/#{stopped['id']}/raw").body.include?('waiting for Ctrl-C') }
+    child_pid = File.read(File.join(@root, 'interrupt-stop.pid')).to_i
+    descendant_pid = File.read(File.join(@root, 'interrupt-stop.descendant')).to_i
     restart_dashboard
     assert_equal '303', request("/builds/#{stopped['id']}/stop", {}).code
-    assert_equal 'interrupted', find(stopped['id'])['status']
+    status(stopped['id'], 'waiting_upload')
+    assert process_alive?(child_pid)
+    assert_nil find(stopped['id'])['note']
+    restart_dashboard
+    assert_equal '303', request("/builds/#{stopped['id']}/upload", 'decision' => 'yes').code
+    assert_equal 'upload', status(stopped['id'], 'failed')['upload_decision']
+    assert_includes request("/builds/#{stopped['id']}/raw").body, 'answer=y'
     wait_for { !process_alive?(child_pid) && !process_alive?(descendant_pid) }
 
     crashed = enqueue('wait-crash')

@@ -13,6 +13,7 @@ ENV['ARCHRISCV_BUILDD_LOG_DIR'] = File.join(TEST_ROOT, 'logs')
 ENV['ARCHRISCV_BUILDD_BUILD_COMMAND'] = File.join(TEST_ROOT, 'build-command')
 ENV['ARCHRISCV_BUILDD_REFRESH_COMMAND'] = File.join(TEST_ROOT, 'refresh-command')
 ENV['ARCHRISCV_BUILDD_BUILDER_USER'] = 'builder'
+ENV['ARCHRISCV_BUILDD_BUILDER_CACHE_DIR'] = File.join(TEST_ROOT, 'builder-cache')
 ENV['ARCHRISCV_BUILDD_WORKDIR'] = TEST_ROOT
 ENV['ARCHRISCV_TEST_ROOT'] = TEST_ROOT
 ENV.delete('SERVER')
@@ -54,6 +55,10 @@ class TestBuildService
     Process.waitpid(@pids.delete(build.id))
   end
 
+  def interrupt(build)
+    BuildTerminal.interrupt(@pids.fetch(build.id))
+  end
+
   def cleanup
     @pids.keys.each { |id| stop(Build.new(id: id, command_line: '', argv: [], pkgbase: '', log_path: '')) }
   end
@@ -67,8 +72,19 @@ class BuildRestartTest < Minitest::Test
       require 'json'
       STDOUT.sync = true
       puts JSON.generate(server: ENV['SERVER'], argv: ARGV, workdir: Dir.pwd)
+      cache_path = File.join(ENV.fetch('ARCHRISCV_BUILDD_BUILDER_CACHE_DIR'), "#{ARGV.first.sub(/:nocheck\z/, '')}-riscv64")
+      puts "builder-cache=#{File.exist?(cache_path)}"
       puts "\e[1m\e[32m==>\e(B\e[m\e[1m Building on test-builder\e(B\e[m"
-      if ARGV.first.start_with?('wait')
+      if ARGV.first.start_with?('interrupt')
+        interrupted = false
+        trap('INT') { interrupted = true }
+        puts 'waiting for Ctrl-C'
+        sleep 0.05 until interrupted
+        puts 'interrupt received'
+        print 'Upload log? [y/N] '
+        puts "answer=#{STDIN.gets.to_s.strip}"
+        exit 1
+      elsif ARGV.first.start_with?('wait')
         puts 'waiting for release'
         sleep 0.05 until File.exist?(File.join(ENV.fetch('ARCHRISCV_TEST_ROOT'), 'release'))
       elsif ARGV.first.start_with?('prompt')
@@ -131,8 +147,12 @@ class BuildRestartTest < Minitest::Test
 
   def refresh_request(extra_safe_deps = nil)
     body = extra_safe_deps.nil? ? '' : "extra_safe_deps=#{CGI.escape(extra_safe_deps)}"
+    post_request('/refresh', body)
+  end
+
+  def post_request(path, body = '')
     req = WEBrick::HTTPRequest.new(WEBrick::Config::HTTP)
-    req.parse(StringIO.new("POST /refresh HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: #{body.bytesize}\r\n\r\n#{body}"))
+    req.parse(StringIO.new("POST #{path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: #{body.bytesize}\r\n\r\n#{body}"))
     res = WEBrick::HTTPResponse.new(WEBrick::Config::HTTP)
     WebApp.new(@manager).call(req, res)
     res
@@ -164,6 +184,88 @@ class BuildRestartTest < Minitest::Test
     assert_equal 400, response.status
     assert_includes response.body, 'refresh failed'
     assert_equal %w[candidate-one candidate-two], @manager.refresh_pending
+  end
+
+  def test_skip_upload_and_retry_preserves_builder_and_cache_by_default
+    FileUtils.mkdir_p(BUILDER_CACHE_DIR)
+    cache = File.join(BUILDER_CACHE_DIR, 'prompt-retry-riscv64')
+    File.write(cache, 'builder@cached-host')
+    build = @manager.enqueue('prompt-retry:nocheck', target_builder: 'pinned-host')
+    wait_for { @manager.find(build.id).status == 'waiting_upload' }
+
+    assert_equal 303, post_request("/builds/#{build.id}/retry").status
+    retried = @manager.all_builds.find { |entry| entry.id != build.id }
+    wait_for { @manager.find(retried.id).status == 'waiting_upload' }
+    assert_equal 'builder@pinned-host', retried.target_builder
+    assert_equal 'prompt-retry:nocheck', retried.command_line
+    assert_equal 'builder@cached-host', File.read(cache)
+    assert_includes File.read(retried.log_path), 'builder-cache=true'
+    assert_includes File.read(retried.log_path), '"server":"builder@pinned-host"'
+    wait_for { @manager.find(build.id).nil? }
+  end
+
+  def test_skip_upload_and_retry_with_new_builder_clears_only_its_cache_and_target
+    FileUtils.mkdir_p(BUILDER_CACHE_DIR)
+    cache = File.join(BUILDER_CACHE_DIR, 'prompt-retry-riscv64')
+    other_cache = File.join(BUILDER_CACHE_DIR, 'other-riscv64')
+    x86_cache = File.join(BUILDER_CACHE_DIR, 'prompt-retry-x86_64')
+    [cache, other_cache, x86_cache].each { |path| File.write(path, 'builder@cached-host') }
+    build = @manager.enqueue('prompt-retry:nocheck', target_builder: 'pinned-host')
+    wait_for { @manager.find(build.id).status == 'waiting_upload' }
+    ENV['SERVER'] = 'builder@environment-host'
+
+    assert_equal 303, post_request("/builds/#{build.id}/retry", 'new_builder=1').status
+    retried = @manager.all_builds.find { |entry| entry.id != build.id }
+    wait_for { @manager.find(retried.id).status == 'waiting_upload' }
+    assert_nil retried.target_builder
+    assert_equal 'prompt-retry:nocheck', retried.command_line
+    refute File.exist?(cache)
+    [other_cache, x86_cache].each { |path| assert_equal 'builder@cached-host', File.read(path) }
+    assert_includes File.read(retried.log_path), 'builder-cache=false'
+    assert_includes File.read(retried.log_path), '"server":null'
+    assert_equal 'builder@environment-host', ENV['SERVER']
+    restart
+    assert_nil @manager.find(retried.id).target_builder
+    assert_equal 1, @service.starts[retried.id]
+    wait_for { @manager.find(build.id).nil? }
+  ensure
+    ENV.delete('SERVER')
+  end
+
+  def test_retry_with_new_builder_allows_missing_cache
+    build = @manager.enqueue('prompt-no-cache')
+    wait_for { @manager.find(build.id).status == 'waiting_upload' }
+    assert_equal 303, post_request("/builds/#{build.id}/retry", 'new_builder=1').status
+    retried = @manager.all_builds.find { |entry| entry.id != build.id }
+    refute_nil retried
+    assert_nil retried.target_builder
+  end
+
+  def test_new_builder_cache_error_does_not_enqueue_a_retry
+    build = @manager.enqueue('prompt-cache-error')
+    wait_for { @manager.find(build.id).status == 'waiting_upload' }
+    @manager.answer_upload(build.id, upload: true)
+    finished(build.id)
+    cache = File.join(BUILDER_CACHE_DIR, 'prompt-cache-error-riscv64')
+    FileUtils.mkdir_p(cache)
+
+    response = post_request("/builds/#{build.id}/retry", 'new_builder=1')
+    assert_equal 400, response.status
+    assert_includes response.body, 'Is a directory'
+    assert_equal [build.id], @manager.all_builds.map(&:id)
+    assert Dir.exist?(cache)
+  end
+
+  def test_live_upload_panel_already_contains_retry_and_new_builder_checkbox
+    build = @manager.enqueue('wait-live-prompt')
+    wait_for { @manager.find(build.id).status == 'running' }
+    res = WEBrick::HTTPResponse.new(WEBrick::Config::HTTP)
+    WebApp.new(@manager).send(:show_log, nil, res, build.id)
+    assert_includes res.body, 'id="decision"'
+    assert_includes res.body, "action=\"/builds/#{build.id}/retry\""
+    assert_includes res.body, 'Skip upload + retry'
+    assert_includes res.body, '<input type="checkbox" name="new_builder" value="1"> New builder'
+    refute_match(/name="new_builder"[^>]*checked/, res.body)
   end
 
   def test_running_build_survives_restart_with_target_and_environment
@@ -253,14 +355,21 @@ class BuildRestartTest < Minitest::Test
     refute Dir.exist?(File.join(WORKER_DIR, build.id))
   end
 
-  def test_stop_still_terminates_build_after_restart
-    build = @manager.enqueue('wait-stop')
-    wait_for { @manager.find(build.id).status == 'running' }
+  def test_stop_sends_ctrl_c_and_allows_upload_after_restart
+    build = @manager.enqueue('interrupt-stop')
+    wait_for { File.exist?(build.log_path) && File.read(build.log_path).include?('waiting for Ctrl-C') }
     restart
-    @manager.stop_build(build.id)
-    assert_equal 'interrupted', @manager.find(build.id).status
-    assert_equal 'stopped by user', @manager.find(build.id).note
-    refute @service.active?(build)
+    assert_equal 303, post_request("/builds/#{build.id}/stop").status
+    wait_for { @manager.find(build.id).status == 'waiting_upload' }
+    assert @service.active?(build)
+    assert_nil @manager.find(build.id).note
+    restart
+    @manager.answer_upload(build.id, upload: true)
+    result = finished(build.id)
+    assert_equal 'upload', result.upload_decision
+    assert_includes File.read(build.log_path), 'interrupt received'
+    assert_includes File.read(build.log_path), 'answer=y'
+    assert_equal 1, @service.starts[build.id]
   end
 
   def test_queued_build_recovers_without_duplicate_launch
@@ -269,7 +378,6 @@ class BuildRestartTest < Minitest::Test
     assert_equal 'queued', JSON.parse(File.read(STATE_FILE))['builds'].first['status']
     restart
     assert_equal 1, @service.starts[build.id]
-    @manager.stop_build(build.id)
   end
 
   def test_legacy_active_build_is_interrupted_and_history_is_unlimited

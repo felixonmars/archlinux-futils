@@ -3,6 +3,7 @@
 
 require 'cgi'
 require 'fileutils'
+require 'fiddle/import'
 require 'json'
 require 'open3'
 require 'pty'
@@ -19,6 +20,7 @@ STATE_FILE = File.join(STATE_DIR, 'state.json')
 WORKER_DIR = File.expand_path(File.join(STATE_DIR, 'workers'))
 BUILD_COMMAND = ENV.fetch('ARCHRISCV_BUILDD_BUILD_COMMAND', 'riscvu')
 BUILDER_USER = ENV.fetch('ARCHRISCV_BUILDD_BUILDER_USER', '').strip
+BUILDER_CACHE_DIR = ENV.fetch('ARCHRISCV_BUILDD_BUILDER_CACHE_DIR', '/tmp/felixbuild-server-select')
 REFRESH_COMMAND = ENV.fetch('ARCHRISCV_BUILDD_REFRESH_COMMAND', 'archrv-refresh')
 BUILD_WORKDIR = ENV['ARCHRISCV_BUILDD_WORKDIR']
 BIND = ENV.fetch('ARCHRISCV_BUILDD_BIND', '127.0.0.1')
@@ -190,13 +192,52 @@ def write_json(path, data)
   File.rename(tmp, path)
 end
 
+module ProcessDescriptors
+  extend Fiddle::Importer
+  dlload Fiddle::Handle::DEFAULT
+  extern 'int pidfd_open(int, unsigned int)'
+  extern 'int pidfd_getfd(int, int, unsigned int)'
+end
+
+class BuildTerminal
+  def self.interrupt(pid)
+    raise ArgumentError, 'build worker is not running' unless pid.positive?
+
+    fd = ProcessDescriptors.pidfd_open(pid, 0)
+    raise SystemCallError.new('open build worker', Fiddle.last_error) if fd.negative?
+
+    process = IO.for_fd(fd)
+    # Duplicate the existing PTY master; reopening /proc/PID/fd/N would create
+    # a different PTY. A pidfd also prevents targeting a reused process ID.
+    terminal = Dir.children("/proc/#{pid}/fdinfo").find do |name|
+      File.read("/proc/#{pid}/fdinfo/#{name}").match?(/^tty-index:\s*\d+/)
+    rescue Errno::ENOENT
+      false
+    end
+    raise ArgumentError, 'build terminal is not ready' unless terminal
+
+    fd = ProcessDescriptors.pidfd_getfd(process.fileno, terminal.to_i, 0)
+    raise SystemCallError.new('access build terminal', Fiddle.last_error) if fd.negative?
+
+    IO.open(fd, 'w') do |writer|
+      raise ArgumentError, 'build terminal is no longer available' unless writer.tty?
+
+      writer.write("\x03")
+      writer.flush
+    end
+  ensure
+    process&.close
+  end
+end
+
 class SystemdBuildService
   def start(build, directory)
     output, status = Open3.capture2e(
       'systemd-run', '--quiet', '--collect', '--service-type=exec',
       "--unit=#{build.unit_name}", "--description=Build #{build.command_line}",
       "--property=User=#{Process.uid}", "--property=Group=#{Process.gid}",
-      '--property=KillMode=control-group', '--property=TimeoutStopSec=10s',
+      # Detached SSH control masters may also carry sessions for other builds.
+      '--property=KillMode=process', '--property=TimeoutStopSec=10s',
       '--property=UMask=0077',
       '--', RbConfig.ruby, File.realpath(__FILE__), '--worker', directory
     )
@@ -219,6 +260,13 @@ class SystemdBuildService
   def stop(build)
     output, status = Open3.capture2e('systemctl', 'stop', build.unit_name)
     raise "could not stop build worker: #{output.strip}" unless status.success? || !active?(build)
+  end
+
+  def interrupt(build)
+    output, status = Open3.capture2e('systemctl', 'show', '--property=MainPID', '--value', build.unit_name)
+    raise "could not query build worker: #{output.strip}" unless status.success?
+
+    BuildTerminal.interrupt(output.strip.to_i)
   end
 end
 
@@ -351,20 +399,28 @@ class BuildWorker
   end
 
   def reap_child
-    return unless @pid && !@wait_status
+    return unless @pid
 
-    Process.kill('TERM', -@pid)
+    # Reap the build's process group even after its leader exits. SSH control
+    # masters detach into separate sessions and must survive for other clients.
+    signal_child_group('TERM')
     deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 3
     loop do
-      _, @wait_status = Process.wait2(@pid, Process::WNOHANG)
-      return if @wait_status
+      _, @wait_status = Process.wait2(@pid, Process::WNOHANG) unless @wait_status
+      break unless signal_child_group(0)
       break if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
 
       sleep 0.05
     end
-    Process.kill('KILL', -@pid)
-    _, @wait_status = Process.wait2(@pid)
-  rescue Errno::ESRCH, Errno::ECHILD
+    signal_child_group('KILL')
+    _, @wait_status = Process.wait2(@pid) unless @wait_status
+  rescue Errno::ECHILD
+    nil
+  end
+
+  def signal_child_group(signal)
+    Process.kill(signal, -@pid)
+  rescue Errno::ESRCH
     nil
   end
 end
@@ -424,11 +480,11 @@ class BuildManager
     @mutex.synchronize { @refresh_pending.dup }
   end
 
-  def enqueue(command_line, target_builder: nil, ignore_active_id: nil)
+  def enqueue(command_line, target_builder: nil, ignore_active_id: nil, new_builder: false)
     command_line = command_line.to_s.strip
     raise ArgumentError, 'enter a package name, optionally ending with :nocheck' unless command_line.match?(COMMAND_PATTERN)
 
-    target_builder = target_builder.to_s.strip
+    target_builder = new_builder ? '' : target_builder.to_s.strip
     if !target_builder.empty? && !target_builder.include?('@') && !BUILDER_USER.empty?
       target_builder = "#{BUILDER_USER}@#{target_builder}"
     end
@@ -455,8 +511,9 @@ class BuildManager
         raise ArgumentError, "#{pkgbase} is already queued or building"
       end
 
+      clear_builder_cache(pkgbase) if new_builder
       @builds[id] = build
-      prepare_worker(build)
+      prepare_worker(build, new_builder: new_builder)
       persist_locked
       launch_worker(build)
     end
@@ -553,17 +610,9 @@ class BuildManager
     build = find(id) || raise(ArgumentError, 'unknown build')
     raise ArgumentError, 'build is not active' unless build.active?
 
-    @service.stop(build)
-    @mutex.synchronize do
-      refresh_workers_locked
-      build = @builds[id]
-      return unless build
-
-      build.status = 'interrupted'
-      build.finished_at ||= Time.now.utc
-      build.note = 'stopped by user'
-      persist_locked
-    end
+    @service.interrupt(build)
+  rescue StandardError => e
+    raise ArgumentError, e.message
   end
 
   def delete_build(id)
@@ -626,7 +675,13 @@ class BuildManager
     File.join(worker_directory(build), 'status.json')
   end
 
-  def prepare_worker(build)
+  def clear_builder_cache(pkgbase)
+    File.unlink(File.join(BUILDER_CACHE_DIR, "#{pkgbase}-riscv64"))
+  rescue Errno::ENOENT
+    nil
+  end
+
+  def prepare_worker(build, new_builder: false)
     build.unit_name = "#{APP_NAME}-build-#{build.id}.service"
     build.log_path = File.expand_path(build.log_path)
     directory = worker_directory(build)
@@ -635,6 +690,8 @@ class BuildManager
     environment = ENV.to_h.reject do |key, _|
       %w[NOTIFY_SOCKET WATCHDOG_PID WATCHDOG_USEC INVOCATION_ID JOURNAL_STREAM SYSTEMD_EXEC_PID].include?(key)
     end
+    # SERVER overrides the selector even when the package's cache was cleared.
+    environment.delete('SERVER') if new_builder
     write_json(File.join(directory, 'request.json'),
       'build' => build.to_h,
       'environment' => environment,
@@ -796,7 +853,8 @@ class WebApp
     end
 
     @manager.answer_upload(id, upload: false) if build.status == 'waiting_upload'
-    @manager.enqueue(build.command_line, target_builder: build.target_builder, ignore_active_id: id)
+    @manager.enqueue(build.command_line, target_builder: build.target_builder, ignore_active_id: id,
+      new_builder: req.query['new_builder'] == '1')
     redirect(res, '/')
   end
 
@@ -1019,6 +1077,11 @@ class WebApp
             hostEl.style.display = '';
           }
           durationEl.textContent = data.duration;
+          if (data.started_at) {
+            document.querySelectorAll('[data-builder-expires-at]').forEach((label) => {
+              label.dataset.builderExpiresAt = Date.parse(data.started_at) + 300000;
+            });
+          }
           if (decisionEl) decisionEl.style.display = data.status === 'waiting_upload' ? '' : 'none';
           if (data.done) events.close();
         });
@@ -1059,6 +1122,7 @@ class WebApp
           status: current.status,
           build_host: current.build_host,
           duration: duration(current),
+          started_at: current.started_at&.iso8601,
           done: current.terminal?
         }
         encoded = JSON.generate(payload)
@@ -1261,16 +1325,28 @@ class WebApp
     HTML
   end
 
-  def retry_button(build)
-    return '' unless %w[failed interrupted waiting_upload].include?(build.status)
+  def retry_button(build, waiting_upload: build.status == 'waiting_upload')
+    return '' unless waiting_upload || %w[failed interrupted].include?(build.status)
 
-    label = build.status == 'waiting_upload' ? 'Skip upload + retry' : 'Retry'
-    button_class = build.status == 'waiting_upload' ? 'button is-small is-warning' : 'button is-small is-primary'
+    label = waiting_upload ? 'Skip upload + retry' : 'Retry'
+    button_class = waiting_upload ? 'button is-small is-warning' : 'button is-small is-primary'
 
     <<~HTML
       <form class="inline" action="/builds/#{h(build.id)}/retry" method="post">
         <button class="#{button_class}" type="submit">#{label}</button>
+        #{new_builder_checkbox(build)}
       </form>
+    HTML
+  end
+
+  def new_builder_checkbox(build)
+    return '' if build.started_at && Time.now - build.started_at >= 300
+
+    expires_at = ((build.started_at.to_f + 300) * 1000).to_i if build.started_at
+    <<~HTML
+      <label class="checkbox is-size-7" data-builder-expires-at="#{expires_at}" title="Clear this package's cached builder and use automatic selection for the retry">
+        <input type="checkbox" name="new_builder" value="1"> New builder
+      </label>
     HTML
   end
 
@@ -1279,7 +1355,7 @@ class WebApp
 
     <<~HTML
       <form class="inline" action="/builds/#{h(build.id)}/stop" method="post">
-        <button class="button is-small is-danger" type="submit">Stop</button>
+        <button class="button is-small is-danger" type="submit" title="Send Ctrl-C to the build terminal">Stop</button>
       </form>
     HTML
   end
@@ -1299,7 +1375,7 @@ class WebApp
               <button class="button is-small is-warning" name="decision" value="yes" type="submit">Upload</button>
               <button class="button is-small is-light" name="decision" value="no" type="submit">Skip</button>
             </form>
-            #{retry_button(build)}
+            #{retry_button(build, waiting_upload: true)}
           </div>
         </div>
       </div>
@@ -1384,6 +1460,16 @@ class WebApp
         <main>
           #{body}
         </main>
+        <script>
+          function expireBuilderChoices() {
+            document.querySelectorAll('[data-builder-expires-at]').forEach((label) => {
+              const expiresAt = Number(label.dataset.builderExpiresAt);
+              if (expiresAt && Date.now() >= expiresAt) label.remove();
+            });
+          }
+          expireBuilderChoices();
+          setInterval(expireBuilderChoices, 1000);
+        </script>
       </body>
       </html>
     HTML
