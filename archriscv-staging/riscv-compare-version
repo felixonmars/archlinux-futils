@@ -8,6 +8,7 @@ require 'uri'
 require 'json'
 require 'erb'
 require 'pycall/import'
+require_relative 'riscv-package-metadata'
 
 include PyCall::Import
 
@@ -32,6 +33,15 @@ $version_mismatch_pkgnames = Set[]
 $blacklist = Set[]
 $broken_pkgbases = Set[]
 $broken_pkgnames = Set[]
+
+def riscv_upstream_version(version)
+    version.sub(/(-[^.-]+)\.[^-]*\z/, '\1')
+end
+
+def target_package?(pkgbase, pkgname)
+    metadata = $target_metadata[pkgbase]
+    !metadata || metadata['pkgnames'].include?(pkgname)
+end
 
 STDOUT.sync = true
 puts "Running pacman -Sy..."
@@ -193,6 +203,23 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
 
     $rv_provides |= $rv_packages.keys.to_set
 
+    puts "Reading RISC-V package metadata (cached by release and patch contents)..."
+    versions = $x86_packages.values.to_h { |package| [package['base'], package['version']] }
+    $target_metadata = RiscvPackageMetadata.new(versions: versions, patch_repo: PATCHREPO,
+        cache_dir: ENV.fetch('RISCV_COMPARE_METADATA_CACHE', '/var/cache/riscv-compare-version'))
+    candidates = $x86_packages.filter_map do |pkgname, package|
+        next if $blacklist.include?(package['base']) || $blacklist.include?(pkgname)
+        next if $rv_packages.key?(pkgname) && riscv_upstream_version($rv_packages[pkgname]['version']) == package['version']
+
+        package['base']
+    end
+    $target_metadata.prefetch(candidates)
+    puts "RISC-V metadata: #{candidates.uniq.size - $target_metadata.errors.size} usable, #{$target_metadata.errors.size} fallbacks"
+    candidates.uniq.each do |pkgbase|
+        metadata = $target_metadata[pkgbase]
+        metadata&.fetch('provides')&.each { |depname| $x86_pkgbase_by_depname[depname] ||= pkgbase }
+    end
+
     puts "Indexing riscv reverse dependencies..."
     $rv_packages.each do |pkgname, package|
         package["depends"].each do |dep|
@@ -202,18 +229,15 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
 
     puts "Checking version mismatch..."
     $rv_packages.each do |pkgname, package|
-        rvver = package["version"]
-
-        if rvver.split("-")[1].include? "."
-            rvver = [rvver.split("-")[0], rvver.split("-")[1].split(".")[0]].join("-")
-        end
+        rvver = riscv_upstream_version(package["version"])
 
         if $x86_packages.has_key?(pkgname) && $x86_packages[pkgname]["version"] == rvver
             pkgfile = "#{REPOROOT}/repo/#{package['db']}/#{package['filename']}"
             $current_rv_package_mtimes_by_pkgbase[$x86_packages[pkgname]["base"]] << File.mtime(pkgfile) if File.exist?(pkgfile)
         end
 
-        if $x86_packages.has_key?(pkgname) && $x86_packages[pkgname]["version"] != rvver
+        if $x86_packages.has_key?(pkgname) && $x86_packages[pkgname]["version"] != rvver &&
+                target_package?($x86_packages[pkgname]['base'], pkgname)
             $version_mismatch_pkgbases << $x86_packages[pkgname]["base"]
             $version_mismatch_pkgnames << pkgname
             package['provides'].each do |_package|
@@ -307,12 +331,11 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
                     end
                 end
 
-                if rvver.split("-")[1].include? "."
-                    rvver = [rvver.split("-")[0], rvver.split("-")[1].split(".")[0]].join("-")
-                end
+                rvver = riscv_upstream_version(rvver)
 
                 next if rvver == package["version"]
             end
+            next unless target_package?(package['base'], pkgname)
 
             log_mtime = nil
             if File.exist?("#{REPOROOT}/.status/logs/#{package['base']}/#{package['base']}-#{package['version']}.log")
@@ -335,13 +358,19 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
     end
 
     def missing_dep(pkgbase)
-        def check_dep(pkgbase)
+        metadata = $target_metadata[pkgbase]
+        if metadata
+            dependencies = metadata['dependencies']
+            own_provides = metadata['provides'].to_set
+        else
+            dependencies = []
+            own_provides = $x86_depnames_by_pkgbase[pkgbase]
             $x86_pkgnames_by_pkgbase[pkgbase].each do |pkgname|
                 next if ! $x86_packages.has_key? pkgname
                 package = $x86_packages[pkgname]
-                package["depends"].each do |dep| yield [dep, nil] end
-                package["makedepends"].each do |dep| yield [dep, "make"] end
-                package["checkdepends"].each do |dep| yield [dep, "check"] end
+                package["depends"].each do |dep| dependencies << [dep, nil] end
+                package["makedepends"].each do |dep| dependencies << [dep, "make"] end
+                package["checkdepends"].each do |dep| dependencies << [dep, "check"] end
             end
         end
 
@@ -349,10 +378,10 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
         broken = Set[]
         outdated = Set[]
 
-        check_dep(pkgbase) do |dep, type|
+        dependencies.each do |dep, type|
             dep = dep.split(/[<>=]/)[0]
 
-            if ! $rv_provides.include?(dep) && ! $x86_depnames_by_pkgbase[pkgbase].include?(dep)
+            if ! $rv_provides.include?(dep) && !own_provides.include?(dep)
                 missing << [dep, type]
             elsif $broken_pkgnames.include?(dep)
                 broken << [dep, type]
@@ -395,6 +424,9 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
         verstr = ""
         missing, broken, outdated = missing_dep(pkgbase)
 
+        if (error = $target_metadata.errors[pkgbase])
+            verstr += " <span class='tag is-warning' title='#{ERB::Util.html_escape(error)}'>Dependency metadata unavailable; using x86_64</span>"
+        end
         verstr += make_tag_with_details(missing, 'DEP MISSING', 'danger') if missing.any?
         verstr += make_tag_with_details(broken, 'DEP BROKEN', 'danger') if broken.any?
         verstr += make_tag_with_details(outdated, 'DEP OUTDATED', 'warning') if outdated.any?
@@ -517,8 +549,10 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
     $x86_packages.each do |pkgname, package|
         pkgbase = package['base']
         next if $rv_packages.include? pkgname or $broken_pkgbases.include? pkgbase
-        next if $current_rv_package_mtimes_by_pkgbase[pkgbase].any?
         next if $blacklist.include? pkgbase or $blacklist.include? pkgname
+        metadata = $target_metadata[pkgbase]
+        next if metadata && !metadata['pkgnames'].include?(pkgname)
+        next if !metadata && $current_rv_package_mtimes_by_pkgbase[pkgbase].any?
 
         missing_pkgbases << pkgbase
     end
@@ -544,6 +578,8 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
         pkgbase = package['base']
         lint_by_pkgbase[pkgbase]["db"] ||= package['db']
         if ! $x86_packages.include? pkgname
+            next if versions.key?(pkgbase) && $target_metadata[pkgbase]&.fetch('pkgnames')&.include?(pkgname)
+
             lint_by_pkgbase[pkgbase]["missing"] << pkgname
         elsif $x86_packages[pkgname]["db"] != package["db"]
             lint_by_pkgbase[pkgbase]["wrong_db"][$x86_packages[pkgname]["db"]] << pkgname
