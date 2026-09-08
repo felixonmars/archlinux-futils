@@ -87,6 +87,7 @@ class BuildRestartTest < Minitest::Test
       elsif ARGV.first.start_with?('wait')
         puts 'waiting for release'
         sleep 0.05 until File.exist?(File.join(ENV.fetch('ARCHRISCV_TEST_ROOT'), 'release'))
+        exit 1 if File.exist?(File.join(ENV.fetch('ARCHRISCV_TEST_ROOT'), 'fail-dependency'))
       elsif ARGV.first.start_with?('prompt')
         print 'Upload log? [y/N] '
         answer = STDIN.gets.to_s.strip
@@ -266,6 +267,48 @@ class BuildRestartTest < Minitest::Test
     assert_includes res.body, 'Skip upload + retry'
     assert_includes res.body, '<input type="checkbox" name="new_builder" value="1"> New builder'
     refute_match(/name="new_builder"[^>]*checked/, res.body)
+    assert_includes res.body, "action=\"/builds/#{build.id}/defer\""
+    assert_includes res.body, 'name="wait_for"'
+    assert_includes res.body, '>Defer</button>'
+  end
+
+  def test_defer_skips_log_and_retries_once_after_a_new_matching_success
+    old_dependency = @manager.enqueue('wait-dependency')
+    File.write(File.join(TEST_ROOT, 'release'), '')
+    finished(old_dependency.id)
+    source = @manager.enqueue('prompt-deferred:nocheck', target_builder: 'pinned-host')
+    wait_for { @manager.find(source.id).status == 'waiting_upload' }
+
+    response = post_request("/builds/#{source.id}/defer", 'wait_for=wait-dependency')
+    assert_equal 303, response.status
+    pending = @manager.deferred_retries.fetch(0)
+    retry_id = pending.fetch('build').fetch('id')
+    wait_for { @manager.find(source.id).nil? }
+    refute File.exist?(source.log_path)
+    assert_equal 'wait-dependency', pending['wait_for']
+    assert_equal 0, @service.starts[retry_id]
+
+    unrelated = @manager.enqueue('unrelated')
+    finished(unrelated.id)
+    File.write(File.join(TEST_ROOT, 'fail-dependency'), '')
+    failed_dependency = @manager.enqueue('wait-dependency')
+    assert_equal 'failed', finished(failed_dependency.id).status
+    restart
+    assert_equal 1, @manager.deferred_retries.size
+    assert_equal 0, @service.starts[retry_id]
+    File.unlink(File.join(TEST_ROOT, 'fail-dependency'))
+
+    dependency = @manager.enqueue('wait-dependency:nocheck')
+    finished(dependency.id)
+    wait_for { @manager.find(retry_id)&.status == 'waiting_upload' }
+    assert_empty @manager.deferred_retries
+    result = @manager.find(retry_id)
+    assert_equal 'prompt-deferred:nocheck', result.command_line
+    assert_equal 'builder@pinned-host', result.target_builder
+    assert_includes File.read(result.log_path), '"server":"builder@pinned-host"'
+    restart
+    assert_equal 1, @service.starts[retry_id]
+    assert_empty @manager.deferred_retries
   end
 
   def test_running_build_survives_restart_with_target_and_environment

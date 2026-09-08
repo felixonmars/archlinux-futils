@@ -431,6 +431,7 @@ class BuildManager
     @mutex = Mutex.new
     @builds = {}
     @refresh_pending = []
+    @deferred_retries = []
     @shutting_down = false
 
     FileUtils.mkdir_p([STATE_DIR, LOG_DIR, WORKER_DIR])
@@ -481,38 +482,14 @@ class BuildManager
   end
 
   def enqueue(command_line, target_builder: nil, ignore_active_id: nil, new_builder: false)
-    command_line = command_line.to_s.strip
-    raise ArgumentError, 'enter a package name, optionally ending with :nocheck' unless command_line.match?(COMMAND_PATTERN)
-
-    target_builder = new_builder ? '' : target_builder.to_s.strip
-    if !target_builder.empty? && !target_builder.include?('@') && !BUILDER_USER.empty?
-      target_builder = "#{BUILDER_USER}@#{target_builder}"
-    end
-    unless target_builder.empty? || target_builder.match?(TARGET_BUILDER_PATTERN)
-      raise ArgumentError, 'enter a target builder as host or user@host, or leave it blank for automatic selection'
-    end
-    target_builder = nil if target_builder.empty?
-
-    pkgbase = command_line.sub(/:nocheck\z/, '')
-    id = "#{Time.now.utc.strftime('%Y%m%d%H%M%S')}-#{format('%06x', Random.rand(0x1000000))}"
-    log_path = File.expand_path(File.join(LOG_DIR, "#{id}-#{safe_filename(pkgbase)}.log"))
-    build = Build.new(
-      id: id,
-      command_line: command_line,
-      argv: [BUILD_COMMAND, command_line],
-      pkgbase: pkgbase,
-      target_builder: target_builder,
-      log_path: log_path
-    )
+    build = new_build(command_line, target_builder: new_builder ? nil : target_builder)
 
     @mutex.synchronize do
       refresh_workers_locked
-      if @builds.values.any? { |existing| existing.id != ignore_active_id && existing.active? && existing.pkgbase == pkgbase }
-        raise ArgumentError, "#{pkgbase} is already queued or building"
-      end
+      check_duplicate_locked(build.pkgbase, ignore_active_id: ignore_active_id)
 
-      clear_builder_cache(pkgbase) if new_builder
-      @builds[id] = build
+      clear_builder_cache(build.pkgbase) if new_builder
+      @builds[build.id] = build
       prepare_worker(build, new_builder: new_builder)
       persist_locked
       launch_worker(build)
@@ -587,11 +564,7 @@ class BuildManager
       build = @builds[id] || raise(ArgumentError, 'unknown build')
       raise ArgumentError, 'build is not waiting for an upload decision' unless build.status == 'waiting_upload'
 
-      path = File.join(worker_directory(build), 'upload.json')
-      if File.exist?(path) && JSON.parse(File.read(path))['decision'] != decision
-        raise ArgumentError, 'an upload decision has already been submitted'
-      end
-      write_json(path, 'decision' => decision)
+      save_upload_decision(build, decision)
     end
 
     deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
@@ -604,6 +577,45 @@ class BuildManager
       sleep 0.05
     end
     raise ArgumentError, 'upload decision saved; the build worker has not acknowledged it yet'
+  end
+
+  def defer_build(id, wait_for:)
+    wait_for = wait_for.to_s.strip
+    unless wait_for.match?(COMMAND_PATTERN) && !wait_for.end_with?(':nocheck')
+      raise ArgumentError, 'enter the package base to wait for'
+    end
+
+    @mutex.synchronize do
+      refresh_workers_locked
+      source = @builds[id] || raise(ArgumentError, 'unknown build')
+      raise ArgumentError, 'build is not waiting for an upload decision' unless source.status == 'waiting_upload'
+      raise ArgumentError, 'a build cannot wait for itself' if wait_for == source.pkgbase
+
+      check_duplicate_locked(source.pkgbase, ignore_active_id: id)
+      path = File.join(worker_directory(source), 'upload.json')
+      raise ArgumentError, 'an upload decision has already been submitted' if File.exist?(path)
+
+      build = new_build(source.command_line, target_builder: source.target_builder)
+      @deferred_retries << {'build' => build.to_h, 'source_id' => id, 'wait_for' => wait_for, 'ready' => false}
+      # Save the retry before skipping; the monitor can resend a skip after a crash.
+      persist_locked
+      save_upload_decision(source, 'skip')
+      build
+    end
+  end
+
+  def deferred_retries
+    @mutex.synchronize { @deferred_retries.map(&:dup) }
+  end
+
+  def cancel_deferred(id)
+    @mutex.synchronize do
+      entry = @deferred_retries.find { |pending| pending['build']['id'] == id }
+      raise ArgumentError, 'unknown deferred build' unless entry
+
+      @deferred_retries.delete(entry)
+      persist_locked
+    end
   end
 
   def stop_build(id)
@@ -638,6 +650,47 @@ class BuildManager
 
   private
 
+  def new_build(command_line, target_builder: nil)
+    command_line = command_line.to_s.strip
+    raise ArgumentError, 'enter a package name, optionally ending with :nocheck' unless command_line.match?(COMMAND_PATTERN)
+
+    target_builder = target_builder.to_s.strip
+    if !target_builder.empty? && !target_builder.include?('@') && !BUILDER_USER.empty?
+      target_builder = "#{BUILDER_USER}@#{target_builder}"
+    end
+    unless target_builder.empty? || target_builder.match?(TARGET_BUILDER_PATTERN)
+      raise ArgumentError, 'enter a target builder as host or user@host, or leave it blank for automatic selection'
+    end
+    target_builder = nil if target_builder.empty?
+
+    pkgbase = command_line.sub(/:nocheck\z/, '')
+    id = "#{Time.now.utc.strftime('%Y%m%d%H%M%S')}-#{format('%06x', Random.rand(0x1000000))}"
+    Build.new(
+      id: id, command_line: command_line, argv: [BUILD_COMMAND, command_line],
+      pkgbase: pkgbase, target_builder: target_builder,
+      log_path: File.expand_path(File.join(LOG_DIR, "#{id}-#{safe_filename(pkgbase)}.log"))
+    )
+  end
+
+  def check_duplicate_locked(pkgbase, ignore_active_id: nil)
+    if @deferred_retries.any? { |entry| entry['build']['pkgbase'] == pkgbase }
+      raise ArgumentError, "#{pkgbase} already has a deferred retry"
+    end
+    if @builds.values.any? { |build| build.id != ignore_active_id && build.active? && build.pkgbase == pkgbase }
+      raise ArgumentError, "#{pkgbase} is already queued or building"
+    end
+  end
+
+  def save_upload_decision(build, decision)
+    path = File.join(worker_directory(build), 'upload.json')
+    if File.exist?(path)
+      raise ArgumentError, 'an upload decision has already been submitted' if JSON.parse(File.read(path))['decision'] != decision
+
+      return
+    end
+    write_json(path, 'decision' => decision)
+  end
+
   def load_state
     return unless File.exist?(STATE_FILE)
 
@@ -654,6 +707,7 @@ class BuildManager
       @builds[build.id] = build
     end
     @refresh_pending = data.fetch('refresh_pending', []).select { |pkgbase| pkgbase.to_s.match?(COMMAND_PATTERN) }
+    @deferred_retries = data.fetch('deferred_retries', [])
     persist_locked if changed
   rescue JSON::ParserError => e
     warn "#{APP_NAME}: ignoring unreadable state file: #{e.message}"
@@ -663,7 +717,8 @@ class BuildManager
     FileUtils.mkdir_p(STATE_DIR)
     write_json(STATE_FILE,
       'builds' => @builds.values.sort_by(&:created_at).map(&:to_h),
-      'refresh_pending' => @refresh_pending
+      'refresh_pending' => @refresh_pending,
+      'deferred_retries' => @deferred_retries
     )
   end
 
@@ -725,6 +780,7 @@ class BuildManager
   def refresh_workers_locked(check_units: false)
     changed = false
     removed = []
+    succeeded = []
     @builds.values.select { |build| build.unit_name && (build.active? || build.discard_after_finish) }.each do |build|
       before = build.to_h
       current = worker_status(build)
@@ -737,6 +793,7 @@ class BuildManager
           current.note = 'build worker exited without recording a result'
         end
       end
+      succeeded << current.pkgbase if current.status == 'succeeded' && build.status != 'succeeded'
       if current.terminal? && current.discard_after_finish
         @builds.delete(build.id)
         changed = true
@@ -746,8 +803,28 @@ class BuildManager
         changed = true
       end
     end
+    launches = []
+    @deferred_retries.dup.each do |entry|
+      if !entry['ready'] && succeeded.include?(entry['wait_for'])
+        entry['ready'] = true
+        changed = true
+      end
+      source = @builds[entry['source_id']]
+      save_upload_decision(source, 'skip') if source&.status == 'waiting_upload'
+      next unless entry['ready']
+      next if @builds.values.any? { |build| build.active? && build.pkgbase == entry['build']['pkgbase'] }
+
+      build = Build.from_h(entry['build'])
+      prepare_worker(build)
+      @builds[build.id] = build
+      @deferred_retries.delete(entry)
+      launches << build
+      changed = true
+    end
+    # Persist successful prerequisites and queued retries together before launching.
     persist_locked if changed
     removed.each { |build| remove_build_files(build) }
+    launches.each { |build| launch_worker(build) }
   end
 
   def remove_build_files(build)
@@ -798,6 +875,10 @@ class WebApp
       answer_upload(req, res, Regexp.last_match(1))
     when %r{\A/builds/([^/]+)/retry\z}
       retry_build(req, res, Regexp.last_match(1))
+    when %r{\A/builds/([^/]+)/defer\z}
+      defer_build(req, res, Regexp.last_match(1))
+    when %r{\A/deferred/([^/]+)/cancel\z}
+      cancel_deferred(req, res, Regexp.last_match(1))
     when %r{\A/builds/([^/]+)/stop\z}
       stop_build(req, res, Regexp.last_match(1))
     when %r{\A/builds/([^/]+)/delete\z}
@@ -862,6 +943,20 @@ class WebApp
     not_found(res) && return unless req.request_method == 'POST'
 
     @manager.stop_build(id)
+    redirect(res, '/')
+  end
+
+  def defer_build(req, res, id)
+    not_found(res) && return unless req.request_method == 'POST'
+
+    @manager.defer_build(id, wait_for: req.query['wait_for'])
+    redirect(res, '/')
+  end
+
+  def cancel_deferred(req, res, id)
+    not_found(res) && return unless req.request_method == 'POST'
+
+    @manager.cancel_deferred(id)
     redirect(res, '/')
   end
 
@@ -1212,6 +1307,7 @@ class WebApp
             </div>
             #{active.empty? ? empty_state('No builds are running.') : active.map { |build| build_card(build) }.join}
           </div>
+          #{deferred_panel(@manager.deferred_retries)}
         </div>
 
         <div class="column">
@@ -1339,6 +1435,32 @@ class WebApp
     HTML
   end
 
+  def deferred_panel(entries)
+    return '' if entries.empty?
+
+    cards = entries.map do |entry|
+      build = entry['build']
+      <<~HTML
+        <div class="build-head mb-2">
+          <p class="is-size-7 mb-0">
+            <strong class="is-family-monospace">#{h(build['command_line'])}</strong>
+            #{entry['ready'] ? 'Ready to retry after the current attempt exits.' : "Waiting for <strong>#{h(entry['wait_for'])}</strong> to build successfully."}
+          </p>
+          <form class="inline" action="/deferred/#{h(build['id'])}/cancel" method="post">
+            <button class="button is-small is-light" type="submit">Cancel</button>
+          </form>
+        </div>
+      HTML
+    end.join
+
+    <<~HTML
+      <section class="box mb-3">
+        <h2 class="title is-5 mb-2">Deferred builds <span class="tag is-light">#{entries.size}</span></h2>
+        #{cards}
+      </section>
+    HTML
+  end
+
   def new_builder_checkbox(build)
     return '' if build.started_at && Time.now - build.started_at >= 300
 
@@ -1376,6 +1498,10 @@ class WebApp
               <button class="button is-small is-light" name="decision" value="no" type="submit">Skip</button>
             </form>
             #{retry_button(build, waiting_upload: true)}
+            <form class="inline defer-form" action="/builds/#{h(build.id)}/defer" method="post">
+              <input class="input is-small defer-package" name="wait_for" type="text" required aria-label="Package to wait for" placeholder="Wait for package" title="Retry after this package base next builds successfully" autocomplete="off" spellcheck="false">
+              <button class="button is-small is-warning" type="submit" title="Skip this log upload and retry after the named package builds successfully">Defer</button>
+            </form>
           </div>
         </div>
       </div>
@@ -1446,6 +1572,7 @@ class WebApp
           .target-builder { width: clamp(6rem, 25vw, 13rem); }
           .level.refresh-head { flex-wrap: wrap; gap: .75rem; }
           .extra-safe-deps { width: clamp(10rem, 25vw, 16rem); }
+          .defer-package { width: 11rem; max-width: 100%; }
           .pending-tag { gap: .35rem; height: auto; padding: .35rem .55rem; }
           .delete-build { position: absolute; right: .7rem; top: .7rem; margin: 0; }
           form.inline, .buttons form { margin-bottom: 0; }
