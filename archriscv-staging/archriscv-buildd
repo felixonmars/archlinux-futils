@@ -1681,6 +1681,12 @@ class WebApp
           #{body}
         </main>
         <script>
+          const pageUrl = new URL(window.location.href);
+          if (pageUrl.searchParams.has('notice')) {
+            pageUrl.searchParams.delete('notice');
+            window.history.replaceState(window.history.state, '', pageUrl);
+          }
+
           function expireBuilderChoices() {
             document.querySelectorAll('[data-builder-expires-at]').forEach((label) => {
               const expiresAt = Number(label.dataset.builderExpiresAt);
