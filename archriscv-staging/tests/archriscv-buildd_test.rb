@@ -407,7 +407,7 @@ class BuildRestartTest < Minitest::Test
     assert_equal 'houndour', @manager.find(build.id).build_host
     res = WEBrick::HTTPResponse.new(WEBrick::Config::HTTP)
     WebApp.new(@manager).send(:show_log, nil, res, build.id)
-    assert_includes res.body, '<span id="build-host" class="tag is-light">houndour</span>'
+    assert_match(/<span id="build-host" class="tag is-light"(?: title="[^"]*")?>houndour<\/span>/, res.body)
     assert_nil JSON.parse(File.read(File.join(worker_directory, 'status.json')))['build_host']
 
     # The old worker keeps publishing snapshots without a hostname.

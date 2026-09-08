@@ -835,10 +835,66 @@ class BuildManager
   end
 end
 
+class BuilderTags
+  def initialize(path: ENV['ARCHRISCV_BUILDD_SELECTOR_PATH'])
+    @path = path || ENV.fetch('PATH', '').split(File::PATH_SEPARATOR).map do |directory|
+      File.join(directory, 'felixbuild-server-select')
+    end.find { |candidate| File.file?(candidate) && File.executable?(candidate) }
+    @mutex = Mutex.new
+    @tags = {}
+  end
+
+  def for(host)
+    return [] if host.to_s.empty? || !@path
+
+    @mutex.synchronize do
+      stat = File.stat(@path)
+      version = [stat.ino, stat.mtime, stat.size]
+      if @version != version
+        @tags = parse(File.read(@path))
+        @version = version
+      end
+      name = hostname(host)
+      @tags[name] || @tags[name.split('.').first] || []
+    end
+  rescue SystemCallError
+    []
+  end
+
+  private
+
+  def hostname(host)
+    host.to_s.split('@').last.to_s.downcase.sub(/\.\z/, '')
+  end
+
+  def parse(source)
+    # Read both selector formats as data; never run its package selection logic.
+    table = source[/^server_specs_text\s*=\s*<<~SPECS\s*\n(.*?)^SPECS\s*$/m, 1]
+    (table || source).each_line.each_with_object({}) do |line, result|
+      next if line.lstrip.start_with?('#')
+
+      if table
+        host, jobs, tags = line.strip.split(/\s*\|\s*/, 5)
+        next unless jobs&.match?(/\A\d+\z/) && tags
+
+        tags = tags.split
+      else
+        match = line.match(/^\s*["']([^"']+)["']\s*=>\s*\{[^\n]*?:tags\s*=>\s*\[([^\]]*)\]/)
+        next unless match
+
+        host = match[1]
+        tags = match[2].scan(/["']([^"']+)["']/).flatten
+      end
+      result[hostname(host)] = tags
+    end
+  end
+end
+
 class WebApp
-  def initialize(manager, read_only: false)
+  def initialize(manager, read_only: false, builder_tags: BuilderTags.new)
     @manager = manager
     @read_only = read_only
+    @builder_tags = builder_tags
   end
 
   def call(req, res)
@@ -882,6 +938,11 @@ class WebApp
 
   def dashboard_path(path = '')
     "#{@read_only ? './' : '/'}#{path}"
+  end
+
+  def builder_title(host)
+    tags = @builder_tags.for(host)
+    tags.empty? ? '' : %( title="#{h(tags.join(', '))}")
   end
 
   def route_build(req, res)
@@ -1005,7 +1066,7 @@ class WebApp
                 #{status_tag(build.status)}
                 <h1 class="title is-4 mb-0">#{h(build.pkgbase || build.command_line.sub(/:nocheck\z/, ''))}</h1>
                 #{nocheck_tag(build.command_line)}
-                <span id="build-host" class="tag is-light"#{host_style}>#{h(host_text)}</span>
+                <span id="build-host" class="tag is-light"#{builder_title(build.build_host)}#{host_style}>#{h(host_text)}</span>
               </div>
             </div>
           </div>
@@ -1090,6 +1151,7 @@ class WebApp
           statusEl.className = `tag ${statusClass(data.status)}`;
           if (hostEl && data.build_host) {
             hostEl.textContent = data.build_host;
+            hostEl.title = (data.build_tags || []).join(', ');
             hostEl.style.display = '';
           }
           durationEl.textContent = data.duration;
@@ -1138,6 +1200,7 @@ class WebApp
         payload = {
           status: current.status,
           build_host: current.build_host,
+          build_tags: @builder_tags.for(current.build_host),
           duration: duration(current),
           started_at: current.started_at&.iso8601,
           done: current.terminal?
@@ -1277,7 +1340,7 @@ class WebApp
             #{status_tag(build.status)}
             <h3 class="title is-6 mb-0">#{h(build.pkgbase || build.command_line.sub(/:nocheck\z/, ''))}</h3>
             #{nocheck_tag(build.command_line)}
-            #{%(<span class="tag is-light">#{h(host)}</span>) if host}
+            #{%(<span class="tag is-light"#{builder_title(host)}>#{h(host)}</span>) if host}
           </div>
           <span class="is-size-7 has-text-grey">#{h(duration(build))}#{%( - exit #{h(build.exit_status)}) if build.exit_status}</span>
         </div>
