@@ -54,7 +54,8 @@ class TestBuildService
     return unless active?(build)
 
     Process.kill('TERM', @pids.fetch(build.id))
-    Process.waitpid(@pids.delete(build.id))
+    Process.waitpid(@pids.fetch(build.id))
+    @pids.delete(build.id)
   end
 
   def interrupt(build)
@@ -86,6 +87,12 @@ class BuildRestartTest < Minitest::Test
         print 'Upload log? [y/N] '
         puts "answer=#{STDIN.gets.to_s.strip}"
         exit 1
+      elsif ARGV.first.start_with?('stubborn')
+        trap('INT') { puts 'Ctrl-C ignored' }
+        trap('TERM', 'IGNORE')
+        child = fork { sleep }
+        puts "stubborn processes=#{Process.pid},#{child}"
+        sleep
       elsif ARGV.first.start_with?('wait')
         puts 'waiting for release'
         sleep 0.05 until File.exist?(File.join(ENV.fetch('ARCHRISCV_TEST_ROOT'), 'release'))
@@ -213,7 +220,7 @@ class BuildRestartTest < Minitest::Test
     assert_equal 200, request.call('HEAD', '/').status
 
     actions = %w[/builds /refresh /refresh/add /refresh/clear /deferred/later/cancel] +
-      %w[upload retry defer memory-killer stop delete].map { |action| "/builds/waiting_upload/#{action}" }
+      %w[upload retry defer memory-killer stop kill delete].map { |action| "/builds/waiting_upload/#{action}" }
     actions.each { |path| assert_equal 403, request.call('POST', path).status }
     %w[PUT PATCH DELETE].each { |method| assert_equal 403, request.call(method, '/').status }
     assert_equal 403, request.call('GET', '/builds/running/stop').status
@@ -528,13 +535,88 @@ class BuildRestartTest < Minitest::Test
     wait_for { @manager.find(build.id).status == 'waiting_upload' }
     assert @service.active?(build)
     assert_nil @manager.find(build.id).note
+    assert @manager.find(build.id).stop_requested
+    refute JSON.parse(File.read(File.join(WORKER_DIR, build.id, 'status.json')))['stop_requested']
     restart
+    assert @manager.find(build.id).stop_requested
     @manager.answer_upload(build.id, upload: true)
     result = finished(build.id)
     assert_equal 'upload', result.upload_decision
     assert_includes File.read(build.log_path), 'interrupt received'
     assert_includes File.read(build.log_path), 'answer=y'
     assert_equal 1, @service.starts[build.id]
+  end
+
+  def test_kill_after_stop_terminates_a_build_and_descendant_that_ignore_signals
+    build = @manager.enqueue('stubborn-kill')
+    pids = wait_for do
+      next unless File.exist?(build.log_path)
+
+      File.read(build.log_path)[/stubborn processes=([\d,]+)/, 1]&.split(',')
+    end
+    other = @manager.enqueue('wait-other')
+    wait_for { @manager.find(other.id).status == 'running' }
+    app = WebApp.new(@manager)
+    controls = app.send(:stop_button, @manager.find(build.id))
+    assert_includes controls, 'data-kill-button style="display:none"'
+    assert_equal 400, post_request("/builds/#{build.id}/kill").status
+    assert @service.active?(build)
+
+    assert_equal 303, post_request("/builds/#{build.id}/stop").status
+    wait_for { File.read(build.log_path).include?('Ctrl-C ignored') }
+    assert_equal 'running', @manager.find(build.id).status
+    restart
+    current = @manager.find(build.id)
+    assert current.stop_requested
+    controls = app.send(:stop_button, current)
+    assert_includes controls, "formaction=\"/builds/#{build.id}/kill\""
+    refute_includes controls, 'data-kill-button style="display:none"'
+    assert_empty WebApp.new(@manager, read_only: true).send(:stop_button, current)
+
+    assert_equal 303, post_request("/builds/#{build.id}/kill").status
+    result = finished(build.id)
+    assert_equal 'interrupted', result.status
+    assert_equal 137, result.exit_status, "#{result.note}\n#{File.read(build.log_path)}"
+    refute @service.active?(build)
+    pids.each do |pid|
+      state = File.read("/proc/#{pid}/status")[/^State:\s+(\S)/, 1] if File.exist?("/proc/#{pid}/status")
+      assert_includes [nil, 'Z', 'X'], state, "build process #{pid} is still running"
+    end
+    assert_equal 'running', @manager.find(other.id).status
+    assert @service.active?(other)
+    assert File.exist?(build.log_path)
+    assert_empty app.send(:stop_button, result)
+    assert_equal 400, post_request("/builds/#{build.id}/kill").status
+
+    req = WEBrick::HTTPRequest.new(WEBrick::Config::HTTP)
+    req.parse(StringIO.new("GET /builds/#{build.id}/events?offset=#{File.size(build.log_path)} HTTP/1.1\r\nHost: localhost\r\n\r\n"))
+    response = WEBrick::HTTPResponse.new(WEBrick::Config::HTTP)
+    WebApp.new(@manager).call(req, response)
+    output = StringIO.new
+    response.body.call(output)
+    assert_includes output.string, '"stop_requested":true'
+  end
+
+  def test_kill_remains_available_when_sending_ctrl_c_fails
+    build = @manager.enqueue('wait-no-terminal')
+    wait_for { @manager.find(build.id).status == 'running' }
+    @service.define_singleton_method(:interrupt) { |_| raise 'cannot access build terminal' }
+    response = post_request("/builds/#{build.id}/stop")
+    assert_equal 400, response.status
+    assert_includes response.body, 'cannot access build terminal'
+    restart
+    assert @manager.find(build.id).stop_requested
+
+    req = WEBrick::HTTPRequest.new(WEBrick::Config::HTTP)
+    req.parse(StringIO.new("GET /builds/#{build.id}/kill HTTP/1.1\r\nHost: localhost\r\n\r\n"))
+    response = WEBrick::HTTPResponse.new(WEBrick::Config::HTTP)
+    WebApp.new(@manager).call(req, response)
+    assert_equal 404, response.status
+    assert @service.active?(build)
+    assert_equal 400, post_request('/builds/missing/kill').status
+
+    assert_equal 303, post_request("/builds/#{build.id}/kill").status
+    assert_equal 'interrupted', finished(build.id).status
   end
 
   def test_queued_build_recovers_without_duplicate_launch

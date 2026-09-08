@@ -107,13 +107,13 @@ class Build
   attr_accessor :id, :command_line, :argv, :pkgbase, :log_path, :status,
                 :created_at, :started_at, :finished_at, :exit_status,
                 :upload_prompt_seen, :upload_decision, :prompt_answered_at,
-                :build_host, :target_builder, :note, :unit_name, :discard_after_finish
+                :build_host, :target_builder, :note, :unit_name, :discard_after_finish, :stop_requested
 
   def initialize(id:, command_line:, argv:, pkgbase:, log_path:, status: 'queued',
                  created_at: Time.now.utc, started_at: nil, finished_at: nil,
                  exit_status: nil, upload_prompt_seen: false, upload_decision: nil,
                  prompt_answered_at: nil, build_host: nil, target_builder: nil, note: nil,
-                 unit_name: nil, discard_after_finish: false)
+                 unit_name: nil, discard_after_finish: false, stop_requested: false)
     @id = id
     @command_line = command_line
     @argv = argv
@@ -132,6 +132,7 @@ class Build
     @note = note
     @unit_name = unit_name
     @discard_after_finish = discard_after_finish
+    @stop_requested = stop_requested
   end
 
   def self.from_h(hash)
@@ -153,7 +154,8 @@ class Build
       target_builder: hash['target_builder'],
       note: hash['note'],
       unit_name: hash['unit_name'],
-      discard_after_finish: hash['discard_after_finish'] || false
+      discard_after_finish: hash['discard_after_finish'] || false,
+      stop_requested: hash['stop_requested'] || false
     )
   end
 
@@ -176,7 +178,8 @@ class Build
       'target_builder' => target_builder,
       'note' => note,
       'unit_name' => unit_name,
-      'discard_after_finish' => discard_after_finish
+      'discard_after_finish' => discard_after_finish,
+      'stop_requested' => stop_requested
     }
   end
 
@@ -645,10 +648,29 @@ class BuildManager
   end
 
   def stop_build(id)
-    build = find(id) || raise(ArgumentError, 'unknown build')
-    raise ArgumentError, 'build is not active' unless build.active?
+    build = @mutex.synchronize do
+      refresh_workers_locked
+      current = @builds[id] || raise(ArgumentError, 'unknown build')
+      raise ArgumentError, 'build is not active' unless current.active?
+
+      # Keep Kill available even if accessing the terminal fails.
+      current.stop_requested = true
+      persist_locked
+      current
+    end
 
     @service.interrupt(build)
+  rescue StandardError => e
+    raise ArgumentError, e.message
+  end
+
+  def kill_build(id)
+    build = find(id) || raise(ArgumentError, 'unknown build')
+    raise ArgumentError, 'build is not active' unless build.active?
+    raise ArgumentError, 'stop the build before killing it' unless build.stop_requested
+
+    @service.stop(build)
+    @mutex.synchronize { refresh_workers_locked(check_units: true) }
   rescue StandardError => e
     raise ArgumentError, e.message
   end
@@ -793,6 +815,9 @@ class BuildManager
   def worker_status(build)
     path = worker_status_path(build)
     current = File.exist?(path) ? Build.from_h(JSON.parse(File.read(path))) : build
+
+    # This flag belongs to the dashboard; worker snapshots do not set it.
+    current.stop_requested ||= build.stop_requested
 
     # Older workers may have missed the host announcement before an ANSI-parser fix.
     current.build_host ||= build.build_host
@@ -989,6 +1014,8 @@ class WebApp
       cancel_deferred(req, res, Regexp.last_match(1))
     when %r{\A/builds/([^/]+)/stop\z}
       stop_build(req, res, Regexp.last_match(1))
+    when %r{\A/builds/([^/]+)/kill\z}
+      kill_build(req, res, Regexp.last_match(1))
     when %r{\A/builds/([^/]+)/delete\z}
       delete_build(req, res, Regexp.last_match(1))
     else
@@ -1062,6 +1089,13 @@ class WebApp
     redirect(res, '/')
   end
 
+  def kill_build(req, res, id)
+    not_found(res) && return unless req.request_method == 'POST'
+
+    @manager.kill_build(id)
+    redirect(res, '/')
+  end
+
   def defer_build(req, res, id)
     not_found(res) && return unless req.request_method == 'POST'
 
@@ -1129,6 +1163,8 @@ class WebApp
         const statusEl = document.querySelector('#status');
         const hostEl = document.querySelector('#build-host');
         const decisionEl = document.querySelector('#decision');
+        const stopControls = document.querySelector('[data-stop-controls]');
+        const killButton = document.querySelector('[data-kill-button]');
         const durationEl = document.querySelector('#duration');
         const logEl = document.querySelector('#log');
         const endLink = document.querySelector('#end-link');
@@ -1188,6 +1224,8 @@ class WebApp
             });
           }
           if (decisionEl) decisionEl.style.display = data.status === 'waiting_upload' ? '' : 'none';
+          if (stopControls) stopControls.style.display = data.done ? 'none' : '';
+          if (killButton) killButton.style.display = data.stop_requested ? '' : 'none';
           if (data.done) events.close();
         });
       </script>
@@ -1230,6 +1268,7 @@ class WebApp
           build_tags: @builder_tags.for(current.build_host),
           duration: duration(current),
           started_at: current.started_at&.iso8601,
+          stop_requested: current.stop_requested,
           done: current.terminal?
         }
         encoded = JSON.generate(payload)
@@ -1509,8 +1548,9 @@ class WebApp
     return '' if @read_only || !build.active?
 
     <<~HTML
-      <form class="inline" action="/builds/#{h(build.id)}/stop" method="post">
+      <form class="inline" action="/builds/#{h(build.id)}/stop" method="post" data-stop-controls>
         <button class="button is-small is-danger" type="submit" title="Send Ctrl-C to the build terminal">Stop</button>
+        <button class="button is-small is-danger" type="submit" formaction="/builds/#{h(build.id)}/kill" data-kill-button#{' style="display:none"' unless build.stop_requested} title="Force the build worker to shut down and terminate its build processes">Kill</button>
       </form>
     HTML
   end
