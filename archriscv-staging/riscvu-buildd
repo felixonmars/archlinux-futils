@@ -1,0 +1,120 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+# Usage: ARCHRISCV_BUILDD_URL=http://host:9181 riscvu-buildd [pkgbase[:nocheck]] [build args...]
+
+require 'json'
+require 'net/http'
+require 'shellwords'
+require 'uri'
+
+class RiscvuBuildd
+  CONNECTION_ERRORS = [IOError, EOFError, SystemCallError, Timeout::Error].freeze
+
+  def initialize(endpoint: URI(ENV.fetch('ARCHRISCV_BUILDD_URL', 'http://127.0.0.1:9181')),
+                 input: $stdin, output: $stdout, error: $stderr)
+    unless endpoint.is_a?(URI::HTTP) && endpoint.host && ['', '/'].include?(endpoint.path) && !endpoint.query && !endpoint.fragment
+      raise 'ARCHRISCV_BUILDD_URL must be an HTTP(S) URL without a path, query or fragment'
+    end
+    @endpoint, @input, @output, @error = endpoint, input, output, error
+    @offset = 0
+    @answered = false
+  end
+
+  def run(argv)
+    argv = argv.dup
+    if argv.empty?
+      raise 'No pkgbase specified and not in a package directory.' unless File.exist?('PKGBUILD')
+
+      argv << File.basename(Dir.pwd)
+    end
+    argv.shift if argv.first == ''
+    params = {'command' => Shellwords.join(argv)}
+    %w[NOUPLOAD SERVER].each { |name| params[name] = ENV[name] if ENV.key?(name) }
+    response = post('/builds', params)
+    @id = JSON.parse(response.body).fetch('id')
+    @error.puts "riscvu-buildd: watching build #{@id}"
+    loop do
+      begin
+        result = watch
+        return result unless result.nil?
+      rescue Interrupt
+        post("/builds/#{@id}/stop", {})
+      rescue *CONNECTION_ERRORS => e
+        @error.puts "riscvu-buildd: #{e.message}; reconnecting"
+      end
+      sleep 1
+    end
+  end
+
+  private
+
+  def http
+    connection = Net::HTTP.new(@endpoint.host, @endpoint.port, nil)
+    connection.use_ssl = @endpoint.scheme == 'https'
+    connection.open_timeout = 10
+    connection.read_timeout = 30
+    connection.max_retries = 0
+    connection
+  end
+
+  def post(path, params)
+    request = Net::HTTP::Post.new(path)
+    request['Accept'] = 'application/json'
+    request.set_form_data(params)
+    response = http.request(request)
+    unless response.is_a?(Net::HTTPSuccess) || response.code == '303'
+      raise "#{path}: HTTP #{response.code}: #{response.body}"
+    end
+    response
+  end
+
+  def watch
+    result = nil
+    http.request_get("/builds/#{@id}/events?offset=#{@offset}") do |response|
+      raise "watch: HTTP #{response.code}" unless response.is_a?(Net::HTTPSuccess)
+
+      buffer = +''
+      response.read_body do |chunk|
+        buffer << chunk
+        while (boundary = buffer.index("\n\n"))
+          event = buffer.slice!(0, boundary + 2)
+          fields = event.lines.filter_map do |line|
+            key, value = line.chomp.split(':', 2)
+            [key, value.strip] if value
+          end.to_h
+          next unless fields['data']
+
+          data = JSON.parse(fields['data'])
+          case fields['event']
+          when 'log'
+            @output.write(data)
+            @output.flush
+            @offset = Integer(fields.fetch('id'))
+          when 'status'
+            if data['done']
+              result = data['exit_status']
+              raise 'build finished without an exit status' unless result.is_a?(Integer)
+            elsif data['status'] == 'waiting_upload' && !@answered
+              answer = @input.gets.to_s.strip
+              post("/builds/#{@id}/upload", decision: answer.match?(/\A(?:y|yes)\z/i) ? 'yes' : 'no')
+              @answered = true
+            end
+          end
+        end
+      end
+    end
+    result
+  end
+end
+
+if $PROGRAM_NAME == __FILE__
+  begin
+    exit RiscvuBuildd.new.run(ARGV)
+  rescue Interrupt
+    warn 'riscvu-buildd: interrupted'
+    exit 130
+  rescue StandardError => e
+    warn "riscvu-buildd: #{e.message}"
+    exit 1
+  end
+end

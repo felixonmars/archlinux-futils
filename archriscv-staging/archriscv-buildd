@@ -108,13 +108,14 @@ class Build
   attr_accessor :id, :command_line, :argv, :pkgbase, :log_path, :status,
                 :created_at, :started_at, :finished_at, :exit_status,
                 :upload_prompt_seen, :upload_decision, :prompt_answered_at,
-                :build_host, :target_builder, :note, :unit_name, :discard_after_finish, :stop_requested
+                :build_host, :target_builder, :note, :unit_name, :discard_after_finish, :stop_requested,
+                :environment
 
   def initialize(id:, command_line:, argv:, pkgbase:, log_path:, status: 'queued',
                  created_at: Time.now.utc, started_at: nil, finished_at: nil,
                  exit_status: nil, upload_prompt_seen: false, upload_decision: nil,
                  prompt_answered_at: nil, build_host: nil, target_builder: nil, note: nil,
-                 unit_name: nil, discard_after_finish: false, stop_requested: false)
+                 unit_name: nil, discard_after_finish: false, stop_requested: false, environment: {})
     @id = id
     @command_line = command_line
     @argv = argv
@@ -134,6 +135,7 @@ class Build
     @unit_name = unit_name
     @discard_after_finish = discard_after_finish
     @stop_requested = stop_requested
+    @environment = environment
   end
 
   def self.from_h(hash)
@@ -156,7 +158,8 @@ class Build
       note: hash['note'],
       unit_name: hash['unit_name'],
       discard_after_finish: hash['discard_after_finish'] || false,
-      stop_requested: hash['stop_requested'] || false
+      stop_requested: hash['stop_requested'] || false,
+      environment: hash.fetch('environment', {})
     )
   end
 
@@ -180,7 +183,8 @@ class Build
       'note' => note,
       'unit_name' => unit_name,
       'discard_after_finish' => discard_after_finish,
-      'stop_requested' => stop_requested
+      'stop_requested' => stop_requested,
+      'environment' => environment
     }
   end
 
@@ -488,8 +492,9 @@ class BuildManager
     @mutex.synchronize { @refresh_pending.dup }
   end
 
-  def enqueue(command_line, target_builder: nil, ignore_active_id: nil, new_builder: false)
-    build = new_build(command_line, target_builder: new_builder ? nil : target_builder)
+  def enqueue(command_line, target_builder: nil, ignore_active_id: nil, new_builder: false, environment: {})
+    environment = environment.reject { |key, _| key == 'SERVER' } if new_builder
+    build = new_build(command_line, target_builder: new_builder ? nil : target_builder, environment: environment)
 
     @mutex.synchronize do
       refresh_workers_locked
@@ -625,7 +630,7 @@ class BuildManager
       path = File.join(worker_directory(source), 'upload.json')
       raise ArgumentError, 'an upload decision has already been submitted' if File.exist?(path)
 
-      build = new_build(source.command_line, target_builder: source.target_builder)
+      build = new_build(source.command_line, target_builder: source.target_builder, environment: source.environment)
       @deferred_retries << {'build' => build.to_h, 'source_id' => id, 'wait_for' => wait_for, 'ready' => false}
       # Save the retry before skipping; the monitor can resend a skip after a crash.
       persist_locked
@@ -699,7 +704,7 @@ class BuildManager
 
   private
 
-  def new_build(command_line, target_builder: nil)
+  def new_build(command_line, target_builder: nil, environment: {})
     command_line = command_line.to_s.strip
     raise ArgumentError, 'enter a package name, optionally ending with :nocheck' unless command_line.match?(COMMAND_PATTERN)
 
@@ -712,11 +717,19 @@ class BuildManager
     end
     target_builder = nil if target_builder.empty?
 
+    unless environment.is_a?(Hash) && environment.all? { |key, value| %w[NOUPLOAD SERVER].include?(key) && value.is_a?(String) && !value.include?("\0") }
+      raise ArgumentError, 'only NOUPLOAD and SERVER environment overrides are supported'
+    end
+    server = environment['SERVER']
+    unless server.nil? || server.empty? || server.match?(TARGET_BUILDER_PATTERN)
+      raise ArgumentError, 'SERVER must be a host or user@host'
+    end
+
     pkgbase = command_line.sub(/:nocheck\z/, '')
     id = "#{Time.now.utc.strftime('%Y%m%d%H%M%S')}-#{format('%06x', Random.rand(0x1000000))}"
     Build.new(
       id: id, command_line: command_line, argv: [BUILD_COMMAND, command_line],
-      pkgbase: pkgbase, target_builder: target_builder,
+      pkgbase: pkgbase, target_builder: target_builder, environment: environment.dup,
       log_path: File.expand_path(File.join(LOG_DIR, "#{id}-#{safe_filename(pkgbase)}.log"))
     )
   end
@@ -794,6 +807,7 @@ class BuildManager
     environment = ENV.to_h.reject do |key, _|
       %w[NOTIFY_SOCKET WATCHDOG_PID WATCHDOG_USEC INVOCATION_ID JOURNAL_STREAM SYSTEMD_EXEC_PID].include?(key)
     end
+    environment.merge!(build.environment)
     # SERVER overrides the selector even when the package's cache was cleared.
     environment.delete('SERVER') if new_builder
     write_json(File.join(directory, 'request.json'),
@@ -1025,8 +1039,15 @@ class WebApp
   end
 
   def create_build(req, res)
-    @manager.enqueue(req.query['command'], target_builder: req.query['target_builder'])
-    redirect(res, '/')
+    environment = req.query.select { |key, _| %w[NOUPLOAD SERVER].include?(key) }
+    build = @manager.enqueue(req.query['command'], target_builder: req.query['target_builder'], environment: environment)
+    if req['accept'] == 'application/json'
+      res.status = 201
+      res['Content-Type'] = 'application/json'
+      res.body = JSON.generate(id: build.id)
+    else
+      redirect(res, '/')
+    end
   end
 
   def refresh_remote(req, res)
@@ -1079,7 +1100,7 @@ class WebApp
 
     @manager.answer_upload(id, upload: false) if build.status == 'waiting_upload'
     @manager.enqueue(build.command_line, target_builder: build.target_builder, ignore_active_id: id,
-      new_builder: req.query['new_builder'] == '1')
+      new_builder: req.query['new_builder'] == '1', environment: build.environment)
     redirect(res, '/')
   end
 
@@ -1257,14 +1278,16 @@ class WebApp
       loop do
         break if @manager.shutting_down?
 
-        log, offset = read_log(build.log_path, offset)
-        sse(out, 'log', JSON.generate(utf8(log)), id: offset) unless log.empty?
-
         current = @manager.find(id)
         break unless current
 
+        # Read after the status snapshot so a terminal status includes the final output.
+        log, offset = read_log(build.log_path, offset)
+        sse(out, 'log', JSON.generate(utf8(log)), id: offset) unless log.empty?
+
         payload = {
           status: current.status,
+          exit_status: current.exit_status,
           build_host: current.build_host,
           build_tags: @builder_tags.for(current.build_host),
           duration: duration(current),

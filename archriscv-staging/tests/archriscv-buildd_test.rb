@@ -74,7 +74,7 @@ class BuildRestartTest < Minitest::Test
       #!/usr/bin/env ruby
       require 'json'
       STDOUT.sync = true
-      puts JSON.generate(server: ENV['SERVER'], argv: ARGV, workdir: Dir.pwd)
+      puts JSON.generate(server: ENV['SERVER'], noupload: ENV['NOUPLOAD'], argv: ARGV, workdir: Dir.pwd)
       cache_path = File.join(ENV.fetch('ARCHRISCV_BUILDD_BUILDER_CACHE_DIR'), "#{ARGV.first.sub(/:nocheck\z/, '')}-riscv64")
       puts "builder-cache=#{File.exist?(cache_path)}"
       puts "\e[1m\e[32m==>\e(B\e[m\e[1m Building on test-builder\e(B\e[m"
@@ -160,12 +160,76 @@ class BuildRestartTest < Minitest::Test
     post_request('/refresh', body)
   end
 
-  def post_request(path, body = '')
+  def post_request(path, body = '', accept: 'text/html')
     req = WEBrick::HTTPRequest.new(WEBrick::Config::HTTP)
-    req.parse(StringIO.new("POST #{path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: #{body.bytesize}\r\n\r\n#{body}"))
+    req.parse(StringIO.new("POST #{path} HTTP/1.1\r\nHost: localhost\r\nAccept: #{accept}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: #{body.bytesize}\r\n\r\n#{body}"))
     res = WEBrick::HTTPResponse.new(WEBrick::Config::HTTP)
     WebApp.new(@manager).call(req, res)
     res
+  end
+
+  def test_json_submission_returns_created_build_id
+    response = post_request('/builds', 'command=example', accept: 'application/json')
+    assert_equal 201, response.status
+    assert_equal 'application/json', response['Content-Type']
+    build = @manager.find(JSON.parse(response.body).fetch('id'))
+    assert_equal 'example', build.command_line
+    assert_equal 0, finished(build.id).exit_status
+  end
+
+  def test_event_stream_includes_final_output_and_exit_status
+    build = @manager.enqueue('example')
+    finished(build.id)
+    req = WEBrick::HTTPRequest.new(WEBrick::Config::HTTP)
+    req.parse(StringIO.new("GET /builds/#{build.id}/events HTTP/1.1\r\nHost: localhost\r\n\r\n"))
+    res = WEBrick::HTTPResponse.new(WEBrick::Config::HTTP)
+    WebApp.new(@manager).call(req, res)
+    output = StringIO.new
+    res.body.call(output)
+    assert_includes output.string, 'build completed'
+    assert_includes output.string, 'exit=0'
+    assert_includes output.string, '"exit_status":0'
+    assert_includes output.string, '"done":true'
+  end
+
+  def test_submission_passes_environment_to_worker_and_preserves_it_after_restart
+    response = post_request('/builds', 'command=example&NOUPLOAD=1&SERVER=custom-host', accept: 'application/json')
+    assert_equal 201, response.status
+    build = finished(JSON.parse(response.body).fetch('id'))
+    assert_includes File.read(build.log_path), '"server":"custom-host"'
+    assert_includes File.read(build.log_path), '"noupload":"1"'
+    restart
+    assert_equal({'NOUPLOAD' => '1', 'SERVER' => 'custom-host'}, @manager.find(build.id).environment)
+    assert_nil ENV['SERVER']
+    other = finished(@manager.enqueue('other-example').id)
+    assert_includes File.read(other.log_path), '"server":null'
+  end
+
+  def test_environment_overrides_are_restricted_and_literal
+    assert_raises(ArgumentError) { @manager.enqueue('example', environment: {'PATH' => '/tmp'}) }
+    assert_raises(ArgumentError) { @manager.enqueue('example', environment: {'SERVER' => 'host; touch /tmp/marker'}) }
+    assert_raises(ArgumentError) { @manager.enqueue('example', environment: {'NOUPLOAD' => "1\0"}) }
+    build = finished(@manager.enqueue('example', environment: {'NOUPLOAD' => '$(false)', 'SERVER' => ''}).id)
+    assert_includes File.read(build.log_path), '"noupload":"$(false)"'
+    assert_includes File.read(build.log_path), '"server":""'
+  end
+
+  def test_retry_preserves_environment_and_new_builder_clears_server
+    build = @manager.enqueue('prompt-env', environment: {'NOUPLOAD' => '1', 'SERVER' => 'custom-host'})
+    wait_for { @manager.find(build.id).status == 'waiting_upload' }
+    assert_equal 303, post_request("/builds/#{build.id}/retry").status
+    retried = @manager.all_builds.find { |entry| entry.id != build.id }
+    wait_for { @manager.find(retried.id).status == 'waiting_upload' }
+    assert_equal build.environment, retried.environment
+    assert_includes File.read(retried.log_path), '"server":"custom-host"'
+    assert_includes File.read(retried.log_path), '"noupload":"1"'
+    wait_for { @manager.find(build.id).nil? }
+    assert_equal 303, post_request("/builds/#{retried.id}/retry", 'new_builder=1').status
+    fresh = @manager.all_builds.find { |entry| entry.id != retried.id }
+    wait_for { @manager.find(fresh.id).status == 'waiting_upload' }
+    assert_equal({'NOUPLOAD' => '1'}, fresh.environment)
+    assert_includes File.read(fresh.log_path), '"server":null'
+    assert_includes File.read(fresh.log_path), '"noupload":"1"'
   end
 
   def test_refresh_passes_extra_safe_dependencies_as_one_literal_argument
