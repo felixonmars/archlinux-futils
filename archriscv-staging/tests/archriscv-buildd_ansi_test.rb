@@ -108,6 +108,35 @@ class AnsiLogTest < Minitest::Test
     assert_equal "first second\n42%gress\n\ntailB", result['html'].gsub(/<[^>]*>/, '')
   end
 
+  def test_initial_log_preserves_utf8_and_replaces_invalid_bytes
+    message = "In member function \u2018bool Breeze::Helper::compositingActive() const\u2019:\n"
+    File.binwrite(@build.log_path, message.b + "caf\xc3\xa9 \xf0\x9f\x99\x82 \xff\n".b)
+    response = WEBrick::HTTPResponse.new(WEBrick::Config::HTTP)
+    @app.send(:show_log, nil, response, @build.id)
+
+    initial = JSON.parse(response.body[/const initialLog = (.*);/, 1])
+    expected = message + "caf\u00e9 \u{1f642} \ufffd\n"
+    assert_equal expected, initial
+    assert_equal [expected], render_cases([[initial]])
+  end
+
+  def test_live_log_preserves_utf8_and_resumes_at_byte_offsets
+    prefix = "caf\u00e9\n"
+    message = "In member function \u2018bool Breeze::Helper::compositingActive() const\u2019:\n"
+    File.binwrite(@build.log_path, prefix + message)
+    request = WEBrick::HTTPRequest.new(WEBrick::Config::HTTP)
+    request.parse(StringIO.new("GET /builds/#{@build.id}/events?offset=0 HTTP/1.1\r\n" \
+      "Host: localhost\r\nLast-Event-ID: #{prefix.bytesize}\r\n\r\n"))
+    response = WEBrick::HTTPResponse.new(WEBrick::Config::HTTP)
+    @app.call(request, response)
+    output = StringIO.new
+    response.body.call(output)
+
+    event = output.string.split("\n\n").find { |frame| frame.include?("event: log\n") }
+    assert_equal message, JSON.parse(event[/^data: (.*)$/, 1])
+    assert_includes event, "id: #{(prefix + message).bytesize}"
+  end
+
   def test_progress_updates_replace_lines_without_losing_other_output
     input = "Cloning...\r\nResolving deltas: 0%\rResolving deltas: 50%\rResolving deltas: 100%, done.\r\n" \
       "download: 10%\r\nkeep this line\r\n\e[2A\e[1G\e[2Kdownload: 100%\e[2B\r" \

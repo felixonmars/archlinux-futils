@@ -85,7 +85,8 @@ def read_log(path, offset = 0, max_bytes = nil)
 end
 
 def utf8(value)
-  value.to_s.encode('UTF-8', invalid: :replace, undef: :replace)
+  # Binary log reads contain UTF-8 bytes; decode them before replacing invalid sequences.
+  value.to_s.dup.force_encoding('UTF-8').scrub
 end
 
 def status_class(status)
