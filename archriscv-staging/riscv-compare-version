@@ -237,6 +237,7 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
         end
 
         if $x86_packages.has_key?(pkgname) && $x86_packages[pkgname]["version"] != rvver &&
+                !($blacklist.include?($x86_packages[pkgname]['base']) || $blacklist.include?(pkgname)) &&
                 target_package?($x86_packages[pkgname]['base'], pkgname)
             $version_mismatch_pkgbases << $x86_packages[pkgname]["base"]
             $version_mismatch_pkgnames << pkgname
@@ -321,6 +322,8 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
     old_log_threshold = Time.now - 30 * 24 * 60 * 60
     $nocheck_pkgbases = Set[]
     $x86_packages.each do |pkgname, package|
+        next if $blacklist.include?(package['base']) || $blacklist.include?(pkgname)
+
         if File.exist?("#{REPOROOT}/.status/logs/#{package['base']}")
             if $rv_packages.has_key?(pkgname)
                 rvver = $rv_packages[pkgname]["version"]
