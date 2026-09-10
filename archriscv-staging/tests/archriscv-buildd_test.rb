@@ -18,6 +18,7 @@ ENV['ARCHRISCV_BUILDD_BUILDER_CACHE_DIR'] = File.join(TEST_ROOT, 'builder-cache'
 ENV['ARCHRISCV_BUILDD_WORKDIR'] = TEST_ROOT
 ENV['ARCHRISCV_TEST_ROOT'] = TEST_ROOT
 ENV.delete('SERVER')
+ENV.delete('KEEPCHROOT')
 load File.expand_path('../archriscv-buildd', __dir__)
 Object.send(:remove_const, :MEMORY_KILLER_LIST)
 MEMORY_KILLER_LIST = File.join(TEST_ROOT, 'packages', 'memory-killer.txt')
@@ -101,7 +102,7 @@ class BuildRestartTest < Minitest::Test
       #!/usr/bin/env ruby
       require 'json'
       STDOUT.sync = true
-      puts JSON.generate(server: ENV['SERVER'], noupload: ENV['NOUPLOAD'], argv: ARGV, workdir: Dir.pwd)
+      puts JSON.generate(server: ENV['SERVER'], noupload: ENV['NOUPLOAD'], keepchroot: ENV['KEEPCHROOT'], argv: ARGV, workdir: Dir.pwd)
       cache_path = File.join(ENV.fetch('ARCHRISCV_BUILDD_BUILDER_CACHE_DIR'), "#{ARGV.first.sub(/:nocheck\z/, '')}-riscv64")
       puts "builder-cache=#{File.exist?(cache_path)}"
       puts "\e[1m\e[32m==>\e(B\e[m\e[1m Building on test-builder\e(B\e[m"
@@ -220,16 +221,19 @@ class BuildRestartTest < Minitest::Test
   end
 
   def test_submission_passes_environment_to_worker_and_preserves_it_after_restart
-    response = post_request('/builds', 'command=example&NOUPLOAD=1&SERVER=custom-host', accept: 'application/json')
+    response = post_request('/builds', 'command=example&NOUPLOAD=1&SERVER=custom-host&KEEPCHROOT=1', accept: 'application/json')
     assert_equal 201, response.status
     build = finished(JSON.parse(response.body).fetch('id'))
     assert_includes File.read(build.log_path), '"server":"custom-host"'
     assert_includes File.read(build.log_path), '"noupload":"1"'
+    assert_includes File.read(build.log_path), '"keepchroot":"1"'
     restart
-    assert_equal({'NOUPLOAD' => '1', 'SERVER' => 'custom-host'}, @manager.find(build.id).environment)
+    assert_equal({'NOUPLOAD' => '1', 'SERVER' => 'custom-host', 'KEEPCHROOT' => '1'}, @manager.find(build.id).environment)
     assert_nil ENV['SERVER']
     other = finished(@manager.enqueue('other-example').id)
     assert_includes File.read(other.log_path), '"server":null'
+    assert_includes File.read(other.log_path), '"keepchroot":null'
+    assert_nil ENV['KEEPCHROOT']
   end
 
   def test_environment_overrides_are_restricted_and_literal
@@ -242,7 +246,7 @@ class BuildRestartTest < Minitest::Test
   end
 
   def test_retry_preserves_environment_and_new_builder_clears_server
-    build = @manager.enqueue('prompt-env', environment: {'NOUPLOAD' => '1', 'SERVER' => 'custom-host'})
+    build = @manager.enqueue('prompt-env', environment: {'NOUPLOAD' => '1', 'SERVER' => 'custom-host', 'KEEPCHROOT' => '1'})
     wait_for { @manager.find(build.id).status == 'waiting_upload' }
     assert_equal 303, post_request("/builds/#{build.id}/retry").status
     retried = @manager.all_builds.find { |entry| entry.id != build.id }
@@ -254,9 +258,64 @@ class BuildRestartTest < Minitest::Test
     assert_equal 303, post_request("/builds/#{retried.id}/retry", 'new_builder=1').status
     fresh = @manager.all_builds.find { |entry| entry.id != retried.id }
     wait_for { @manager.find(fresh.id).status == 'waiting_upload' }
-    assert_equal({'NOUPLOAD' => '1'}, fresh.environment)
+    assert_equal({'NOUPLOAD' => '1', 'KEEPCHROOT' => '1'}, fresh.environment)
     assert_includes File.read(fresh.log_path), '"server":null'
     assert_includes File.read(fresh.log_path), '"noupload":"1"'
+    assert_includes File.read(fresh.log_path), '"keepchroot":"1"'
+  end
+
+  def test_keep_chroot_checkbox_can_be_enabled_and_disabled_on_retry
+    build = @manager.enqueue('prompt-keep-chroot')
+    wait_for { @manager.find(build.id).status == 'waiting_upload' }
+    app = WebApp.new(@manager)
+    assert_includes app.send(:start_build_form), 'name="KEEPCHROOT" value="1"> Keep chroot'
+    assert_includes app.send(:decision_panel, @manager.find(build.id)), 'name="KEEPCHROOT" value="1"> Keep chroot'
+
+    response = post_request("/builds/#{build.id}/retry", 'keep_chroot_present=1&KEEPCHROOT=1')
+    assert_equal 303, response.status
+    kept = @manager.all_builds.find { |entry| entry.id != build.id }
+    wait_for { @manager.find(kept.id).status == 'waiting_upload' }
+    kept = @manager.find(kept.id)
+    assert_equal '1', kept.environment['KEEPCHROOT']
+    assert_includes File.read(kept.log_path), '"keepchroot":"1"'
+    assert_includes app.send(:retry_button, kept), 'name="KEEPCHROOT" value="1" checked> Keep chroot'
+    wait_for { @manager.find(build.id).nil? }
+
+    response = post_request("/builds/#{kept.id}/retry", 'keep_chroot_present=1')
+    assert_equal 303, response.status
+    normal = @manager.all_builds.find { |entry| entry.id != kept.id }
+    wait_for { @manager.find(normal.id).status == 'waiting_upload' }
+    normal = @manager.find(normal.id)
+    assert_equal '0', normal.environment['KEEPCHROOT']
+    assert_includes File.read(normal.log_path), '"keepchroot":"0"'
+    refute_match(/name="KEEPCHROOT"[^>]*checked/, app.send(:retry_button, normal))
+  end
+
+  def test_keep_chroot_is_selected_per_build_and_ignores_daemon_environment
+    ENV['KEEPCHROOT'] = '1'
+    app = WebApp.new(@manager)
+    assert_includes app.send(:start_build_form), 'name="KEEPCHROOT" value="1"> Keep chroot'
+    default = finished(@manager.enqueue('keep-default').id)
+    refute default.environment.key?('KEEPCHROOT')
+    assert_includes File.read(default.log_path), '"keepchroot":null'
+
+    response = post_request('/builds', 'command=normal&keep_chroot_present=1', accept: 'application/json')
+    assert_equal 201, response.status
+    normal = finished(JSON.parse(response.body).fetch('id'))
+    assert_equal '0', normal.environment['KEEPCHROOT']
+    assert_includes File.read(normal.log_path), '"keepchroot":"0"'
+
+    response = post_request('/builds', 'command=kept&keep_chroot_present=1&KEEPCHROOT=1', accept: 'application/json')
+    assert_equal 201, response.status
+    kept = finished(JSON.parse(response.body).fetch('id'))
+    assert_includes File.read(kept.log_path), '"keepchroot":"1"'
+    ENV.delete('KEEPCHROOT')
+    restart
+    refute @manager.find(default.id).environment.key?('KEEPCHROOT')
+    assert_equal '0', @manager.find(normal.id).environment['KEEPCHROOT']
+    assert_equal '1', @manager.find(kept.id).environment['KEEPCHROOT']
+  ensure
+    ENV.delete('KEEPCHROOT')
   end
 
   def test_refresh_passes_extra_safe_dependencies_as_one_literal_argument
@@ -496,7 +555,7 @@ class BuildRestartTest < Minitest::Test
     old_dependency = @manager.enqueue('wait-dependency')
     File.write(File.join(TEST_ROOT, 'release'), '')
     finished(old_dependency.id)
-    source = @manager.enqueue('prompt-deferred:nocheck', target_builder: 'pinned-host')
+    source = @manager.enqueue('prompt-deferred:nocheck', target_builder: 'pinned-host', environment: {'KEEPCHROOT' => '1'})
     wait_for { @manager.find(source.id).status == 'waiting_upload' }
 
     response = post_request("/builds/#{source.id}/defer", 'wait_for=wait-dependency')
@@ -526,6 +585,8 @@ class BuildRestartTest < Minitest::Test
     assert_equal 'prompt-deferred:nocheck', result.command_line
     assert_equal 'builder@pinned-host', result.target_builder
     assert_includes File.read(result.log_path), '"server":"builder@pinned-host"'
+    assert_equal({'KEEPCHROOT' => '1'}, result.environment)
+    assert_includes File.read(result.log_path), '"keepchroot":"1"'
     restart
     assert_equal 1, @service.starts[retry_id]
     assert_empty @manager.deferred_retries

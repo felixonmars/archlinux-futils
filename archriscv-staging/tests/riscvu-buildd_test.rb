@@ -93,16 +93,25 @@ class RiscvuBuilddTest < Minitest::Test
   def test_process_forwards_only_supported_environment_variables
     @streams << status(done: true, exit_status: 0)
     _, error, result = Open3.capture3({'ARCHRISCV_BUILDD_URL' => @endpoint.to_s,
-      'NOUPLOAD' => '1', 'SERVER' => 'builder@example-host', 'UNRELATED_SECRET' => 'not-forwarded'},
+      'NOUPLOAD' => '1', 'SERVER' => 'builder@example-host', 'KEEPCHROOT' => '1', 'UNRELATED_SECRET' => 'not-forwarded'},
       RbConfig.ruby, File.expand_path('../riscvu-buildd', __dir__), 'pkg')
     assert_equal 0, result.exitstatus, error
-    assert_equal({'command' => 'pkg', 'NOUPLOAD' => '1', 'SERVER' => 'builder@example-host'}, @requests.first.last)
+    assert_equal({'command' => 'pkg', 'NOUPLOAD' => '1', 'SERVER' => 'builder@example-host', 'KEEPCHROOT' => '1'}, @requests.first.last)
+  end
+
+  def test_process_forwards_disabled_keep_chroot
+    @streams << status(done: true, exit_status: 0)
+    _, error, result = Open3.capture3({'ARCHRISCV_BUILDD_URL' => @endpoint.to_s,
+      'NOUPLOAD' => nil, 'SERVER' => nil, 'KEEPCHROOT' => '0'},
+      RbConfig.ruby, File.expand_path('../riscvu-buildd', __dir__), 'pkg')
+    assert_equal 0, result.exitstatus, error
+    assert_equal({'command' => 'pkg', 'KEEPCHROOT' => '0'}, @requests.first.last)
   end
 
   def test_process_preserves_empty_and_unset_environment_variables
     @streams << status(done: true, exit_status: 0)
     _, error, result = Open3.capture3({'ARCHRISCV_BUILDD_URL' => @endpoint.to_s,
-      'NOUPLOAD' => '', 'SERVER' => nil},
+      'NOUPLOAD' => '', 'SERVER' => nil, 'KEEPCHROOT' => nil},
       RbConfig.ruby, File.expand_path('../riscvu-buildd', __dir__), 'pkg')
     assert_equal 0, result.exitstatus, error
     assert_equal({'command' => 'pkg', 'NOUPLOAD' => ''}, @requests.first.last)

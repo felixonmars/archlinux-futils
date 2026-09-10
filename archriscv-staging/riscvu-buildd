@@ -29,7 +29,7 @@ class RiscvuBuildd
     end
     argv.shift if argv.first == ''
     params = {'command' => Shellwords.join(argv)}
-    %w[NOUPLOAD SERVER].each { |name| params[name] = ENV[name] if ENV.key?(name) }
+    %w[NOUPLOAD SERVER KEEPCHROOT].each { |name| params[name] = ENV[name] if ENV.key?(name) }
     response = post('/builds', params)
     @id = JSON.parse(response.body).fetch('id')
     @error.puts "riscvu-buildd: watching build #{@id}"

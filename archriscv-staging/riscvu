@@ -76,13 +76,21 @@ if [[ "$RVVER" == "$PKGVER"* ]]; then
     PKGVER=${PKGVER%-*}-$PKGREL
 fi
 
+# KEEPCHROOT=1 reserves a different worker for every attempt, leaving its chroot
+# available for debugging until it is manually removed from the builder.
+chroot_args=()
+if [[ "$KEEPCHROOT" == "1" ]]; then
+    CHROOT_ID=$(cat /proc/sys/kernel/random/uuid) || exit 1
+    chroot_args=(--worker "keep-${PKGBASE}-${CHROOT_ID}")
+fi
+
 SERVER=$(felixbuild-server-select riscv64)
 
 if [[ "$NOUPLOAD" == "1" ]]; then
-    SYNCBACKPKGBUILD=1 felixbuild $SERVER pkgctl build --arch riscv64 $CMD $nocheck || exit 1
+    SYNCBACKPKGBUILD=1 felixbuild $SERVER pkgctl build --arch riscv64 "${chroot_args[@]}" $CMD $nocheck || exit 1
 else
     LOGFILE=$PKGBASE-$(. PKGBUILD; echo $epoch${epoch:+:}$pkgver-$pkgrel).log
-    SYNCBACKPKGBUILD=1 felixbuild $SERVER pkgctl build --arch riscv64 $CMD $nocheck | tee $LOGFILE
+    SYNCBACKPKGBUILD=1 felixbuild $SERVER pkgctl build --arch riscv64 "${chroot_args[@]}" $CMD $nocheck | tee $LOGFILE
     if [[ ${PIPESTATUS[0]} -ne 0 ]]; then
         read -r -p "Upload log? [y/N] " response
         if [[ "$response" =~ ^([yY][eE][sS]|[yY])$ ]]
