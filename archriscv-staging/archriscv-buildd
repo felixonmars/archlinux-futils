@@ -62,7 +62,7 @@ end
 def duration(build)
   return '-' unless build.started_at
 
-  finished = build.finished_at || Time.now.utc
+  finished = build.upload_prompt_at || build.finished_at || Time.now.utc
   seconds = [(finished - build.started_at).to_i, 0].max
   minutes, secs = seconds.divmod(60)
   hours, minutes = minutes.divmod(60)
@@ -107,13 +107,13 @@ end
 class Build
   attr_accessor :id, :command_line, :argv, :pkgbase, :log_path, :status,
                 :created_at, :started_at, :finished_at, :exit_status,
-                :upload_prompt_seen, :upload_decision, :prompt_answered_at,
+                :upload_prompt_seen, :upload_prompt_at, :upload_decision, :prompt_answered_at,
                 :build_host, :target_builder, :note, :unit_name, :discard_after_finish, :stop_requested,
                 :environment
 
   def initialize(id:, command_line:, argv:, pkgbase:, log_path:, status: 'queued',
                  created_at: Time.now.utc, started_at: nil, finished_at: nil,
-                 exit_status: nil, upload_prompt_seen: false, upload_decision: nil,
+                 exit_status: nil, upload_prompt_seen: false, upload_prompt_at: nil, upload_decision: nil,
                  prompt_answered_at: nil, build_host: nil, target_builder: nil, note: nil,
                  unit_name: nil, discard_after_finish: false, stop_requested: false, environment: {})
     @id = id
@@ -127,6 +127,7 @@ class Build
     @finished_at = finished_at
     @exit_status = exit_status
     @upload_prompt_seen = upload_prompt_seen
+    @upload_prompt_at = upload_prompt_at
     @upload_decision = upload_decision
     @prompt_answered_at = prompt_answered_at
     @build_host = build_host
@@ -151,6 +152,7 @@ class Build
       finished_at: parse_time(hash['finished_at']),
       exit_status: hash['exit_status'],
       upload_prompt_seen: hash['upload_prompt_seen'] || false,
+      upload_prompt_at: parse_time(hash['upload_prompt_at']),
       upload_decision: hash['upload_decision'],
       prompt_answered_at: parse_time(hash['prompt_answered_at']),
       build_host: hash['build_host'],
@@ -176,6 +178,7 @@ class Build
       'finished_at' => finished_at&.utc&.iso8601,
       'exit_status' => exit_status,
       'upload_prompt_seen' => upload_prompt_seen,
+      'upload_prompt_at' => upload_prompt_at&.utc&.iso8601,
       'upload_decision' => upload_decision,
       'prompt_answered_at' => prompt_answered_at&.utc&.iso8601,
       'build_host' => build_host,
@@ -385,6 +388,7 @@ class BuildWorker
     end
     if !@build.upload_prompt_seen && clean_tail.match?(PROMPT_PATTERN)
       @build.upload_prompt_seen = true
+      @build.upload_prompt_at = Time.now.utc
       @build.status = 'waiting_upload'
       changed = true
     end
@@ -833,6 +837,12 @@ class BuildManager
 
     # This flag belongs to the dashboard; worker snapshots do not set it.
     current.stop_requested ||= build.stop_requested
+
+    # Older workers only record entering waiting_upload through the snapshot's mtime.
+    current.upload_prompt_at ||= build.upload_prompt_at
+    if current.status == 'waiting_upload' && !current.upload_prompt_at && File.exist?(path)
+      current.upload_prompt_at = File.mtime(path).utc
+    end
 
     # Older workers may have missed the host announcement before an ANSI-parser fix.
     current.build_host ||= build.build_host

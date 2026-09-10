@@ -3,6 +3,7 @@
 require 'fileutils'
 require 'json'
 require 'minitest/autorun'
+require 'minitest/mock'
 require 'rbconfig'
 require 'stringio'
 require 'tmpdir'
@@ -64,6 +65,32 @@ class TestBuildService
 
   def cleanup
     @pids.keys.each { |id| stop(Build.new(id: id, command_line: '', argv: [], pkgbase: '', log_path: '')) }
+  end
+end
+
+class BuildDurationTest < Minitest::Test
+  def setup
+    @started_at = Time.utc(2026, 9, 10, 1)
+    @build = Build.new(id: 'duration', command_line: 'example', argv: ['riscvu', 'example'],
+      pkgbase: 'example', log_path: '', started_at: @started_at, status: 'running')
+  end
+
+  def test_running_duration_advances_until_the_worker_finishes
+    Time.stub(:now, @started_at + 62) { assert_equal '1m02s', duration(@build) }
+    Time.stub(:now, @started_at + 63) { assert_equal '1m03s', duration(@build) }
+    @build.finished_at = @started_at + 64
+    Time.stub(:now, @started_at + 120) { assert_equal '1m04s', duration(Build.from_h(@build.to_h)) }
+  end
+
+  def test_duration_stays_frozen_after_upload_prompt_and_serialization
+    @build = Build.from_h(@build.to_h.merge('upload_prompt_at' => (@started_at + 3661).iso8601))
+    Time.stub(:now, @started_at + 7200) do
+      %w[waiting_upload running failed interrupted succeeded].each do |status|
+        @build.status = status
+        @build.finished_at = @started_at + 5400 if @build.terminal?
+        assert_equal '1h01m01s', duration(Build.from_h(@build.to_h)), status
+      end
+    end
   end
 end
 
@@ -566,17 +593,60 @@ class BuildRestartTest < Minitest::Test
     assert_equal 'houndour', @manager.find(build.id).build_host
   end
 
+  def test_older_worker_duration_stays_frozen_after_restart_and_completion
+    prompt_at = Time.utc(2026, 9, 10, 1)
+    build = Build.new(id: 'older-prompt', command_line: 'example', argv: ['riscvu', 'example'],
+      pkgbase: 'example', log_path: File.join(LOG_DIR, 'older-prompt.log'), status: 'waiting_upload',
+      started_at: prompt_at - 125, upload_prompt_seen: true,
+      unit_name: 'archriscv-buildd-build-older-prompt.service')
+    directory = File.join(WORKER_DIR, build.id)
+    FileUtils.mkdir_p(directory)
+    path = File.join(directory, 'status.json')
+    snapshot = build.to_h
+    snapshot.delete('upload_prompt_at')
+    write_json(path, snapshot)
+    File.utime(prompt_at, prompt_at, path)
+    write_json(STATE_FILE, 'builds' => [snapshot])
+    @manager = new_manager
+    assert_equal '2m05s', duration(@manager.find(build.id))
+
+    # Old workers keep publishing snapshots without the prompt timestamp.
+    snapshot['status'] = 'running'
+    snapshot['upload_decision'] = 'upload'
+    write_json(path, snapshot)
+    @manager = new_manager
+    assert_equal '2m05s', duration(@manager.find(build.id))
+    snapshot['status'] = 'failed'
+    snapshot['finished_at'] = (prompt_at + 3600).iso8601
+    write_json(path, snapshot)
+    assert_equal '2m05s', duration(@manager.find(build.id))
+    @manager = new_manager
+    assert_equal '2m05s', duration(@manager.find(build.id))
+  end
+
   def test_upload_prompt_can_be_answered_after_restart
     build = @manager.enqueue('prompt-upload')
     wait_for { @manager.find(build.id).status == 'waiting_upload' }
+    current = @manager.find(build.id)
+    prompt_at = current.upload_prompt_at
+    refute_nil prompt_at
+    assert_operator prompt_at, :>=, current.started_at
+    assert_nil current.finished_at
+    elapsed = duration(current)
     restart
     assert_equal 'waiting_upload', @manager.find(build.id).status
+    assert_equal prompt_at, @manager.find(build.id).upload_prompt_at
+    assert_equal elapsed, duration(@manager.find(build.id))
     @manager.answer_upload(build.id, upload: true)
     result = finished(build.id)
     assert_equal 'upload', result.upload_decision
     assert_equal 'failed', result.status
     assert_equal 1, result.exit_status
+    assert_equal prompt_at, result.upload_prompt_at
+    assert_equal elapsed, duration(result)
     assert_includes File.read(build.log_path), 'answer=y'
+    restart
+    assert_equal elapsed, duration(@manager.find(build.id))
   end
 
   def test_saved_skip_decision_is_consumed_while_dashboard_is_offline
