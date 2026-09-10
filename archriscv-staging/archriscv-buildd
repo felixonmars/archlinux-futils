@@ -23,6 +23,7 @@ BUILDER_USER = ENV.fetch('ARCHRISCV_BUILDD_BUILDER_USER', '').strip
 BUILDER_CACHE_DIR = ENV.fetch('ARCHRISCV_BUILDD_BUILDER_CACHE_DIR', '/tmp/felixbuild-server-select')
 MEMORY_KILLER_LIST = File.join(Dir.home, 'projects/archriscv/packages/memory-killer.txt')
 REFRESH_COMMAND = ENV.fetch('ARCHRISCV_BUILDD_REFRESH_COMMAND', 'archrv-refresh')
+REFRESH_STATE_FILE = File.join(Dir.home, '.cache/archriscv/reported.json')
 BUILD_WORKDIR = ENV['ARCHRISCV_BUILDD_WORKDIR']
 BIND = ENV.fetch('ARCHRISCV_BUILDD_BIND', '127.0.0.1')
 PORT = ENV.fetch('ARCHRISCV_BUILDD_PORT', '9181').to_i
@@ -1484,7 +1485,18 @@ class WebApp
     '<span class="tag is-light">nocheck</span>'
   end
 
+  def refresh_safe_deps
+    data = JSON.parse(File.read(REFRESH_STATE_FILE))
+    return [] unless data.is_a?(Hash)
+
+    Array(data['safe_anchors']).grep(String).sort
+  rescue SystemCallError, JSON::ParserError
+    []
+  end
+
   def refresh_panel(pending)
+    safe_deps = refresh_safe_deps
+    safe_deps_title = "Existing safe dependencies: #{safe_deps.empty? ? 'none' : safe_deps.join(', ')}"
     pending_tags = pending.map do |pkgbase|
       <<~HTML
         <label class="tag is-light pending-tag">
@@ -1522,7 +1534,7 @@ class WebApp
     HTML
 
     <<~HTML
-      <section class="box refresh-panel">
+      <section class="box refresh-panel" title="#{h(safe_deps_title)}">
         <div class="section-heading refresh-head">
           <div>
             <h2>Pending refresh <span class="section-count">#{pending.size}</span></h2>
