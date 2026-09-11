@@ -20,10 +20,10 @@ PATCHREPO = "/var/www/archriscv-packages"
 $x86_packages = Hash.new{|h,k| h[k] = {}}
 $rv_packages = Hash.new{|h,k| h[k] = {}}
 $x86_pkgnames_by_pkgbase = Hash.new{|h,k| h[k] = Set[]}
-$x86_depnames_by_pkgbase = Hash.new{|h,k| h[k] = Set[]}
 $x86_pkgbase_by_depname = {}
 
-$rv_provides = Set[]
+$x86_dependencies = RiscvPackageDependencies.new { |a, b| pyalpm.vercmp(a, b) }
+$rv_dependencies = RiscvPackageDependencies.new { |a, b| pyalpm.vercmp(a, b) }
 $rv_required_by_depname = Hash.new{|h,k| h[k] = Set[]}
 $current_rv_package_mtimes_by_pkgbase = Hash.new{|h,k| h[k] = []}
 
@@ -134,16 +134,19 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
         f.puts("<tr><td></td><td>_warning</td><td><span style='color:var(--bulma-danger)'>Failed to fetch from MelonBot, marks will be missing!</span></td></tr>")
     end
 
-    def read_db(handle, db, result)
+    def read_db(handle, db, result, dependencies)
         count = 0
         db_handle = handle.register_syncdb(db, 0)
         db_handle.search("").each do |package|
             yield package
 
+            metadata = {}
             ["depends", "makedepends", "checkdepends", "provides", "arch", "base", "version", "filename"].each do |field|
-                result[package.name][field] = package.send(field)
+                metadata[field] = package.send(field)
             end
-            result[package.name]["db"] = db
+            metadata["db"] = db
+            dependencies.add(package.name, metadata)
+            result[package.name] = metadata
 
             count += 1
         end
@@ -164,19 +167,17 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
         stat = ""
         ["core", "extra"].each do |db|
             puts "Reading x86_64 #{db}..."
-            x86_count = read_db(x86_handle, db, $x86_packages) do |package|
+            x86_count = read_db(x86_handle, db, $x86_packages, $x86_dependencies) do |package|
                 $x86_pkgnames_by_pkgbase[package.base] << package.name
-                $x86_depnames_by_pkgbase[package.base] << package.name
                 $x86_pkgbase_by_depname[package.name] = package.base
                 package.provides.each do |_package|
                     depname = _package.split("=")[0]
-                    $x86_depnames_by_pkgbase[package.base] << depname
                     $x86_pkgbase_by_depname[depname] ||= package.base
                 end
             end
 
             puts "Reading riscv64 #{db}..."
-            rv_count = read_db(rv_handle, db, $rv_packages) do |package|
+            rv_count = read_db(rv_handle, db, $rv_packages, $rv_dependencies) do |package|
                 if ! File.exist?("#{REPOROOT}/repo/#{db}/#{package.filename}")
                     f.puts("<tr><td>#{db}</td><td>#{package.base}</td><td><span style='color:var(--bulma-danger)'>Lint: #{package.name} package file not found in repository</span></td></tr>")
                 elsif ! File.exist?("#{REPOROOT}/repo/#{db}/#{package.filename}.sig")
@@ -201,8 +202,6 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
         File.rename("#{REPOROOT}/.status/status.txt.tmp", "#{REPOROOT}/.status/status.txt")
     end
 
-    $rv_provides |= $rv_packages.keys.to_set
-
     puts "Reading RISC-V package metadata (cached by release and patch contents)..."
     versions = $x86_packages.values.to_h { |package| [package['base'], package['version']] }
     $target_metadata = RiscvPackageMetadata.new(versions: versions, patch_repo: PATCHREPO,
@@ -217,7 +216,9 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
     puts "RISC-V metadata: #{candidates.uniq.size - $target_metadata.errors.size} usable, #{$target_metadata.errors.size} fallbacks"
     candidates.uniq.each do |pkgbase|
         metadata = $target_metadata[pkgbase]
-        metadata&.fetch('provides')&.each { |depname| $x86_pkgbase_by_depname[depname] ||= pkgbase }
+        metadata&.fetch('provides')&.each do |provide|
+            $x86_pkgbase_by_depname[RiscvPackageDependencies.depname(provide)] ||= pkgbase
+        end
     end
 
     puts "Indexing riscv reverse dependencies..."
@@ -241,14 +242,6 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
                 target_package?($x86_packages[pkgname]['base'], pkgname)
             $version_mismatch_pkgbases << $x86_packages[pkgname]["base"]
             $version_mismatch_pkgnames << pkgname
-            package['provides'].each do |_package|
-                depname = _package.split("=")[0]
-                $version_mismatch_pkgnames << depname if ! $x86_packages.has_key? depname
-            end
-        end
-
-        package["provides"].each do |_package|
-            $rv_provides << _package.split("=")[0]
         end
     end
 
@@ -353,10 +346,6 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
 
             $broken_pkgbases << package['base']
             $broken_pkgnames << pkgname
-            package['provides'].each do |_package|
-                depname = _package.split("=")[0]
-                $broken_pkgnames << depname if ! $x86_packages.has_key? depname
-            end
         end
     end
 
@@ -364,46 +353,36 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
         metadata = $target_metadata[pkgbase]
         if metadata
             dependencies = metadata['dependencies']
-            own_provides = metadata['provides'].to_set
+            own_provides = metadata['provides']
         else
             dependencies = []
-            own_provides = $x86_depnames_by_pkgbase[pkgbase]
+            own_provides = []
             $x86_pkgnames_by_pkgbase[pkgbase].each do |pkgname|
                 next if ! $x86_packages.has_key? pkgname
                 package = $x86_packages[pkgname]
+                own_provides << "#{pkgname}=#{package['version']}"
+                package['provides'].each { |provide| own_provides << provide }
                 package["depends"].each do |dep| dependencies << [dep, nil] end
                 package["makedepends"].each do |dep| dependencies << [dep, "make"] end
                 package["checkdepends"].each do |dep| dependencies << [dep, "check"] end
             end
         end
 
-        missing = Set[]
-        broken = Set[]
-        outdated = Set[]
-
-        dependencies.each do |dep, type|
-            dep = dep.split(/[<>=]/)[0]
-
-            if ! $rv_provides.include?(dep) && !own_provides.include?(dep)
-                missing << [dep, type]
-            elsif $broken_pkgnames.include?(dep)
-                broken << [dep, type]
-            elsif $version_mismatch_pkgnames.include?(dep)
-                outdated << [dep, type]
-            end
-        end
-        
-        return missing, broken, outdated
+        $rv_dependencies.classify(dependencies, own_provides: own_provides,
+            broken: $broken_pkgnames, outdated: $version_mismatch_pkgnames)
     end
 
-    def dep_anchor(depname)
-        $x86_pkgbase_by_depname[depname] || depname
+    def dep_anchor(dependency)
+        package = $rv_dependencies.resolve(dependency) || $x86_dependencies.resolve(dependency)
+        depname = RiscvPackageDependencies.depname(dependency)
+        package ? package['base'] : ($x86_pkgbase_by_depname[depname] || depname)
     end
 
     def make_link(list, pkg)
         package, type = pkg
         type = type ? "&nbsp;(#{type})" : ""
-        anchor = dep_anchor(package)
+        anchor = ERB::Util.html_escape(dep_anchor(package))
+        package = ERB::Util.html_escape(package)
         list ? "<li><a href='##{anchor}'>#{package}</a>#{type}</li>" : "<a href='##{anchor}'>#{package}</a>#{type}"
     end
 

@@ -23,7 +23,7 @@ class RiscvPackageMetadata
     end
   end
 
-  CACHE_VERSION = 2
+  CACHE_VERSION = 3
   ERROR_RETRY_SECONDS = 900
   DEPENDENCY_FIELDS = {'depends' => nil, 'makedepends' => 'make', 'checkdepends' => 'check'}.freeze
   EXTRACT_SCRIPT = <<~'BASH'
@@ -42,6 +42,9 @@ class RiscvPackageMetadata
     metadata_fields=(arch depends makedepends checkdepends provides
                      depends_riscv64 makedepends_riscv64 checkdepends_riscv64 provides_riscv64)
     srcinfo_open_section pkgbase "${pkgbase:-${pkgname[0]}}"
+    for metadata_field in pkgver pkgrel epoch; do
+      pkgbuild_extract_to_srcinfo '' "$metadata_field" 0
+    done
     for metadata_field in "${metadata_fields[@]}"; do
       pkgbuild_extract_to_srcinfo '' "$metadata_field" 1
     done
@@ -109,6 +112,7 @@ class RiscvPackageMetadata
   end
 
   def self.parse(srcinfo, pkgbase, version: nil)
+    srcinfo = srcinfo.dup.force_encoding(Encoding::UTF_8)
     global = {}
     packages = {}
     section = global
@@ -124,18 +128,17 @@ class RiscvPackageMetadata
       end
     end
     raise InvalidMetadata, 'invalid .SRCINFO' unless global['pkgbase'] == [pkgbase] && !packages.empty?
-    if version
-      source_version = "#{global.fetch('pkgver', []).first}-#{global.fetch('pkgrel', []).first}"
-      epoch = global.fetch('epoch', ['0']).first
-      source_version = "#{epoch}:#{source_version}" if epoch.to_i.positive?
-      raise InvalidMetadata, 'stale .SRCINFO version' unless source_version == version
-    end
+    raise InvalidMetadata, 'missing .SRCINFO version' unless global['pkgver']&.any? && global['pkgrel']&.any?
+    source_version = "#{global['pkgver'].first}-#{global['pkgrel'].first}"
+    epoch = global.fetch('epoch', ['0']).first
+    source_version = "#{epoch}:#{source_version}" if epoch.to_i.positive?
+    raise InvalidMetadata, 'stale .SRCINFO version' if version && source_version != version
 
     # A global arch=(x86_64) gets extended by felixbuild; explicit split-package
     # arch overrides still restrict which outputs makepkg builds on riscv64.
     packages.select! { |_name, attrs| !attrs.key?('arch') || attrs['arch'].empty? || (attrs['arch'] & %w[any riscv64]).any? }
     dependencies = Set.new
-    provides = packages.keys.to_set
+    provides = packages.keys.map { |pkgname| "#{pkgname}=#{source_version}" }.to_set
     unless packages.empty?
       [global, *packages.values.map { |attrs| global.merge(attrs) }].each do |attrs|
         DEPENDENCY_FIELDS.each do |field, type|
@@ -145,7 +148,7 @@ class RiscvPackageMetadata
       packages.each_value do |attrs|
         effective = global.merge(attrs)
         (effective.fetch('provides', []) + effective.fetch('provides_riscv64', [])).each do |dep|
-          provides << dep.split(/[<>=]/).first
+          provides << dep
         end
       end
     end
@@ -215,5 +218,86 @@ class RiscvPackageMetadata
     end
 
     stdout
+  end
+end
+
+class RiscvPackageDependencies
+  REPOSITORIES = %w[core extra].freeze
+
+  def initialize(&vercmp)
+    @vercmp = vercmp
+    @packages = Hash.new { |h, k| h[k] = [] }
+    @providers = Hash.new { |h, k| h[k] = [] }
+  end
+
+  def add(pkgname, package)
+    candidate = package.merge('name' => pkgname)
+    @packages[pkgname] << candidate
+    package['provides'].each do |provide|
+      name, version = provide.split('=', 2)
+      @providers[name] << [candidate, version] unless name == pkgname
+    end
+  end
+
+  def self.depname(dependency)
+    dependency.split(/[<>=]/, 2).first
+  end
+
+  def resolve(dependency)
+    name, operator, version = dependency.split(/(>=|<=|=|>|<)/, 2)
+
+    # libalpm checks literal package names before considering virtual providers.
+    package = @packages.fetch(name, []).sort_by { |candidate| order(candidate) }.find do |candidate|
+      version_satisfies?(candidate['version'], operator, version)
+    end
+    return package if package
+
+    # Select the first compatible provider, even if its build is broken/outdated.
+    @providers.fetch(name, []).sort_by { |candidate, _| order(candidate) }.find do |_candidate, provided_version|
+      version_satisfies?(provided_version, operator, version)
+    end&.first
+  end
+
+  def provided?(dependency, provides)
+    name, operator, version = dependency.split(/(>=|<=|=|>|<)/, 2)
+    provides.any? do |provide|
+      provided_name, provided_version = provide.split('=', 2)
+      name == provided_name && version_satisfies?(provided_version, operator, version)
+    end
+  end
+
+  def classify(dependencies, own_provides:, broken:, outdated:)
+    missing_deps, broken_deps, outdated_deps = Set.new, Set.new, Set.new
+    dependencies.each do |dependency, type|
+      package = resolve(dependency)
+      if !package
+        missing_deps << [dependency, type] unless provided?(dependency, own_provides)
+      elsif broken.include?(package['name'])
+        broken_deps << [dependency, type]
+      elsif outdated.include?(package['name'])
+        outdated_deps << [dependency, type]
+      end
+    end
+    [missing_deps, broken_deps, outdated_deps]
+  end
+
+  private
+
+  def order(package)
+    [REPOSITORIES.index(package['db']), package['name']]
+  end
+
+  def version_satisfies?(version, operator, required_version)
+    return true unless operator
+    return false unless version
+
+    comparison = @vercmp.call(version, required_version)
+    case operator
+    when '=' then comparison == 0
+    when '>=' then comparison >= 0
+    when '<=' then comparison <= 0
+    when '>' then comparison > 0
+    when '<' then comparison < 0
+    end
   end
 end
