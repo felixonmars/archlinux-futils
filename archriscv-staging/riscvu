@@ -102,7 +102,7 @@ else
 fi
 
 # BUILDHOST=$SERVER PKGBASE=$PKGBASE felix-rsync-wrapper riscvadd $REPO
-riscvadd $REPO
+riscvadd $REPO || exit 1
 
 if [[ -n "$nocheck" ]]; then
     warning "Marking $PKGVER as nocheck"

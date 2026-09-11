@@ -35,14 +35,19 @@ class RiscvuTest < Minitest::Test
         fi
       }
       git() { [[ "$*" == 'checkout --detach 1-1' ]]; }
-      ssh() { :; }
+      ssh() { printf 'ssh %s\n' "$*"; }
       felixbuild-server-select() { printf 'test-builder\n'; }
       felixbuild() {
         printf '%s\0' "$@" > "$RISCVU_TEST_CAPTURE"
         printf 'Running %s\n' "$*"
         return "$RISCVU_TEST_EXIT"
       }
-      riscvadd() { :; }
+      riscvadd() {
+        if [[ "$RISCVU_TEST_ADD_EXIT" != 0 ]]; then
+          printf 'gpg: signing failed: Timeout\n' >&2
+        fi
+        return "$RISCVU_TEST_ADD_EXIT"
+      }
       builtin source "$@"
     BASH
   end
@@ -51,18 +56,33 @@ class RiscvuTest < Minitest::Test
     FileUtils.remove_entry(@root)
   end
 
-  def build(keepchroot:, noupload:, exit_status: 0)
+  def build(keepchroot:, noupload:, exit_status: 0, add_exit_status: 0, nocheck: true)
     output, error, status = Open3.capture3(
       {'KEEPCHROOT' => keepchroot, 'NOUPLOAD' => noupload, 'FORCE_PKGVER' => nil,
-       'RISCVU_TEST_CAPTURE' => @capture, 'RISCVU_TEST_EXIT' => exit_status.to_s, 'TMPDIR' => @root},
-      'bash', @harness, File.expand_path('../riscvu', __dir__), 'example:nocheck', '--testing',
+       'RISCVU_TEST_CAPTURE' => @capture, 'RISCVU_TEST_EXIT' => exit_status.to_s,
+       'RISCVU_TEST_ADD_EXIT' => add_exit_status.to_s, 'TMPDIR' => @root},
+      'bash', @harness, File.expand_path('../riscvu', __dir__), nocheck ? 'example:nocheck' : 'example', '--testing',
       stdin_data: "n\n", chdir: @root)
-    assert_equal exit_status, status.exitstatus, "#{output}\n#{error}"
+    assert_equal(exit_status.zero? && add_exit_status.zero? ? 0 : 1, status.exitstatus, "#{output}\n#{error}")
     assert_empty Dir.glob(File.join(@root, 'tmp.*')), 'temporary checkout was not cleaned up'
     args = File.binread(@capture).split("\0")
     assert_equal %w[test-builder pkgctl build --arch riscv64], args.first(5)
-    assert_equal %w[--testing --nocheck], args.last(2)
-    [args, output]
+    assert_equal(nocheck ? %w[--testing --nocheck] : %w[--testing], args.last(nocheck ? 2 : 1))
+    [args, output, error]
+  end
+
+  def test_signing_failures_stop_before_updating_nocheck_status
+    [nil, '1'].each do |noupload|
+      [false, true].each do |nocheck|
+        [1, 2, 124].each do |add_exit_status|
+          _, output, error = build(keepchroot: nil, noupload: noupload,
+            add_exit_status: add_exit_status, nocheck: nocheck)
+          assert_includes error, 'gpg: signing failed: Timeout'
+          refute_includes output, '.nocheck'
+          refute_includes error, 'Marking'
+        end
+      end
+    end
   end
 
   def test_default_and_disabled_builds_keep_automatic_worker_selection
