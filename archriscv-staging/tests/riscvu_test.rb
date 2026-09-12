@@ -9,6 +9,7 @@ class RiscvuTest < Minitest::Test
   def setup
     @root = Dir.mktmpdir('riscvu-test-')
     @capture = File.join(@root, 'build-args')
+    @mktemp_capture = File.join(@root, 'mktemp-args')
     @harness = File.join(@root, 'harness.sh')
     # Run the real script with shell stand-ins for all package and remote actions.
     # Skip local configuration so tests never read builder credentials.
@@ -22,6 +23,10 @@ class RiscvuTest < Minitest::Test
       colorize() { :; }
       error() { printf '%s\n' "$*" >&2; }
       warning() { printf '%s\n' "$*" >&2; }
+      mktemp() {
+        printf '%s\0' "$@" > "$RISCVU_TEST_MKTEMP_CAPTURE"
+        command mktemp -d --tmpdir="$RISCVU_TEST_TMPDIR"
+      }
       pkgctl() {
         [[ "$1 $2" == 'repo clone' ]] || return 1
         mkdir -- "$3"
@@ -60,10 +65,12 @@ class RiscvuTest < Minitest::Test
     output, error, status = Open3.capture3(
       {'KEEPCHROOT' => keepchroot, 'NOUPLOAD' => noupload, 'FORCE_PKGVER' => nil,
        'RISCVU_TEST_CAPTURE' => @capture, 'RISCVU_TEST_EXIT' => exit_status.to_s,
-       'RISCVU_TEST_ADD_EXIT' => add_exit_status.to_s, 'TMPDIR' => @root},
+       'RISCVU_TEST_ADD_EXIT' => add_exit_status.to_s, 'RISCVU_TEST_MKTEMP_CAPTURE' => @mktemp_capture,
+       'RISCVU_TEST_TMPDIR' => @root},
       'bash', @harness, File.expand_path('../riscvu', __dir__), nocheck ? 'example:nocheck' : 'example', '--testing',
       stdin_data: "n\n", chdir: @root)
     assert_equal(exit_status.zero? && add_exit_status.zero? ? 0 : 1, status.exitstatus, "#{output}\n#{error}")
+    assert_equal ['-d', '--tmpdir=/var/tmp'], File.binread(@mktemp_capture).split("\0")
     assert_empty Dir.glob(File.join(@root, 'tmp.*')), 'temporary checkout was not cleaned up'
     args = File.binread(@capture).split("\0")
     assert_equal %w[test-builder pkgctl build --arch riscv64], args.first(5)
