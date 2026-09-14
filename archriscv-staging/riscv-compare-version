@@ -67,6 +67,7 @@ end
 
 File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
     f.puts('
+    <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light dark">
     <link rel="stylesheet" href="https://cdnjs.snrat.com/ajax/libs/bulma/1.0.3/css/bulma.min.css" integrity="sha384-DtLgkgZWuBalGogBkye1PTBvXKCD/hnA8vHqpqfcGCf/FOa1heAyeHExO8JNtVM/" crossorigin="anonymous">
@@ -572,10 +573,30 @@ File.open("#{REPOROOT}/.status/status.htm.tmp", 'w') do |f|
         messages = []
         if lint["missing"].any?
             packages = lint["missing"].map do |pkgname|
-                depnames = [pkgname] + $rv_packages[pkgname]["provides"].map{|_package| _package.split(/[<>=]/)[0]}
-                required_by = depnames.flat_map{|depname| $rv_required_by_depname[depname].to_a}.uniq - [pkgname]
-                required_by_links = required_by.map{|required_by_pkgname| "<a href='##{$rv_packages[required_by_pkgname]["base"]}'>#{required_by_pkgname}</a>"}
-                required_by.empty? ? pkgname : "#{pkgname} (required by #{required_by_links.join(", ")})"
+                requirements = $rv_dependencies.removal_requirements(pkgname, $rv_packages)
+                package_name = pkgname
+                summary = if requirements.any?{|requirement| requirement['status'] == 'blocked'}
+                    "removal breaks runtime deps"
+                elsif requirements.any?{|requirement| requirement['status'] == 'unsatisfied'}
+                    "runtime deps already unsatisfied"
+                else
+                    package_name = "<span style='color:var(--bulma-success)'>#{pkgname}</span>"
+                    "<span style='color:var(--bulma-success)'>removable</span>"
+                end
+                details = requirements.map do |requirement|
+                    dependent = requirement['name']
+                    dependency = ERB::Util.html_escape(requirement['dependency'])
+                    replacement = requirement['replacement']
+                    result = if replacement
+                        "<a href='##{replacement['base']}'>#{replacement['name']}</a>"
+                    elsif requirement['status'] == 'blocked'
+                        "<strong>blocks removal</strong>"
+                    else
+                        "already unsatisfied"
+                    end
+                    "<a href='##{$rv_packages[dependent]['base']}'>#{dependent}</a>: #{dependency} &rarr; #{result}"
+                end
+                "#{package_name} (#{([summary] + details).join('; ')})"
             end.join(", ")
             subject = lint["missing"].size == 1 ? "package" : "packages"
             messages << "<span style='color:var(--bulma-warning)'>Lint: #{subject} not found in x86 repository: #{packages}.</span>"

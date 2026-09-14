@@ -243,19 +243,42 @@ class RiscvPackageDependencies
     dependency.split(/[<>=]/, 2).first
   end
 
-  def resolve(dependency)
+  def resolve(dependency, excluding: nil)
     name, operator, version = dependency.split(/(>=|<=|=|>|<)/, 2)
 
     # libalpm checks literal package names before considering virtual providers.
     package = @packages.fetch(name, []).sort_by { |candidate| order(candidate) }.find do |candidate|
-      version_satisfies?(candidate['version'], operator, version)
+      candidate['name'] != excluding && version_satisfies?(candidate['version'], operator, version)
     end
     return package if package
 
     # Select the first compatible provider, even if its build is broken/outdated.
-    @providers.fetch(name, []).sort_by { |candidate, _| order(candidate) }.find do |_candidate, provided_version|
-      version_satisfies?(provided_version, operator, version)
+    @providers.fetch(name, []).sort_by { |candidate, _| order(candidate) }.find do |candidate, provided_version|
+      candidate['name'] != excluding && version_satisfies?(provided_version, operator, version)
     end&.first
+  end
+
+  def removal_requirements(pkgname, packages)
+    package = packages.fetch(pkgname)
+    provides = ["#{pkgname}=#{package['version']}"] + package['provides'].reject { |provide| self.class.depname(provide) == pkgname }
+    names = provides.map { |provide| self.class.depname(provide) }.to_set
+    packages.sort.flat_map do |dependent, metadata|
+      next [] if dependent == pkgname
+
+      metadata['depends'].uniq.filter_map do |dependency|
+        next unless names.include?(self.class.depname(dependency))
+
+        replacement = resolve(dependency, excluding: pkgname)
+        status = if replacement
+          'covered'
+        elsif provided?(dependency, provides)
+          'blocked'
+        else
+          'unsatisfied'
+        end
+        {'name' => dependent, 'dependency' => dependency, 'replacement' => replacement, 'status' => status}
+      end
+    end
   end
 
   def provided?(dependency, provides)

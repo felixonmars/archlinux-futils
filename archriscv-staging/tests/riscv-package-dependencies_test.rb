@@ -93,6 +93,42 @@ class RiscvPackageDependenciesTest < Minitest::Test
     assert_nil @dependencies.resolve('virtual>=3')
   end
 
+  def test_removal_checks_each_requirement_and_provided_version
+    packages = {
+      'old' => {'version' => '2-1', 'provides' => ['virtual=2', 'unversioned', 'old=9'], 'depends' => ['self-only']},
+      'replacement' => {'version' => '99-1', 'provides' => ['old=2', 'virtual=1', 'unversioned'], 'depends' => []},
+      'consumer' => {'version' => '1-1', 'provides' => [], 'depends' => ['old>=2', 'virtual>=2', 'unversioned', 'unversioned>=1', 'old>=9', 'unrelated']}
+    }
+    packages.each do |name, metadata|
+      @dependencies.add(name, metadata.merge('db' => 'extra', 'base' => name))
+    end
+
+    requirements = @dependencies.removal_requirements('old', packages)
+    assert_equal ['consumer'], requirements.map { |requirement| requirement['name'] }.uniq
+    assert_equal ['old>=2', 'virtual>=2', 'unversioned', 'unversioned>=1', 'old>=9'],
+      requirements.map { |requirement| requirement['dependency'] }
+    assert_equal %w[covered blocked covered unsatisfied unsatisfied],
+      requirements.map { |requirement| requirement['status'] }
+    assert_equal ['replacement', nil, 'replacement', nil, nil],
+      requirements.map { |requirement| requirement['replacement']&.fetch('name') }
+  end
+
+  def test_removal_excludes_the_package_as_both_literal_and_virtual_provider
+    add('old', version: '2-1', provides: ['virtual=2'])
+    add('replacement', provides: ['old=2', 'virtual=2'])
+
+    assert_equal 'old', @dependencies.resolve('old>=2')['name']
+    assert_equal 'replacement', @dependencies.resolve('old>=2', excluding: 'old')['name']
+    assert_equal 'replacement', @dependencies.resolve('virtual>=2', excluding: 'old')['name']
+    assert_nil @dependencies.resolve('old>=3', excluding: 'old')
+  end
+
+  def test_removal_with_no_reverse_dependencies
+    packages = {'old' => {'version' => '1-1', 'provides' => [], 'depends' => ['old']}}
+
+    assert_empty @dependencies.removal_requirements('old', packages)
+  end
+
   def test_comparisons_use_alpm_epoch_pkgrel_and_soname_semantics
     add('package', version: '1:2.0-3.1', provides: ['virtual=1:2.0-3.1', 'libfoo.so=2-64'])
 
