@@ -50,6 +50,29 @@ class AnsiLogTest < Minitest::Test
     assert_equal "==> Cloning tinymist ...\r\n", input.gsub(ANSI_PATTERN, '')
   end
 
+  def test_package_version_waits_for_complete_token_and_matches_pkgbase
+    worker = BuildWorker.allocate
+    worker.instance_variable_set(:@build, @build)
+    worker.instance_variable_set(:@prompt_tail, '')
+    worker.define_singleton_method(:persist) {}
+    worker.send(:observe_prompt, "==> Making package: dependency 9.0-1 (date)\r\n")
+    assert_nil @build.package_version
+    worker.send(:observe_prompt, "\e[32m==>\e(B\e[m Making package: test 2:1.4.")
+    assert_nil @build.package_version
+    worker.send(:observe_prompt, "1-1 (date)\r\n")
+    assert_equal '2:1.4.1-1', @build.package_version
+    assert_equal '2:1.4.1-1', Build.from_h(@build.to_h).package_version
+  end
+
+  def test_package_version_is_recovered_for_cards_and_log_heading
+    File.write(@build.log_path, "\e[32m==>\e[m Making package: test 1.4.1-1 (date)\n")
+    assert_includes @app.send(:build_card, @build), '<span class="has-text-grey">1.4.1-1</span>'
+    @build.package_version = nil
+    response = WEBrick::HTTPResponse.new(WEBrick::Config::HTTP)
+    @app.send(:show_log, nil, response, @build.id)
+    assert_includes response.body, '<span id="package-version" class="has-text-grey">1.4.1-1</span>'
+  end
+
   def test_every_chunk_boundary_in_escape_sequences
     inputs = [
       ["before\e(BafterB", 'beforeafterB'],

@@ -110,17 +110,18 @@ class Build
                 :created_at, :started_at, :finished_at, :exit_status,
                 :upload_prompt_seen, :upload_prompt_at, :upload_decision, :prompt_answered_at,
                 :build_host, :target_builder, :note, :unit_name, :discard_after_finish, :stop_requested,
-                :environment
+                :environment, :package_version
 
   def initialize(id:, command_line:, argv:, pkgbase:, log_path:, status: 'queued',
                  created_at: Time.now.utc, started_at: nil, finished_at: nil,
                  exit_status: nil, upload_prompt_seen: false, upload_prompt_at: nil, upload_decision: nil,
                  prompt_answered_at: nil, build_host: nil, target_builder: nil, note: nil,
-                 unit_name: nil, discard_after_finish: false, stop_requested: false, environment: {})
+                 unit_name: nil, discard_after_finish: false, stop_requested: false, environment: {}, package_version: nil)
     @id = id
     @command_line = command_line
     @argv = argv
     @pkgbase = pkgbase
+    @package_version = package_version
     @log_path = log_path
     @status = status
     @created_at = created_at
@@ -146,6 +147,7 @@ class Build
       command_line: hash.fetch('command_line'),
       argv: hash.fetch('argv'),
       pkgbase: hash['pkgbase'],
+      package_version: hash['package_version'],
       log_path: hash.fetch('log_path'),
       status: hash.fetch('status', 'queued'),
       created_at: parse_time(hash['created_at']) || Time.now.utc,
@@ -172,6 +174,7 @@ class Build
       'command_line' => command_line,
       'argv' => argv,
       'pkgbase' => pkgbase,
+      'package_version' => package_version,
       'log_path' => log_path,
       'status' => status,
       'created_at' => created_at&.utc&.iso8601,
@@ -194,6 +197,11 @@ class Build
 
   def active?
     ACTIVE_STATUSES.include?(status)
+  end
+
+  def read_package_version(log)
+    name = pkgbase || command_line.sub(/:nocheck\z/, '')
+    self.package_version ||= log.gsub(ANSI_PATTERN, '').match(/(?:\A|[\r\n])==> Making package: #{Regexp.escape(name)} ([^\s]+)\s/)&.[](1)
   end
 
   def terminal?
@@ -383,6 +391,9 @@ class BuildWorker
     @prompt_tail = tail.bytesize > 512 ? tail.byteslice(-512, 512) : tail
     clean_tail = @prompt_tail.gsub(ANSI_PATTERN, '')
     changed = false
+    unless @build.package_version
+      changed = true if @build.read_package_version(clean_tail)
+    end
     if !@build.build_host && (match = clean_tail.match(HOST_PATTERN))
       @build.build_host = match[1]
       changed = true
@@ -849,9 +860,11 @@ class BuildManager
 
     # Older workers may have missed the host announcement before an ANSI-parser fix.
     current.build_host ||= build.build_host
-    unless current.build_host
+    current.package_version ||= build.package_version
+    unless current.build_host && current.package_version
       log, = read_log(current.log_path, 0, 65_536)
-      current.build_host = log.gsub(ANSI_PATTERN, '').match(HOST_PATTERN)&.[](1)
+      current.build_host ||= log.gsub(ANSI_PATTERN, '').match(HOST_PATTERN)&.[](1)
+      current.read_package_version(log)
     end
     current
   end
@@ -1167,6 +1180,7 @@ class WebApp
     return not_found(res) unless build
 
     log, offset = read_log(build.log_path)
+    build.read_package_version(log)
     host_style = build.build_host ? '' : ' style="display:none"'
     host_text = build.build_host.to_s
 
@@ -1175,6 +1189,7 @@ class WebApp
         <div class="section-heading">
           <div class="build-title">
             <h1 class="title is-4 mb-0">#{h(build.pkgbase || build.command_line.sub(/:nocheck\z/, ''))}</h1>
+            <span id="package-version" class="has-text-grey">#{h(build.package_version)}</span>
             #{nocheck_tag(build.command_line)}
           </div>
           <div class="build-actions">
@@ -1255,6 +1270,7 @@ class WebApp
         events.addEventListener('log', (event) => appendLog(JSON.parse(event.data)));
         events.addEventListener('status', (event) => {
           const data = JSON.parse(event.data);
+          if (data.package_version) document.querySelector('#package-version').textContent = data.package_version;
           statusEl.textContent = data.status.replace(/_/g, ' ');
           statusEl.className = `tag ${statusClass(data.status)}`;
           if (hostEl && data.build_host) {
@@ -1312,6 +1328,7 @@ class WebApp
           status: current.status,
           exit_status: current.exit_status,
           build_host: current.build_host,
+          package_version: current.package_version,
           build_tags: @builder_tags.for(current.build_host),
           duration: duration(current),
           started_at: current.started_at&.iso8601,
@@ -1437,10 +1454,11 @@ class WebApp
 
   def build_card(build)
     host = build.build_host
-    unless host
+    unless host && build.package_version
       log, = read_log(build.log_path, 0, 65_536)
       match = log.gsub(ANSI_PATTERN, '').match(HOST_PATTERN)
-      host = match[1] if match
+      host ||= match[1] if match
+      build.read_package_version(log)
     end
 
     <<~HTML
@@ -1448,6 +1466,7 @@ class WebApp
         #{delete_button(build)}
         <div class="build-title">
           <h3><a href="#{h(dashboard_path("builds/#{build.id}/log"))}">#{h(build.pkgbase || build.command_line.sub(/:nocheck\z/, ''))}</a></h3>
+          #{%(<span class="has-text-grey">#{h(build.package_version)}</span>) if build.package_version}
           #{nocheck_tag(build.command_line)}
         </div>
         <div class="build-details">

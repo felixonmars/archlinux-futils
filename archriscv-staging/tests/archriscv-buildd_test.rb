@@ -635,10 +635,12 @@ class BuildRestartTest < Minitest::Test
     write_json(STATE_FILE, 'builds' => [snapshot], 'refresh_pending' => [])
     File.write(build.log_path, "\e]3008;start=build;hostname=lanturn\e\\" \
       "\e[1m\e[32m==>\e(B\e[m\e[1m Building on houndour\e(B\e[m\r\n" \
+      "==> Making package: tinymist 1.4.1-1 (date)\r\n" \
       "\e]3008;end=build\e\\")
     @manager = new_manager
 
     assert_equal 'houndour', @manager.find(build.id).build_host
+    assert_equal '1.4.1-1', @manager.find(build.id).package_version
     res = WEBrick::HTTPResponse.new(WEBrick::Config::HTTP)
     WebApp.new(@manager).send(:show_log, nil, res, build.id)
     assert_match(/<span id="build-host" class="tag is-light"(?: title="[^"]*")?>houndour<\/span>/, res.body)
@@ -652,6 +654,7 @@ class BuildRestartTest < Minitest::Test
     assert_equal 'houndour', @manager.find(build.id).build_host
     @manager = new_manager
     assert_equal 'houndour', @manager.find(build.id).build_host
+    assert_equal '1.4.1-1', @manager.find(build.id).package_version
   end
 
   def test_older_worker_duration_stays_frozen_after_restart_and_completion
