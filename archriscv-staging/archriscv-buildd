@@ -1007,6 +1007,7 @@ class GitHubAuth
 
   COOKIE = 'archriscv_buildd_session'
   SESSION_SECONDS = 43_200
+  CLI_SESSION_SECONDS = 30 * 86_400
 
   def initialize(client_id: ENV.fetch('ARCHRISCV_BUILDD_GITHUB_CLIENT_ID', ''),
     client_secret: ENV.fetch('ARCHRISCV_BUILDD_GITHUB_CLIENT_SECRET', ''),
@@ -1017,6 +1018,7 @@ class GitHubAuth
     @public_url = public_url.delete_suffix('/')
     @editors = editors.split(/[\s,]+/).map(&:downcase).freeze
     @sessions = {}
+    @cli_codes = {}
     @mutex = Mutex.new
     @base_path = ''
     @origin = ''
@@ -1095,6 +1097,37 @@ class GitHubAuth
   def logout(req, res)
     @mutex.synchronize { @sessions.delete(cookie(req)) }
     set_cookie(res, '', 0)
+  end
+
+  def cli_code(req)
+    @mutex.synchronize do
+      owner = cookie(req)
+      session = @sessions[owner]
+      raise Error, 'Sign in with an approved GitHub account first.' unless editor?(session) && session[:expires_at] > Time.now.to_i
+
+      # Keep only one outstanding code per browser session. Codes are never cookies.
+      @cli_codes.delete_if { |_, entry| entry[:expires_at] <= Time.now.to_i || entry[:owner] == owner }
+      code = SecureRandom.urlsafe_base64(32)
+      @cli_codes[code] = {owner: owner, expires_at: Time.now.to_i + 600}
+      code
+    end
+  end
+
+  def exchange_cli_code(req)
+    code = req.query['code']
+    @mutex.synchronize do
+      pending = @cli_codes.delete(code)
+      session = @sessions[pending[:owner]] if pending && pending[:expires_at] > Time.now.to_i
+      unless editor?(session) && session[:expires_at] > Time.now.to_i
+        raise Error, 'Terminal login code expired or could not be verified. Generate a new code.'
+      end
+
+      # Give the terminal its own session so it can sign out without ending the browser session.
+      token = SecureRandom.urlsafe_base64(32)
+      entry = {login: session[:login], csrf: SecureRandom.urlsafe_base64(32), expires_at: Time.now.to_i + CLI_SESSION_SECONDS}.freeze
+      @sessions[token] = entry
+      entry.merge(cookie: "#{COOKIE}=#{token}")
+    end
   end
 
   private
@@ -1187,6 +1220,10 @@ class WebApp
 
       @auth.logout(req, res)
       return redirect(res, '/')
+    when ['POST', '/auth/cli/exchange']
+      res['Content-Type'] = 'application/json; charset=utf-8'
+      res.body = JSON.generate(@auth.exchange_cli_code(req))
+      return
     end
 
     if @read_only && (!%w[GET HEAD].include?(req.request_method) || !view_path?(req.path))
@@ -1200,6 +1237,10 @@ class WebApp
     case [method, req.path]
     when ['GET', '/']
       html(res, render_index(req))
+    when ['GET', '/auth/cli']
+      html(res, cli_login_page)
+    when ['POST', '/auth/cli']
+      html(res, cli_login_page(@auth.cli_code(req)))
     when ['GET', '/log-viewer.js']
       res['Content-Type'] = 'text/javascript; charset=utf-8'
       res['Cache-Control'] = 'no-cache'
@@ -1230,7 +1271,7 @@ class WebApp
   end
 
   def view_path?(path)
-    ['/', '/log-viewer.js'].include?(path) || path.match?(%r{\A/builds/[^/]+/(?:log|log-chunk|raw|events)\z})
+    ['/', '/log-viewer.js', '/auth/cli'].include?(path) || path.match?(%r{\A/builds/[^/]+/(?:log|log-chunk|raw|events)\z})
   end
 
   def dashboard_path(path = '')
@@ -1970,6 +2011,7 @@ class WebApp
     if @session
       <<~HTML
         <span>#{h(@session[:login])} &middot; #{@read_only ? 'View only' : 'Editor'}</span>
+        #{%(<a class="button is-light" href="#{h(dashboard_path('auth/cli'))}">Terminal login</a>) unless @read_only}
         <form class="inline" action="#{h(dashboard_path('auth/logout'))}" method="post">
           <button class="button is-light" type="submit">Sign out</button>
         </form>
@@ -1979,6 +2021,33 @@ class WebApp
     else
       '<span class="has-text-grey">View only</span>'
     end
+  end
+
+  def cli_login_page(code = nil)
+    controls = if @read_only
+                 '<p>Sign in with an approved GitHub account, then return to Terminal login.</p>'
+               else
+                 <<~HTML
+                   <p>Run <code>riscvu-buildd --login</code> in your terminal, then generate a code here.</p>
+                   <form action="#{h(dashboard_path('auth/cli'))}" method="post">
+                     <button class="button is-primary" type="submit">Generate login code</button>
+                   </form>
+                 HTML
+               end
+    credentials = <<~HTML if code
+      <p>Paste this code into your terminal. It works once, expires in 10 minutes, and replaces any previous unused code.</p>
+      <input class="input is-family-monospace" aria-label="Terminal login code" value="#{h(code)}" readonly autocomplete="off">
+      <p>The terminal session lasts 30 days or until the scheduler restarts. Use <code>riscvu-buildd --logout</code> to sign out.</p>
+    HTML
+    layout('terminal login', <<~HTML)
+      <section class="box">
+        <h1 class="title is-4">Terminal login</h1>
+        <div class="build-actions">#{account_controls}</div>
+        #{controls}
+        #{credentials}
+        <a href="#{h(dashboard_path)}">Dashboard</a>
+      </section>
+    HTML
   end
 
   def layout(title, body)

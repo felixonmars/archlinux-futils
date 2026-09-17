@@ -1,26 +1,40 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
-# Usage: ARCHRISCV_BUILDD_URL=http://host:9181 riscvu-buildd [pkgbase[:nocheck]] [build args...]
+# Usage: ARCHRISCV_BUILDD_URL=https://host/buildd/ riscvu-buildd --login
+#        riscvu-buildd [pkgbase[:nocheck]] [build args...]
 
+require 'digest'
+require 'fileutils'
+require 'io/console'
 require 'json'
 require 'net/http'
 require 'shellwords'
+require 'tempfile'
 require 'uri'
 
 class RiscvuBuildd
+  class LoginRequired < RuntimeError; end
+
   CONNECTION_ERRORS = [IOError, EOFError, SystemCallError, Timeout::Error].freeze
 
   def initialize(endpoint: URI(ENV.fetch('ARCHRISCV_BUILDD_URL', 'http://127.0.0.1:9181')),
-                 input: $stdin, output: $stdout, error: $stderr)
-    unless endpoint.is_a?(URI::HTTP) && endpoint.host && ['', '/'].include?(endpoint.path) && !endpoint.query && !endpoint.fragment
-      raise 'ARCHRISCV_BUILDD_URL must be an HTTP(S) URL without a path, query or fragment'
+                 input: $stdin, output: $stdout, error: $stderr, session_path: nil)
+    endpoint = endpoint.dup
+    endpoint.path = endpoint.path.delete_suffix('/')
+    unless (endpoint.is_a?(URI::HTTPS) || (endpoint.is_a?(URI::HTTP) && %w[localhost 127.0.0.1 ::1].include?(endpoint.hostname))) &&
+      endpoint.host && endpoint.path.match?(%r{\A(?:/[A-Za-z0-9_-]+)*\z}) && !endpoint.userinfo && !endpoint.query && !endpoint.fragment
+      raise 'ARCHRISCV_BUILDD_URL must use HTTPS with an optional path prefix (HTTP is allowed only on localhost)'
     end
     @endpoint, @input, @output, @error = endpoint, input, output, error
+    @session_path = session_path || File.join(Dir.home, '.local/state/riscvu-buildd', "#{Digest::SHA256.hexdigest(endpoint.to_s)}.json")
     @offset = 0
     @answered = false
   end
 
   def run(argv)
+    return login if argv == ['--login']
+    return logout if argv == ['--logout']
+
     argv = argv.dup
     if argv.empty?
       raise 'No pkgbase specified and not in a package directory.' unless File.exist?('PKGBUILD')
@@ -48,8 +62,68 @@ class RiscvuBuildd
 
   private
 
+  def path(value)
+    "#{@endpoint.path}#{value}"
+  end
+
+  def login
+    @error.puts "Open #{@endpoint}/auth/cli, sign in with GitHub, and generate a terminal login code."
+    @error.print 'Login code: '
+    @error.flush
+    code = if @input.respond_to?(:tty?) && @input.tty?
+             @input.noecho(&:gets)
+           else
+             @input.gets
+           end
+    @error.puts
+    raise 'No login code provided.' unless code&.strip&.match?(/\A[A-Za-z0-9_-]{43}\z/)
+
+    request = Net::HTTP::Post.new(path('/auth/cli/exchange'))
+    request.set_form_data(code: code.strip)
+    response = http.request(request)
+    raise "Terminal login failed (HTTP #{response.code}). Generate a new code and try again." unless response.is_a?(Net::HTTPSuccess)
+
+    session = JSON.parse(response.body).merge('endpoint' => @endpoint.to_s)
+    validate_session(session)
+    FileUtils.mkdir_p(File.dirname(@session_path), mode: 0o700)
+    Tempfile.create('.session-', File.dirname(@session_path)) do |file|
+      file.write(JSON.generate(session))
+      file.close
+      File.rename(file.path, @session_path)
+    end
+    @error.puts "Signed in as #{session.fetch('login')}. Session expires in 30 days or when the scheduler restarts."
+    0
+  end
+
+  def logout
+    begin
+      post('/auth/logout', {})
+    rescue LoginRequired
+      # Expired or already revoked sessions only need their local copy removed.
+    end
+    File.unlink(@session_path) if File.exist?(@session_path)
+    @error.puts 'Signed out.'
+    0
+  end
+
+  def validate_session(session)
+    unless session.is_a?(Hash) && session['endpoint'] == @endpoint.to_s &&
+      session['cookie'].is_a?(String) && session['cookie'].match?(/\Aarchriscv_buildd_session=[A-Za-z0-9_-]{43}\z/) &&
+      session['csrf'].is_a?(String) && session['csrf'].match?(/\A[A-Za-z0-9_-]{43}\z/) &&
+      session['expires_at'].is_a?(Integer) && session['expires_at'] > Time.now.to_i
+      raise LoginRequired, 'Missing, invalid, or expired session. Run riscvu-buildd --login with this ARCHRISCV_BUILDD_URL first.'
+    end
+    session
+  end
+
+  def session
+    validate_session(JSON.parse(File.read(@session_path)))
+  rescue Errno::ENOENT, JSON::ParserError
+    raise LoginRequired, 'No saved session. Run riscvu-buildd --login with this ARCHRISCV_BUILDD_URL first.'
+  end
+
   def http
-    connection = Net::HTTP.new(@endpoint.host, @endpoint.port, nil)
+    connection = Net::HTTP.new(@endpoint.hostname, @endpoint.port, nil)
     connection.use_ssl = @endpoint.scheme == 'https'
     connection.open_timeout = 10
     connection.read_timeout = 30
@@ -58,10 +132,16 @@ class RiscvuBuildd
   end
 
   def post(path, params)
-    request = Net::HTTP::Post.new(path)
+    credentials = session
+    request = Net::HTTP::Post.new(self.path(path))
     request['Accept'] = 'application/json'
+    request['Cookie'] = credentials.fetch('cookie')
+    request['X-CSRF-Token'] = credentials.fetch('csrf')
     request.set_form_data(params)
     response = http.request(request)
+    if response.code == '403'
+      raise LoginRequired, "#{path}: authorization expired or was revoked. Run riscvu-buildd --login with this ARCHRISCV_BUILDD_URL again."
+    end
     unless response.is_a?(Net::HTTPSuccess) || response.code == '303'
       raise "#{path}: HTTP #{response.code}: #{response.body}"
     end
@@ -70,7 +150,7 @@ class RiscvuBuildd
 
   def watch
     result = nil
-    http.request_get("/builds/#{@id}/events?offset=#{@offset}") do |response|
+    http.request_get(path("/builds/#{@id}/events?offset=#{@offset}")) do |response|
       raise "watch: HTTP #{response.code}" unless response.is_a?(Net::HTTPSuccess)
 
       buffer = +''

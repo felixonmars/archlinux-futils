@@ -283,6 +283,98 @@ class BuildAuthTest < Minitest::Test
     assert_equal 403, request('POST', '/builds', cookie: cookie(start)).status
   end
 
+  def cli_code(editor)
+    response = request('POST', '/auth/cli', cookie: editor, params: {_csrf: csrf(editor)})
+    assert_equal 200, response.status
+    assert_equal 'no-store', response['Cache-Control']
+    response.body[/aria-label="Terminal login code" value="([^"]+)"/, 1].tap { |code| refute_nil code }
+  end
+
+  def test_terminal_code_requires_editor_and_csrf_and_cannot_be_used_as_a_cookie
+    viewer = login('UnlistedUser')
+    assert_equal 403, request('POST', '/auth/cli', cookie: viewer, params: {_csrf: csrf(viewer)}).status
+    assert_equal 403, request('POST', '/auth/cli').status
+    editor = login
+    assert_equal 403, request('POST', '/auth/cli', cookie: editor).status
+    assert_equal 403, request('POST', '/auth/cli', cookie: editor, params: {_csrf: csrf(editor)},
+      headers: {'Origin' => 'https://evil.example'}).status
+    code = cli_code(editor)
+    assert_equal 403, request('POST', '/builds', cookie: "#{GitHubAuth::COOKIE}=#{code}",
+      params: {command: 'test', _csrf: csrf(editor)}).status
+  end
+
+  def test_terminal_code_exchanges_once_for_a_separate_30_day_session
+    editor = login
+    code = cli_code(editor)
+    response = request('POST', '/auth/cli/exchange', params: {code: code})
+    assert_equal 200, response.status
+    assert_equal 'no-store', response['Cache-Control']
+    credentials = JSON.parse(response.body)
+    refute_equal editor, credentials['cookie']
+    refute_equal csrf(editor), credentials['csrf']
+    assert_in_delta Time.now.to_i + 30 * 86_400, credentials['expires_at'], 1
+    assert_equal 400, request('POST', '/auth/cli/exchange', params: {code: code}).status
+    assert_equal 403, request('POST', '/builds', cookie: credentials['cookie'], params: {command: 'test'}).status
+    Time.stub(:now, Time.now + 14 * 86_400) do
+      assert_equal 303, request('POST', '/builds', cookie: credentials['cookie'],
+        params: {command: 'test', _csrf: credentials['csrf']}).status
+      assert_equal 403, request('POST', '/builds', cookie: editor, params: {command: 'test'}).status
+    end
+    Time.stub(:now, Time.now + 31 * 86_400) do
+      assert_equal 403, request('POST', '/builds', cookie: credentials['cookie'],
+        params: {command: 'test', _csrf: credentials['csrf']}).status
+    end
+    assert_includes request('GET', '/', cookie: editor).body, 'AllowedUser &middot; Editor'
+  end
+
+  def test_terminal_codes_expire_and_replacement_invalidates_old_code
+    editor = login
+    old = cli_code(editor)
+    current = cli_code(editor)
+    assert_equal 1, @auth.instance_variable_get(:@cli_codes).length
+    assert_equal 400, request('POST', '/auth/cli/exchange', params: {code: old}).status
+    Time.stub(:now, Time.now + 601) do
+      assert_equal 400, request('POST', '/auth/cli/exchange', params: {code: current}).status
+    end
+  end
+
+  def test_terminal_code_cannot_be_exchanged_after_browser_logout_or_editor_removal
+    editor = login
+    code = cli_code(editor)
+    request('POST', '/auth/logout', cookie: editor, params: {_csrf: csrf(editor)})
+    assert_equal 400, request('POST', '/auth/cli/exchange', params: {code: code}).status
+    editor = login
+    code = cli_code(editor)
+    @auth.instance_variable_set(:@editors, [])
+    assert_equal 400, request('POST', '/auth/cli/exchange', params: {code: code}).status
+  end
+
+  def test_concurrent_terminal_code_exchange_creates_only_one_session
+    code = cli_code(login)
+    threads = 2.times.map { Thread.new { request('POST', '/auth/cli/exchange', params: {code: code}).status } }
+    assert_equal [200, 400], threads.map(&:value).sort
+    assert_equal 2, @auth.instance_variable_get(:@sessions).length
+  end
+
+  def test_slow_terminal_exchange_body_does_not_block_other_sessions
+    editor = login
+    entered = Queue.new
+    release = Queue.new
+    req = Object.new
+    req.define_singleton_method(:query) do
+      entered << true
+      release.pop
+      {'code' => 'invalid'}
+    end
+    thread = Thread.new { assert_raises(GitHubAuth::Error) { @auth.exchange_cli_code(req) } }
+    entered.pop
+    response = Timeout.timeout(2) { request('GET', '/', cookie: editor) }
+    assert_includes response.body, 'AllowedUser &middot; Editor'
+  ensure
+    release << true if release
+    thread&.value
+  end
+
   def test_real_exchange_uses_https_and_sanitizes_transport_errors
     auth = GitHubAuth.new(client_id: 'id', client_secret: 'secret', public_url: 'https://buildd.example.com')
     responses = [
