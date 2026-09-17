@@ -21,6 +21,21 @@ class SystemdBuildRestartTest < Minitest::Test
     @port = socket.addr[1]
     socket.close
     @command = File.join(@root, 'fake-build')
+    @auth_helper = File.join(@root, 'fake-github.rb')
+    # Replace only the external identity exchange; exercise real cookies and CSRF.
+    File.write(@auth_helper, <<~'RUBY')
+      class GitHubAuth
+        prepend(Module.new do
+          private
+
+          def github_user(code, verifier)
+            raise 'unexpected OAuth exchange' unless code == 'integration-test' && !verifier.empty?
+
+            {'id' => 1, 'login' => 'integration-editor'}
+          end
+        end)
+      end
+    RUBY
     File.write(@command, <<~'RUBY')
       #!/usr/bin/env ruby
       require 'rbconfig'
@@ -108,14 +123,24 @@ class SystemdBuildRestartTest < Minitest::Test
   def request(path, params = nil)
     uri = URI("http://127.0.0.1:#{@port}#{path}")
     Net::HTTP.start(uri.host, uri.port, nil, open_timeout: 2, read_timeout: 10) do |http|
-      if params
-        req = Net::HTTP::Post.new(uri)
-        req.set_form_data(params)
-        http.request(req)
-      else
-        http.get(uri.request_uri)
-      end
+      req = params ? Net::HTTP::Post.new(uri) : Net::HTTP::Get.new(uri)
+      req.set_form_data(params) if params
+      req['Cookie'] = @session_cookie if @session_cookie
+      req['X-CSRF-Token'] = @csrf if params && @csrf
+      http.request(req)
     end
+  end
+
+  def login_dashboard
+    response = request('/auth/github')
+    assert_equal '303', response.code
+    @session_cookie = response['Set-Cookie'].split(';').first
+    state = URI.decode_www_form(URI(response['Location']).query).to_h.fetch('state')
+    response = request("/auth/github/callback?code=integration-test&state=#{state}")
+    assert_equal '303', response.code
+    @session_cookie = response['Set-Cookie'].split(';').first
+    @csrf = request('/').body[/name="_csrf" value="([^"]+)"/, 1]
+    refute_nil @csrf
   end
 
   def wait_for_dashboard
@@ -132,9 +157,13 @@ class SystemdBuildRestartTest < Minitest::Test
       "--setenv=ARCHRISCV_BUILDD_STATE_DIR=#{@root}", "--setenv=ARCHRISCV_BUILDD_LOG_DIR=#{@root}/logs",
       "--setenv=ARCHRISCV_BUILDD_BUILD_COMMAND=#{@command}", "--setenv=ARCHRISCV_BUILDD_WORKDIR=#{@root}",
       '--setenv=ARCHRISCV_BUILDD_BUILDER_USER=builder',
+      '--setenv=ARCHRISCV_BUILDD_GITHUB_CLIENT_ID=test', '--setenv=ARCHRISCV_BUILDD_GITHUB_CLIENT_SECRET=test',
+      '--setenv=ARCHRISCV_BUILDD_GITHUB_EDITORS=integration-editor',
+      "--setenv=ARCHRISCV_BUILDD_PUBLIC_URL=http://127.0.0.1:#{@port}",
       "--setenv=ARCHRISCV_SYSTEMD_TEST_ROOT=#{@root}", '--setenv=ARCHRISCV_BUILDD_BIND=127.0.0.1',
-      "--setenv=ARCHRISCV_BUILDD_PORT=#{@port}", '--', RbConfig.ruby, @daemon)
+      "--setenv=ARCHRISCV_BUILDD_PORT=#{@port}", '--', RbConfig.ruby, '-r', @auth_helper, @daemon)
     wait_for_dashboard
+    login_dashboard
   end
 
   def restart_dashboard
@@ -143,6 +172,7 @@ class SystemdBuildRestartTest < Minitest::Test
     assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 5,
       'dashboard shutdown hung, possibly on an open log stream'
     wait_for_dashboard
+    login_dashboard
   end
 
   def builds

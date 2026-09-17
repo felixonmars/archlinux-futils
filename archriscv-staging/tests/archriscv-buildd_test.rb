@@ -188,11 +188,22 @@ class BuildRestartTest < Minitest::Test
     post_request('/refresh', body)
   end
 
+  def editor_app(manager = @manager)
+    auth = GitHubAuth.new(editors: 'tester')
+    session = {login: 'tester', csrf: 'test-csrf'}
+    auth.define_singleton_method(:session) { |_| session }
+    app = WebApp.new(manager, auth: auth)
+    # Private rendering helpers are also exercised outside the request dispatcher.
+    app.instance_variable_set(:@session, session)
+    app.instance_variable_set(:@read_only, false)
+    app
+  end
+
   def post_request(path, body = '', accept: 'text/html')
     req = WEBrick::HTTPRequest.new(WEBrick::Config::HTTP)
-    req.parse(StringIO.new("POST #{path} HTTP/1.1\r\nHost: localhost\r\nAccept: #{accept}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: #{body.bytesize}\r\n\r\n#{body}"))
+    req.parse(StringIO.new("POST #{path} HTTP/1.1\r\nHost: localhost\r\nAccept: #{accept}\r\nX-CSRF-Token: test-csrf\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: #{body.bytesize}\r\n\r\n#{body}"))
     res = WEBrick::HTTPResponse.new(WEBrick::Config::HTTP)
-    WebApp.new(@manager).call(req, res)
+    editor_app.call(req, res)
     res
   end
 
@@ -211,7 +222,7 @@ class BuildRestartTest < Minitest::Test
     req = WEBrick::HTTPRequest.new(WEBrick::Config::HTTP)
     req.parse(StringIO.new("GET /builds/#{build.id}/events HTTP/1.1\r\nHost: localhost\r\n\r\n"))
     res = WEBrick::HTTPResponse.new(WEBrick::Config::HTTP)
-    WebApp.new(@manager).call(req, res)
+    editor_app.call(req, res)
     output = StringIO.new
     res.body.call(output)
     assert_includes output.string, 'build completed'
@@ -267,7 +278,7 @@ class BuildRestartTest < Minitest::Test
   def test_keep_chroot_checkbox_can_be_enabled_and_disabled_on_retry
     build = @manager.enqueue('prompt-keep-chroot')
     wait_for { @manager.find(build.id).status == 'waiting_upload' }
-    app = WebApp.new(@manager)
+    app = editor_app
     assert_includes app.send(:start_build_form), 'name="KEEPCHROOT" value="1"> Keep chroot'
     assert_includes app.send(:decision_panel, @manager.find(build.id)), 'name="KEEPCHROOT" value="1"> Keep chroot'
 
@@ -293,7 +304,7 @@ class BuildRestartTest < Minitest::Test
 
   def test_keep_chroot_is_selected_per_build_and_ignores_daemon_environment
     ENV['KEEPCHROOT'] = '1'
-    app = WebApp.new(@manager)
+    app = editor_app
     assert_includes app.send(:start_build_form), 'name="KEEPCHROOT" value="1"> Keep chroot'
     default = finished(@manager.enqueue('keep-default').id)
     refute default.environment.key?('KEEPCHROOT')
@@ -330,7 +341,7 @@ class BuildRestartTest < Minitest::Test
     refute File.exist?(marker)
   end
 
-  def test_view_only_pages_keep_status_and_logs_but_reject_all_actions
+  def test_anonymous_pages_keep_status_and_logs_but_reject_all_actions
     builds = (ACTIVE_STATUSES + TERMINAL_STATUSES).map do |status|
       Build.new(id: status, command_line: "package-#{status}", argv: ['riscvu', "package-#{status}"],
         pkgbase: "package-#{status}", log_path: File.join(TEST_ROOT, 'view.log'), status: status)
@@ -339,7 +350,7 @@ class BuildRestartTest < Minitest::Test
     deferred = {'build' => {'id' => 'later', 'command_line' => 'deferred-package'}, 'wait_for' => 'dependency'}
     manager = Struct.new(:all_builds, :refresh_pending, :deferred_retries).new(builds, ['pending-package'], [deferred])
     manager.define_singleton_method(:find) { |id| all_builds.find { |build| build.id == id } }
-    view = WebApp.new(manager, read_only: true)
+    view = WebApp.new(manager)
     request = lambda do |method, path, app = view|
       req = WEBrick::HTTPRequest.new(WEBrick::Config::HTTP)
       req.parse(StringIO.new("#{method} #{path} HTTP/1.1\r\nHost: localhost:9181\r\nContent-Length: 0\r\n\r\n"))
@@ -351,7 +362,6 @@ class BuildRestartTest < Minitest::Test
     ['/', '/builds/waiting_upload/log', '/builds/failed/log'].each do |path|
       response = request.call('GET', path)
       assert_equal 200, response.status
-      refute_includes response.body, 'View only'
       refute_match(/method="post"|type="checkbox"|formaction=/, response.body)
     end
     dashboard = request.call('GET', '/').body
@@ -359,8 +369,8 @@ class BuildRestartTest < Minitest::Test
     refute_includes dashboard, 'Pending refresh'
     refute_includes dashboard, 'pending-package'
     assert_includes dashboard, 'name="q"'
-    assert_includes dashboard, 'href="./builds/running/log"'
-    assert_includes dashboard, 'action="./" method="get"'
+    assert_includes dashboard, 'href="/builds/running/log"'
+    assert_includes dashboard, 'action="/" method="get"'
     log_page = request.call('GET', '/builds/running/log').body
     assert_includes log_page, 'src="../../log-viewer.js?v=3"'
     assert_includes log_page, 'new EventSource(`events?offset=${offset}`)'
@@ -377,7 +387,7 @@ class BuildRestartTest < Minitest::Test
     actions.each { |path| assert_equal 403, request.call('POST', path).status }
     %w[PUT PATCH DELETE].each { |method| assert_equal 403, request.call(method, '/').status }
     assert_equal 403, request.call('GET', '/builds/running/stop').status
-    assert_includes request.call('GET', '/', WebApp.new(manager)).body, 'method="post"'
+    assert_includes request.call('GET', '/', editor_app(manager)).body, 'method="post"'
   end
 
   def test_refresh_without_extra_safe_dependencies_preserves_default_invocation
@@ -450,7 +460,7 @@ class BuildRestartTest < Minitest::Test
     req = WEBrick::HTTPRequest.new(WEBrick::Config::HTTP)
     req.parse(StringIO.new("GET /builds/#{build.id}/memory-killer HTTP/1.1\r\nHost: localhost\r\n\r\n"))
     res = WEBrick::HTTPResponse.new(WEBrick::Config::HTTP)
-    WebApp.new(@manager).call(req, res)
+    editor_app.call(req, res)
     assert_equal 404, res.status
     refute File.exist?(MEMORY_KILLER_LIST)
   end
@@ -541,7 +551,7 @@ class BuildRestartTest < Minitest::Test
     build = @manager.enqueue('wait-live-prompt')
     wait_for { @manager.find(build.id).status == 'running' }
     res = WEBrick::HTTPResponse.new(WEBrick::Config::HTTP)
-    WebApp.new(@manager).send(:show_log, nil, res, build.id)
+    editor_app.send(:show_log, nil, res, build.id)
     assert_includes res.body, 'id="decision"'
     assert_includes res.body, "action=\"/builds/#{build.id}/retry\""
     assert_includes res.body, 'Skip upload + retry'
@@ -645,7 +655,7 @@ class BuildRestartTest < Minitest::Test
     assert_equal 'houndour', @manager.find(build.id).build_host
     assert_equal '1.4.1-1', @manager.find(build.id).package_version
     res = WEBrick::HTTPResponse.new(WEBrick::Config::HTTP)
-    WebApp.new(@manager).send(:show_log, nil, res, build.id)
+    editor_app.send(:show_log, nil, res, build.id)
     assert_match(/<span id="build-host" class="tag is-light"(?: title="[^"]*")?>houndour<\/span>/, res.body)
     assert_nil JSON.parse(File.read(File.join(worker_directory, 'status.json')))['build_host']
 
@@ -757,7 +767,7 @@ class BuildRestartTest < Minitest::Test
     end
     other = @manager.enqueue('wait-other')
     wait_for { @manager.find(other.id).status == 'running' }
-    app = WebApp.new(@manager)
+    app = editor_app
     controls = app.send(:stop_button, @manager.find(build.id))
     assert_includes controls, 'data-kill-button style="display:none"'
     assert_equal 400, post_request("/builds/#{build.id}/kill").status
@@ -772,7 +782,7 @@ class BuildRestartTest < Minitest::Test
     controls = app.send(:stop_button, current)
     assert_includes controls, "formaction=\"/builds/#{build.id}/kill\""
     refute_includes controls, 'data-kill-button style="display:none"'
-    assert_empty WebApp.new(@manager, read_only: true).send(:stop_button, current)
+    assert_empty WebApp.new(@manager).send(:stop_button, current)
 
     assert_equal 303, post_request("/builds/#{build.id}/kill").status
     result = finished(build.id)
@@ -792,7 +802,7 @@ class BuildRestartTest < Minitest::Test
     req = WEBrick::HTTPRequest.new(WEBrick::Config::HTTP)
     req.parse(StringIO.new("GET /builds/#{build.id}/events?offset=#{File.size(build.log_path)} HTTP/1.1\r\nHost: localhost\r\n\r\n"))
     response = WEBrick::HTTPResponse.new(WEBrick::Config::HTTP)
-    WebApp.new(@manager).call(req, response)
+    editor_app.call(req, response)
     output = StringIO.new
     response.body.call(output)
     assert_includes output.string, '"stop_requested":true'
@@ -811,7 +821,7 @@ class BuildRestartTest < Minitest::Test
     req = WEBrick::HTTPRequest.new(WEBrick::Config::HTTP)
     req.parse(StringIO.new("GET /builds/#{build.id}/kill HTTP/1.1\r\nHost: localhost\r\n\r\n"))
     response = WEBrick::HTTPResponse.new(WEBrick::Config::HTTP)
-    WebApp.new(@manager).call(req, response)
+    editor_app.call(req, response)
     assert_equal 404, response.status
     assert @service.active?(build)
     assert_equal 400, post_request('/builds/missing/kill').status
@@ -852,7 +862,7 @@ class BuildRestartTest < Minitest::Test
     req = WEBrick::HTTPRequest.new(WEBrick::Config::HTTP)
     req.parse(StringIO.new("GET /builds/#{build.id}/events?offset=0 HTTP/1.1\r\nHost: localhost\r\nLast-Event-ID: 6\r\n\r\n"))
     res = WEBrick::HTTPResponse.new(WEBrick::Config::HTTP)
-    WebApp.new(@manager).call(req, res)
+    editor_app.call(req, res)
     output = StringIO.new
     res.body.call(output)
     refute_includes output.string, 'first'

@@ -5,9 +5,12 @@ require 'cgi'
 require 'fileutils'
 require 'fiddle/import'
 require 'json'
+require 'net/http'
 require 'open3'
+require 'openssl'
 require 'pty'
 require 'rbconfig'
+require 'securerandom'
 require 'shellwords'
 require 'time'
 require 'webrick'
@@ -27,8 +30,6 @@ REFRESH_STATE_FILE = File.join(Dir.home, '.cache/archriscv/reported.json')
 BUILD_WORKDIR = ENV['ARCHRISCV_BUILDD_WORKDIR']
 BIND = ENV.fetch('ARCHRISCV_BUILDD_BIND', '127.0.0.1')
 PORT = ENV.fetch('ARCHRISCV_BUILDD_PORT', '9181').to_i
-VIEW_BIND = ENV.fetch('ARCHRISCV_BUILDD_VIEW_BIND', BIND)
-VIEW_PORT = ENV.fetch('ARCHRISCV_BUILDD_VIEW_PORT', '0').to_i
 RECENT_PAGE_SIZE = 30
 PROMPT_PATTERN = /(?:\A|[\r\n])Upload log\? \[y\/N\] \z/.freeze
 HOST_PATTERN = /(?:\A|[\r\n])==> Building on ([A-Za-z0-9._-]+)/.freeze
@@ -1000,17 +1001,198 @@ class BuilderTags
   end
 end
 
+class GitHubAuth
+  class Error < StandardError; end
+
+  COOKIE = 'archriscv_buildd_session'
+  SESSION_SECONDS = 43_200
+
+  def initialize(client_id: ENV.fetch('ARCHRISCV_BUILDD_GITHUB_CLIENT_ID', ''),
+    client_secret: ENV.fetch('ARCHRISCV_BUILDD_GITHUB_CLIENT_SECRET', ''),
+    public_url: ENV.fetch('ARCHRISCV_BUILDD_PUBLIC_URL', ''),
+    editors: ENV.fetch('ARCHRISCV_BUILDD_GITHUB_EDITORS', ''))
+    @client_id = client_id
+    @client_secret = client_secret
+    @public_url = public_url.delete_suffix('/')
+    @editors = editors.split(/[\s,]+/).map(&:downcase).freeze
+    @sessions = {}
+    @mutex = Mutex.new
+    @base_path = ''
+    @origin = ''
+    return if [client_id, client_secret, public_url].all?(&:empty?)
+
+    if (!client_id.empty? || !client_secret.empty?) && !configured?
+      raise ArgumentError, 'GitHub login requires client ID, client secret, and public URL'
+    end
+
+    uri = URI(@public_url)
+    unless (uri.is_a?(URI::HTTPS) || (uri.is_a?(URI::HTTP) && %w[localhost 127.0.0.1 ::1].include?(uri.hostname))) &&
+      uri.host && uri.path.match?(%r{\A(?:/[A-Za-z0-9_-]+)*\z}) && !uri.userinfo && !uri.query && !uri.fragment
+      raise ArgumentError, 'Public URL must use HTTPS with an optional path prefix (HTTP is allowed only on localhost)'
+    end
+    @base_path = uri.path
+    uri.path = ''
+    @origin = uri.to_s
+  end
+
+  def path(path = '')
+    "#{@base_path}/#{path.delete_prefix('/')}"
+  end
+
+  def configured?
+    [@client_id, @client_secret, @public_url].none?(&:empty?)
+  end
+
+  def session(req)
+    @mutex.synchronize do
+      entry = @sessions[cookie(req)]
+      entry if entry && entry[:login] && entry[:expires_at] > Time.now.to_i
+    end
+  end
+
+  def editor?(session)
+    session && @editors.include?(session[:login].downcase)
+  end
+
+  def valid_csrf?(req, session)
+    return false unless session
+    return false if req['origin'] && req['origin'] != @origin
+
+    equal?(session[:csrf], req['x-csrf-token'] || req.query['_csrf'])
+  end
+
+  def login(req, res)
+    raise Error, 'GitHub login is not configured.' unless configured?
+
+    state = SecureRandom.urlsafe_base64(32)
+    verifier = SecureRandom.urlsafe_base64(32)
+    replace_session(req, res, {state: state, verifier: verifier}, 600)
+    'https://github.com/login/oauth/authorize?' + URI.encode_www_form(
+      client_id: @client_id, redirect_uri: "#{@public_url}/auth/github/callback", scope: '', state: state,
+      code_challenge: [OpenSSL::Digest::SHA256.digest(verifier)].pack('m0').tr('+/', '-_').delete('='),
+      code_challenge_method: 'S256')
+  end
+
+  def callback(req, res)
+    pending = @mutex.synchronize do
+      entry = @sessions[cookie(req)]
+      if entry && entry[:state] && entry[:expires_at] > Time.now.to_i && equal?(entry[:state], req.query['state'])
+        @sessions.delete(cookie(req))
+      end
+    end
+    raise Error, 'Login expired or could not be verified. Please sign in again.' unless pending
+    raise Error, 'GitHub login was cancelled. Please sign in again.' if req.query['error'] || req.query['code'].to_s.empty?
+
+    user = github_user(req.query['code'], pending[:verifier])
+    unless user['id'].is_a?(Integer) && user['id'].positive? && user['login'].is_a?(String) &&
+      user['login'].match?(/\A[a-zA-Z0-9][a-zA-Z0-9-]{0,38}\z/)
+      raise Error, 'GitHub did not return a valid account.'
+    end
+    replace_session(req, res, {login: user['login'], csrf: SecureRandom.urlsafe_base64(32)}, SESSION_SECONDS)
+  end
+
+  def logout(req, res)
+    @mutex.synchronize { @sessions.delete(cookie(req)) }
+    set_cookie(res, '', 0)
+  end
+
+  private
+
+  def cookie(req)
+    req.cookies.find { |item| item.name == COOKIE }&.value
+  end
+
+  def equal?(expected, actual)
+    actual.is_a?(String) && expected.bytesize == actual.bytesize && OpenSSL.fixed_length_secure_compare(expected, actual)
+  end
+
+  def replace_session(req, res, values, lifetime)
+    token = SecureRandom.urlsafe_base64(32)
+    @mutex.synchronize do
+      @sessions.delete_if { |_, entry| entry[:expires_at] <= Time.now.to_i }
+      @sessions.delete(cookie(req))
+      @sessions[token] = values.merge(expires_at: Time.now.to_i + lifetime).freeze
+    end
+    set_cookie(res, token, lifetime)
+  end
+
+  def set_cookie(res, token, lifetime)
+    res['Set-Cookie'] = "#{COOKIE}=#{token}; Path=#{path}; HttpOnly; SameSite=Lax; Max-Age=#{lifetime}" +
+      (@public_url.start_with?('https://') ? '; Secure' : '')
+  end
+
+  def github_user(code, verifier)
+    uri = URI('https://github.com/login/oauth/access_token')
+    request = Net::HTTP::Post.new(uri)
+    request.set_form_data(client_id: @client_id, client_secret: @client_secret, code: code,
+      redirect_uri: "#{@public_url}/auth/github/callback", code_verifier: verifier)
+    token = github_json(uri, request)['access_token']
+    raise Error, 'GitHub login failed. Please sign in again.' unless token.is_a?(String) && !token.empty?
+
+    uri = URI('https://api.github.com/user')
+    request = Net::HTTP::Get.new(uri)
+    request['Authorization'] = "Bearer #{token}"
+    github_json(uri, request)
+  end
+
+  def github_json(uri, request)
+    request['Accept'] = 'application/json'
+    request['User-Agent'] = APP_NAME
+    response = Net::HTTP.start(uri.host, uri.port, use_ssl: true, open_timeout: 5, read_timeout: 10, write_timeout: 10) do |http|
+      http.request(request)
+    end
+    raise Error, 'GitHub login is unavailable. Please try again.' unless response.is_a?(Net::HTTPSuccess)
+
+    data = JSON.parse(response.body)
+    raise Error, 'GitHub login returned an invalid response.' unless data.is_a?(Hash)
+
+    data
+  rescue JSON::ParserError, IOError, SystemCallError, SocketError, Timeout::Error, OpenSSL::SSL::SSLError
+    raise Error, 'GitHub login is unavailable. Please try again.'
+  end
+end
+
 class WebApp
-  def initialize(manager, read_only: false, builder_tags: BuilderTags.new)
+  def initialize(manager, auth: GitHubAuth.new, builder_tags: BuilderTags.new)
     @manager = manager
-    @read_only = read_only
+    @auth = auth
+    @read_only = true
+    @session = nil
     @builder_tags = builder_tags
   end
 
   def call(req, res)
+    # WEBrick serves requests concurrently; permissions belong to one request.
+    dup.send(:serve, req, res)
+  end
+
+  private
+
+  def serve(req, res)
+    @session = @auth.session(req)
+    @read_only = !@auth.editor?(@session)
+    res['Cache-Control'] = 'no-store'
+    res['Vary'] = 'Cookie'
+    res['Referrer-Policy'] = 'same-origin'
+    res['X-Frame-Options'] = 'DENY'
+    case [req.request_method, req.path]
+    when ['GET', '/auth/github']
+      return redirect(res, @auth.login(req, res))
+    when ['GET', '/auth/github/callback']
+      @auth.callback(req, res)
+      return redirect(res, '/')
+    when ['POST', '/auth/logout']
+      return forbidden(res) unless @auth.valid_csrf?(req, @session)
+
+      @auth.logout(req, res)
+      return redirect(res, '/')
+    end
+
     if @read_only && (!%w[GET HEAD].include?(req.request_method) || !view_path?(req.path))
-      html(res, layout('view only', '<p class="notification is-warning">This listener is view only.</p>'), status: 403)
-      return
+      return forbidden(res)
+    end
+    unless %w[GET HEAD].include?(req.request_method)
+      return forbidden(res) unless req.request_method == 'POST' && @auth.valid_csrf?(req, @session)
     end
 
     method = req.request_method == 'HEAD' ? 'GET' : req.request_method
@@ -1032,6 +1214,8 @@ class WebApp
     else
       route_build(req, res)
     end
+  rescue GitHubAuth::Error => e
+    html(res, layout('login failed', %(<p class="notification is-warning">#{h(e.message)} <a href="#{h(dashboard_path('auth/github'))}">Sign in with GitHub</a></p>)), status: 400)
   rescue ArgumentError => e
     html(res, render_index(req, error: e.message), status: 400)
   rescue StandardError => e
@@ -1040,14 +1224,16 @@ class WebApp
     html(res, layout('error', %(<section class="notification is-danger"><h2 class="title is-5">Internal error</h2><p>#{h(e.message)}</p></section>)), status: 500)
   end
 
-  private
+  def forbidden(res)
+    html(res, layout('access denied', '<p class="notification is-warning">An approved GitHub account and a valid form are required. Sign in and reload the page to try again.</p>'), status: 403)
+  end
 
   def view_path?(path)
     ['/', '/log-viewer.js'].include?(path) || path.match?(%r{\A/builds/[^/]+/(?:log|log-chunk|raw|events)\z})
   end
 
   def dashboard_path(path = '')
-    "#{@read_only ? './' : '/'}#{path}"
+    @auth.path(path)
   end
 
   def builder_title(host)
@@ -1220,6 +1406,7 @@ class WebApp
           <div class="build-actions">
             <a class="button is-light" href="../../">Dashboard</a>
             <a class="button is-light" href="raw">Raw log</a>
+            #{account_controls}
             #{retry_button(build) unless build.status == 'waiting_upload'}
             #{stop_button(build)}
           </div>
@@ -1435,6 +1622,7 @@ class WebApp
       <header class="masthead">
         <h1>#{APP_TITLE}</h1>
         <span class="experimental">Experimental</span>
+        <div class="build-actions">#{account_controls}</div>
       </header>
 
       #{flash('error', error) if error}
@@ -1480,7 +1668,7 @@ class WebApp
     builder_hint = BUILDER_USER.empty? ? 'host or user@host' : "host (defaults to #{BUILDER_USER}@host) or user@host"
     <<~HTML
       <section class="box start-panel">
-        <form action="/builds" method="post">
+        <form action="#{h(dashboard_path('builds'))}" method="post">
           <label class="label panel-label" for="command">Start a build</label>
           <div class="field has-addons build-inputs">
             <div class="control is-expanded">
@@ -1540,7 +1728,7 @@ class WebApp
     return '' if @read_only || build.active?
 
     <<~HTML
-      <form class="delete-build" action="/builds/#{h(build.id)}/delete" method="post">
+      <form class="delete-build" action="#{h(dashboard_path("builds/#{build.id}/delete"))}" method="post">
         <button class="delete is-small" type="submit" title="Delete build and log" aria-label="delete" onclick="return confirm('Delete this build and its log?')"></button>
       </form>
     HTML
@@ -1579,18 +1767,18 @@ class WebApp
                      %(<div class="tags mb-2">#{pending_tags}</div>)
                    else
                      <<~HTML
-                       <form action="/refresh/add" method="post">
+                       <form action="#{h(dashboard_path('refresh/add'))}" method="post">
                          <div class="tags mb-2">#{pending_tags}</div>
                          <div class="buttons are-small mb-0">
                            <button class="button is-small is-primary" type="submit">Add selected</button>
-                           <button class="button is-small is-light" type="submit" formaction="/refresh/clear" onclick="return confirm('Dismiss selected pending packages?')">Dismiss selected</button>
+                           <button class="button is-small is-light" type="submit" formaction="#{h(dashboard_path('refresh/clear'))}" onclick="return confirm('Dismiss selected pending packages?')">Dismiss selected</button>
                          </div>
                        </form>
                      HTML
                    end
 
     refresh_form = <<~HTML unless @read_only
-      <form class="field has-addons mb-0" action="/refresh" method="post">
+      <form class="field has-addons mb-0" action="#{h(dashboard_path('refresh'))}" method="post">
         <div class="control extra-safe-deps">
           <input class="input is-small" id="extra-safe-deps" name="extra_safe_deps" type="text" aria-label="Add persisted safe dependencies (optional)" placeholder="Add safe deps (optional)" title="Comma-separated dependencies to keep safe until they leave the status page after updating" autocomplete="off" spellcheck="false">
         </div>
@@ -1621,7 +1809,7 @@ class WebApp
     button_class = waiting_upload ? 'button is-small is-warning' : 'button is-small is-primary'
 
     <<~HTML
-      <form class="inline" action="/builds/#{h(build.id)}/retry" method="post">
+      <form class="inline" action="#{h(dashboard_path("builds/#{build.id}/retry"))}" method="post">
         <button class="#{button_class}" type="submit">#{label}</button>
         #{new_builder_checkbox(build)}
         #{keep_chroot_checkbox(checked: build.environment['KEEPCHROOT'] == '1')}
@@ -1635,7 +1823,7 @@ class WebApp
     cards = entries.map do |entry|
       build = entry['build']
       cancel_form = <<~HTML unless @read_only
-        <form class="inline" action="/deferred/#{h(build['id'])}/cancel" method="post">
+        <form class="inline" action="#{h(dashboard_path("deferred/#{build['id']}/cancel"))}" method="post">
           <button class="button is-small is-light" type="submit">Cancel</button>
         </form>
       HTML
@@ -1686,9 +1874,9 @@ class WebApp
     return '' if @read_only || !build.active?
 
     <<~HTML
-      <form class="inline" action="/builds/#{h(build.id)}/stop" method="post" data-stop-controls>
+      <form class="inline" action="#{h(dashboard_path("builds/#{build.id}/stop"))}" method="post" data-stop-controls>
         <button class="button is-small is-danger" type="submit" title="Send Ctrl-C to the build terminal">Stop</button>
-        <button class="button is-small is-danger" type="submit" formaction="/builds/#{h(build.id)}/kill" data-kill-button#{' style="display:none"' unless build.stop_requested} title="Force the build worker to shut down and terminate its build processes">Kill</button>
+        <button class="button is-small is-danger" type="submit" formaction="#{h(dashboard_path("builds/#{build.id}/kill"))}" data-kill-button#{' style="display:none"' unless build.stop_requested} title="Force the build worker to shut down and terminate its build processes">Kill</button>
       </form>
     HTML
   end
@@ -1707,15 +1895,15 @@ class WebApp
       <div#{id_attr} class="decision-panel"#{style}>
         <p class="decision-label">Upload log?</p>
         <div class="decision-actions">
-          <form class="inline" action="/builds/#{h(build.id)}/upload" method="post">
+          <form class="inline" action="#{h(dashboard_path("builds/#{build.id}/upload"))}" method="post">
             <button class="button is-small is-warning" name="decision" value="yes" type="submit">Upload</button>
             <button class="button is-small is-light" name="decision" value="no" type="submit">Skip</button>
           </form>
           #{retry_button(build, waiting_upload: true)}
-          <form class="inline" action="/builds/#{h(build.id)}/memory-killer" method="post">
+          <form class="inline" action="#{h(dashboard_path("builds/#{build.id}/memory-killer"))}" method="post">
             <button class="button is-small is-light" type="submit" title="Add this package to the memory killer list for future automatic builder selection">Require 32G+ RAM</button>
           </form>
-          <form class="inline defer-form" action="/builds/#{h(build.id)}/defer" method="post">
+          <form class="inline defer-form" action="#{h(dashboard_path("builds/#{build.id}/defer"))}" method="post">
             <input class="input is-small defer-package" name="wait_for" type="text" required aria-label="Package to wait for" placeholder="Wait for package" title="Retry after this package base next builds successfully" autocomplete="off" spellcheck="false">
             <button class="button is-small is-warning" type="submit" title="Skip this log upload and retry after the named package builds successfully">Defer</button>
           </form>
@@ -1753,7 +1941,7 @@ class WebApp
 
   def redirect(res, location)
     res.status = 303
-    res['Location'] = location
+    res['Location'] = location.start_with?('/') ? dashboard_path(location) : location
     res.body = ''
   end
 
@@ -1761,7 +1949,27 @@ class WebApp
     html(res, layout('not found', '<section class="notification is-warning">Not found</section>'), status: 404)
   end
 
+  def account_controls
+    if @session
+      <<~HTML
+        <span>#{h(@session[:login])} &middot; #{@read_only ? 'View only' : 'Editor'}</span>
+        <form class="inline" action="#{h(dashboard_path('auth/logout'))}" method="post">
+          <button class="button is-light" type="submit">Sign out</button>
+        </form>
+      HTML
+    elsif @auth.configured?
+      %(<a class="button is-light" href="#{h(dashboard_path('auth/github'))}">Sign in with GitHub</a>)
+    else
+      '<span class="has-text-grey">View only</span>'
+    end
+  end
+
   def layout(title, body)
+    if @session
+      body = body.gsub(/<form\b[^>]*\bmethod="post"[^>]*>/) do |form|
+        form + %(<input type="hidden" name="_csrf" value="#{h(@session[:csrf])}">)
+      end
+    end
     <<~HTML
       <!doctype html>
       <html lang="en" data-theme="light">
@@ -1925,33 +2133,28 @@ if $PROGRAM_NAME == __FILE__
   end
 
   manager = BuildManager.new
-  listeners = [[BIND, PORT, false]]
-  listeners << [VIEW_BIND, VIEW_PORT, true] if VIEW_PORT.positive?
-  servers = listeners.map do |bind, port, read_only|
-    server = WEBrick::HTTPServer.new(
-      BindAddress: bind,
-      Port: port,
-      ServerSoftware: APP_NAME,
-      AccessLog: [],
-      Logger: WEBrick::Log.new($stderr, ENV['ARCHRISCV_BUILDD_DEBUG'] ? WEBrick::Log::DEBUG : WEBrick::Log::INFO)
-    )
-    app = WebApp.new(manager, read_only: read_only)
-    server.mount_proc('/') { |req, res| app.call(req, res) }
-    warn "#{APP_NAME}: #{read_only ? 'view-only' : 'control'} listener on http://#{bind}:#{port}"
-    server
-  end
+  app = WebApp.new(manager)
+  server = WEBrick::HTTPServer.new(
+    BindAddress: BIND,
+    Port: PORT,
+    ServerSoftware: APP_NAME,
+    AccessLog: [],
+    Logger: WEBrick::Log.new($stderr, ENV['ARCHRISCV_BUILDD_DEBUG'] ? WEBrick::Log::DEBUG : WEBrick::Log::INFO)
+  )
+  server.mount_proc('/') { |req, res| app.call(req, res) }
+  warn "#{APP_NAME}: dashboard listener on http://#{BIND}:#{PORT}"
   manager.start
 
   signal_reader, signal_writer = IO.pipe
   Thread.new do
     signal_reader.read(1)
     manager.shutdown
-    servers.each(&:shutdown)
+    server.shutdown
   end
 
   %w[INT TERM].each do |signal|
     trap(signal) { signal_writer.write_nonblock('.') rescue nil }
   end
 
-  servers.map { |server| Thread.new { server.start } }.each(&:value)
+  server.start
 end
