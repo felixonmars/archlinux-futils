@@ -84,6 +84,10 @@ if [[ "$KEEPCHROOT" == "1" ]]; then
     chroot_args=(--worker "keep-${PKGBASE}-${CHROOT_ID}")
 fi
 
+if [[ "$SWITCHBRANCH" == "1" ]]; then
+    git -C "$RVPATCHREPO" switch "$PKGBASE" || exit 1
+fi
+
 SERVER=$(felixbuild-server-select riscv64)
 
 if [[ "$NOUPLOAD" == "1" ]]; then

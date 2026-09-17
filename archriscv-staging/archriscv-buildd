@@ -754,8 +754,8 @@ class BuildManager
     end
     target_builder = nil if target_builder.empty?
 
-    unless environment.is_a?(Hash) && environment.all? { |key, value| %w[NOUPLOAD SERVER KEEPCHROOT].include?(key) && value.is_a?(String) && !value.include?("\0") }
-      raise ArgumentError, 'only NOUPLOAD, SERVER and KEEPCHROOT environment overrides are supported'
+    unless environment.is_a?(Hash) && environment.all? { |key, value| %w[NOUPLOAD SERVER KEEPCHROOT SWITCHBRANCH].include?(key) && value.is_a?(String) && !value.include?("\0") }
+      raise ArgumentError, 'only NOUPLOAD, SERVER, KEEPCHROOT and SWITCHBRANCH environment overrides are supported'
     end
     server = environment['SERVER']
     unless server.nil? || server.empty? || server.match?(TARGET_BUILDER_PATTERN)
@@ -844,8 +844,9 @@ class BuildManager
     environment = ENV.to_h.reject do |key, _|
       %w[NOTIFY_SOCKET WATCHDOG_PID WATCHDOG_USEC INVOCATION_ID JOURNAL_STREAM SYSTEMD_EXEC_PID].include?(key)
     end
-    # KEEPCHROOT is selected per build through the client or UI.
+    # These options are selected per build through the client or UI.
     environment.delete('KEEPCHROOT')
+    environment.delete('SWITCHBRANCH')
     environment.merge!(build.environment)
     # SERVER overrides the selector even when the package's cache was cleared.
     environment.delete('SERVER') if new_builder
@@ -1273,11 +1274,14 @@ class WebApp
   end
 
   def build_environment(req)
-    environment = req.query.select { |key, _| %w[NOUPLOAD SERVER KEEPCHROOT].include?(key) }
+    environment = req.query.select { |key, _| %w[NOUPLOAD SERVER KEEPCHROOT SWITCHBRANCH].include?(key) }
     # An unchecked HTML checkbox is absent; API requests can omit the option
     # altogether to preserve the previous attempt's value on retry.
     if req.query['keep_chroot_present'] == '1'
       environment['KEEPCHROOT'] = req.query['KEEPCHROOT'] == '1' ? '1' : '0'
+    end
+    if req.query['switch_branch_present'] == '1'
+      environment['SWITCHBRANCH'] = req.query['SWITCHBRANCH'] == '1' ? '1' : '0'
     end
     environment
   end
@@ -1682,6 +1686,7 @@ class WebApp
             </div>
           </div>
           #{keep_chroot_checkbox}
+          #{switch_branch_checkbox}
           <p class="help">Use <span class="is-family-monospace">:nocheck</span> to skip checks. Leave builder blank for automatic selection.</p>
         </form>
       </section>
@@ -1813,6 +1818,7 @@ class WebApp
         <button class="#{button_class}" type="submit">#{label}</button>
         #{new_builder_checkbox(build)}
         #{keep_chroot_checkbox(checked: build.environment['KEEPCHROOT'] == '1')}
+        #{switch_branch_checkbox(checked: build.environment['SWITCHBRANCH'] == '1')}
       </form>
     HTML
   end
@@ -1854,6 +1860,17 @@ class WebApp
       <input type="hidden" name="keep_chroot_present" value="1">
       <label class="checkbox is-size-7" title="Keep a separate chroot for this attempt so later builds cannot overwrite it; remove it manually when finished debugging">
         <input type="checkbox" name="KEEPCHROOT" value="1"#{' checked' if checked}> Keep chroot
+      </label>
+    HTML
+  end
+
+  def switch_branch_checkbox(checked: false)
+    return '' if @read_only
+
+    <<~HTML
+      <input type="hidden" name="switch_branch_present" value="1">
+      <label class="checkbox is-size-7" title="Switch the archriscv overlay repository to the branch named after the pkgbase before building">
+        <input type="checkbox" name="SWITCHBRANCH" value="1"#{' checked' if checked}> Switch overlay branch
       </label>
     HTML
   end

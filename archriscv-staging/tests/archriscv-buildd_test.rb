@@ -19,6 +19,7 @@ ENV['ARCHRISCV_BUILDD_WORKDIR'] = TEST_ROOT
 ENV['ARCHRISCV_TEST_ROOT'] = TEST_ROOT
 ENV.delete('SERVER')
 ENV.delete('KEEPCHROOT')
+ENV.delete('SWITCHBRANCH')
 load File.expand_path('../archriscv-buildd', __dir__)
 Object.send(:remove_const, :MEMORY_KILLER_LIST)
 MEMORY_KILLER_LIST = File.join(TEST_ROOT, 'packages', 'memory-killer.txt')
@@ -102,7 +103,7 @@ class BuildRestartTest < Minitest::Test
       #!/usr/bin/env ruby
       require 'json'
       STDOUT.sync = true
-      puts JSON.generate(server: ENV['SERVER'], noupload: ENV['NOUPLOAD'], keepchroot: ENV['KEEPCHROOT'], argv: ARGV, workdir: Dir.pwd)
+      puts JSON.generate(server: ENV['SERVER'], noupload: ENV['NOUPLOAD'], keepchroot: ENV['KEEPCHROOT'], switchbranch: ENV['SWITCHBRANCH'], argv: ARGV, workdir: Dir.pwd)
       cache_path = File.join(ENV.fetch('ARCHRISCV_BUILDD_BUILDER_CACHE_DIR'), "#{ARGV.first.sub(/:nocheck\z/, '')}-riscv64")
       puts "builder-cache=#{File.exist?(cache_path)}"
       puts "\e[1m\e[32m==>\e(B\e[m\e[1m Building on test-builder\e(B\e[m"
@@ -232,14 +233,15 @@ class BuildRestartTest < Minitest::Test
   end
 
   def test_submission_passes_environment_to_worker_and_preserves_it_after_restart
-    response = post_request('/builds', 'command=example&NOUPLOAD=1&SERVER=custom-host&KEEPCHROOT=1', accept: 'application/json')
+    response = post_request('/builds', 'command=example&NOUPLOAD=1&SERVER=custom-host&KEEPCHROOT=1&SWITCHBRANCH=1', accept: 'application/json')
     assert_equal 201, response.status
     build = finished(JSON.parse(response.body).fetch('id'))
     assert_includes File.read(build.log_path), '"server":"custom-host"'
     assert_includes File.read(build.log_path), '"noupload":"1"'
     assert_includes File.read(build.log_path), '"keepchroot":"1"'
     restart
-    assert_equal({'NOUPLOAD' => '1', 'SERVER' => 'custom-host', 'KEEPCHROOT' => '1'}, @manager.find(build.id).environment)
+    assert_equal({'NOUPLOAD' => '1', 'SERVER' => 'custom-host', 'KEEPCHROOT' => '1', 'SWITCHBRANCH' => '1'}, @manager.find(build.id).environment)
+    assert_includes File.read(build.log_path), '"switchbranch":"1"'
     assert_nil ENV['SERVER']
     other = finished(@manager.enqueue('other-example').id)
     assert_includes File.read(other.log_path), '"server":null'
@@ -257,7 +259,7 @@ class BuildRestartTest < Minitest::Test
   end
 
   def test_retry_preserves_environment_and_new_builder_clears_server
-    build = @manager.enqueue('prompt-env', environment: {'NOUPLOAD' => '1', 'SERVER' => 'custom-host', 'KEEPCHROOT' => '1'})
+    build = @manager.enqueue('prompt-env', environment: {'NOUPLOAD' => '1', 'SERVER' => 'custom-host', 'KEEPCHROOT' => '1', 'SWITCHBRANCH' => '1'})
     wait_for { @manager.find(build.id).status == 'waiting_upload' }
     assert_equal 303, post_request("/builds/#{build.id}/retry").status
     retried = @manager.all_builds.find { |entry| entry.id != build.id }
@@ -269,7 +271,7 @@ class BuildRestartTest < Minitest::Test
     assert_equal 303, post_request("/builds/#{retried.id}/retry", 'new_builder=1').status
     fresh = @manager.all_builds.find { |entry| entry.id != retried.id }
     wait_for { @manager.find(fresh.id).status == 'waiting_upload' }
-    assert_equal({'NOUPLOAD' => '1', 'KEEPCHROOT' => '1'}, fresh.environment)
+    assert_equal({'NOUPLOAD' => '1', 'KEEPCHROOT' => '1', 'SWITCHBRANCH' => '1'}, fresh.environment)
     assert_includes File.read(fresh.log_path), '"server":null'
     assert_includes File.read(fresh.log_path), '"noupload":"1"'
     assert_includes File.read(fresh.log_path), '"keepchroot":"1"'
@@ -327,6 +329,32 @@ class BuildRestartTest < Minitest::Test
     assert_equal '1', @manager.find(kept.id).environment['KEEPCHROOT']
   ensure
     ENV.delete('KEEPCHROOT')
+  end
+
+  def test_overlay_branch_checkbox_is_per_build_and_can_be_disabled_on_retry
+    ENV['SWITCHBRANCH'] = '1'
+    default = finished(@manager.enqueue('branch-default').id)
+    assert_includes File.read(default.log_path), '"switchbranch":null'
+    response = post_request('/builds', 'command=prompt-branch&switch_branch_present=1&SWITCHBRANCH=1', accept: 'application/json')
+    assert_equal 201, response.status
+    build = @manager.find(JSON.parse(response.body).fetch('id'))
+    wait_for { @manager.find(build.id).status == 'waiting_upload' }
+    assert_includes File.read(build.log_path), '"switchbranch":"1"'
+    refute build.environment.key?('KEEPCHROOT')
+    app = editor_app
+    assert_match(/Keep chroot.*name="SWITCHBRANCH" value="1"> Switch overlay branch/m, app.send(:start_build_form))
+    assert_includes app.send(:decision_panel, @manager.find(build.id)), 'name="SWITCHBRANCH" value="1" checked> Switch overlay branch'
+    assert_empty WebApp.new(@manager).send(:switch_branch_checkbox)
+    restart
+    assert_equal '1', @manager.find(build.id).environment['SWITCHBRANCH']
+    assert_equal 303, post_request("/builds/#{build.id}/retry", 'switch_branch_present=1').status
+    retry_build = @manager.all_builds.find { |entry| entry.pkgbase == build.pkgbase && entry.id != build.id }
+    wait_for { @manager.find(retry_build.id).status == 'waiting_upload' }
+    assert_equal '0', retry_build.environment['SWITCHBRANCH']
+    assert_includes File.read(retry_build.log_path), '"switchbranch":"0"'
+    refute_match(/name="SWITCHBRANCH"[^>]*checked/, app.send(:retry_button, retry_build))
+  ensure
+    ENV.delete('SWITCHBRANCH')
   end
 
   def test_refresh_passes_extra_safe_dependencies_as_one_literal_argument
@@ -568,7 +596,7 @@ class BuildRestartTest < Minitest::Test
     old_dependency = @manager.enqueue('wait-dependency')
     File.write(File.join(TEST_ROOT, 'release'), '')
     finished(old_dependency.id)
-    source = @manager.enqueue('prompt-deferred:nocheck', target_builder: 'pinned-host', environment: {'KEEPCHROOT' => '1'})
+    source = @manager.enqueue('prompt-deferred:nocheck', target_builder: 'pinned-host', environment: {'KEEPCHROOT' => '1', 'SWITCHBRANCH' => '1'})
     wait_for { @manager.find(source.id).status == 'waiting_upload' }
 
     response = post_request("/builds/#{source.id}/defer", 'wait_for=wait-dependency')
@@ -598,7 +626,7 @@ class BuildRestartTest < Minitest::Test
     assert_equal 'prompt-deferred:nocheck', result.command_line
     assert_equal 'builder@pinned-host', result.target_builder
     assert_includes File.read(result.log_path), '"server":"builder@pinned-host"'
-    assert_equal({'KEEPCHROOT' => '1'}, result.environment)
+    assert_equal({'KEEPCHROOT' => '1', 'SWITCHBRANCH' => '1'}, result.environment)
     assert_includes File.read(result.log_path), '"keepchroot":"1"'
     restart
     assert_equal 1, @service.starts[retry_id]
