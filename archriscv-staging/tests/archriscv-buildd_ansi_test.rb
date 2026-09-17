@@ -160,6 +160,141 @@ class AnsiLogTest < Minitest::Test
     assert_includes event, "id: #{(prefix + message).bytesize}"
   end
 
+  def test_large_log_loads_tail_and_pages_back_without_gaps_or_duplicates
+    text = "==> Making package: test 1.4.1-1 (date)\n" +
+      (1..120_000).map { |i| "line #{i}: caf\u00e9 \e[32moutput\e[m\n" }.join
+    File.write(@build.log_path, text)
+    response = WEBrick::HTTPResponse.new(WEBrick::Config::HTTP)
+    @app.send(:show_log, nil, response, @build.id)
+    initial = JSON.parse(response.body[/const initialLog = (.*);/, 1])
+    assert_operator initial.bytesize, :<=, 131_072
+    assert_operator initial.bytesize, :>, 65_536
+    refute_includes initial, 'line 1:'
+    assert_includes initial, 'line 120000:'
+    assert_includes response.body, '<span id="package-version" class="has-text-grey">1.4.1-1</span>'
+    assert_includes response.body, "let offset = #{text.bytesize};"
+
+    page = read_log_page(@build.log_path)
+    assert_equal initial, page[:text]
+    # New output must not shift backward pagination's byte offsets.
+    File.open(@build.log_path, 'a') { |file| file.write("new output\n") }
+    combined = initial
+    while page[:before].positive?
+      before = page[:before]
+      request = WEBrick::HTTPRequest.new(WEBrick::Config::HTTP)
+      request.parse(StringIO.new("GET /builds/#{@build.id}/log-chunk?before=#{before} HTTP/1.1\r\nHost: localhost\r\n\r\n"))
+      @app.call(request, response)
+      assert_equal 200, response.status
+      page = JSON.parse(response.body, symbolize_names: true)
+      assert_equal before, page[:offset]
+      assert_operator page[:before], :<, before
+      assert_operator page[:text].bytesize, :<=, 131_072
+      combined = page[:text] + combined
+    end
+    assert_equal text, combined
+  end
+
+  def test_paging_long_lines_preserves_utf8_at_every_boundary
+    text = "\u{1f642}" * 600_001 + 'end'
+    File.write(@build.log_path, text)
+    combined = ''
+    before = nil
+    loop do
+      page = read_log_page(@build.log_path, before)
+      assert_operator page[:text].bytesize, :<=, 131_072
+      combined = page[:text] + combined
+      before = page[:before]
+      break if before.zero?
+    end
+    assert_equal text, combined
+    assert_equal({text: '', before: 0, offset: 0}, read_log_page(@build.log_path, 0))
+    assert_equal({text: '', before: 0, offset: 0}, read_log_page('missing-log'))
+  end
+
+  def test_history_loading_keeps_live_output_and_scroll_position_and_retries_failures
+    program = @parser + <<~JS
+      const assert = require('node:assert/strict');
+      global.document = {
+        createElement: () => ({innerHTML: ''}),
+        createRange: () => ({
+          selectNodeContents(element) { this.element = element; },
+          getBoundingClientRect() { return this.element.getBoundingClientRect(); }
+        })
+      };
+      global.window = {scrollY: 40, innerHeight: 20, scrollTo: (_, y) => { window.scrollY = y; }};
+      const element = {
+        children: [],
+        appendChild(node) { this.children.push(node); return node; },
+        replaceChildren() { this.children = []; },
+        getBoundingClientRect() { return {height: this.children.length * 20}; }
+      };
+      const history = {};
+      let finishFetch;
+      const requests = [];
+      global.fetch = url => {
+        requests.push(url);
+        return new Promise(resolve => { finishFetch = resolve; });
+      };
+      (async () => {
+        const log = new PagedLog(element, history, 'tail\\n', 100);
+        assert.equal(requests.length, 0);
+        const loading = log.loadOlder();
+        await log.loadOlder();
+        assert.deepEqual(requests, ['log-chunk?before=100']);
+        log.write('live\\n');
+        finishFetch({ok: true, json: async () => ({text: 'older\\n', before: 50})});
+        await loading;
+        assert.equal(log.terminal.toHTML(), 'older\\ntail\\nlive\\n');
+        assert.equal(window.scrollY, 60);
+
+        const failed = log.loadOlder();
+        finishFetch({ok: false, status: 500});
+        await failed;
+        assert.equal(log.before, 50);
+        assert.match(history.textContent, /retry/);
+        const retry = log.loadOlder();
+        finishFetch({ok: true, json: async () => ({text: '\\x1b[32mstart\\n', before: 0})});
+        await retry;
+        const expected = new TerminalLog();
+        expected.write('\\x1b[32mstart\\nolder\\ntail\\nlive\\n');
+        assert.equal(log.terminal.toHTML(), expected.toHTML());
+        assert.equal(window.scrollY, 80);
+        assert.equal(history.textContent, 'Start of log');
+        await log.loadOlder();
+        assert.equal(requests.length, 3);
+
+        // Multiple chunks of cursor updates render as a single progress line.
+        element.replaceChildren();
+        const progress = new PagedLog(element, history, 'progress\\r100%', 300);
+        const pages = [
+          {text: 'progress\\r50%', before: 200},
+          {text: 'progress\\r0%', before: 100},
+          {text: 'context\\n'.repeat(5), before: 50},
+          {text: 'first\\n', before: 0}
+        ];
+        let fetched = 0;
+        global.fetch = async () => ({ok: true, json: async () => pages[fetched++]});
+        await progress.loadOlder(100);
+        assert.equal(fetched, 3);
+        assert.equal(progress.before, 50);
+        assert.equal(progress.terminal.lines.length, 6);
+        await progress.loadOlder(100);
+        assert.equal(fetched, 3, 'a full viewport must not fetch more automatically');
+        await progress.loadOlder();
+        assert.equal(fetched, 4, 'scrolling must fetch another screen of history');
+        assert.equal(progress.before, 0);
+
+        element.replaceChildren();
+        const short = new PagedLog(element, history, '100%', 10);
+        global.fetch = async () => ({ok: true, json: async () => ({text: '0%\\r', before: 0})});
+        await short.loadOlder(100);
+        assert.equal(short.before, 0, 'stop at file start even when progress never fills the viewport');
+      })().catch(error => { console.error(error); process.exitCode = 1; });
+    JS
+    _, errors, status = Open3.capture3('node', stdin_data: program)
+    assert status.success?, errors
+  end
+
   def test_progress_updates_replace_lines_without_losing_other_output
     input = "Cloning...\r\nResolving deltas: 0%\rResolving deltas: 50%\rResolving deltas: 100%, done.\r\n" \
       "download: 10%\r\nkeep this line\r\n\e[2A\e[1G\e[2Kdownload: 100%\e[2B\r" \

@@ -1,5 +1,63 @@
 'use strict';
 
+class PagedLog {
+  constructor(element, historyElement, text, before) {
+    this.element = element;
+    this.historyElement = historyElement;
+    this.text = text;
+    this.before = before;
+    this.loading = false;
+    this.terminal = new TerminalLog(element);
+    this.terminal.write(text);
+    this.updateHistory();
+  }
+
+  updateHistory() {
+    this.historyElement.textContent = this.before > 0 ? 'Scroll up to load older output' : 'Start of log';
+  }
+
+  write(text) {
+    this.text += text;
+    this.terminal.write(text);
+  }
+
+  contentHeight() {
+    // Measure rendered text, excluding the log panel's minimum height.
+    const range = document.createRange();
+    range.selectNodeContents(this.element);
+    return range.getBoundingClientRect().height;
+  }
+
+  async loadOlder(targetHeight = this.contentHeight() + window.innerHeight) {
+    if (this.loading || this.before === 0 || this.contentHeight() >= targetHeight) return;
+    this.loading = true;
+    this.historyElement.textContent = 'Loading older output…';
+    try {
+      do {
+        const response = await fetch(`log-chunk?before=${this.before}`);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const page = await response.json();
+        const height = this.element.getBoundingClientRect().height;
+        const scrollY = window.scrollY;
+        // Replay only fetched output so escape sequences and partial lines at the
+        // page boundary join correctly, including live output received while fetching.
+        this.text = page.text + this.text;
+        this.before = page.before;
+        this.element.replaceChildren();
+        this.terminal = new TerminalLog(this.element);
+        this.terminal.write(this.text);
+        window.scrollTo(0, scrollY + this.element.getBoundingClientRect().height - height);
+        // Progress updates can consume whole chunks without adding visible lines.
+      } while (this.before > 0 && this.contentHeight() < targetHeight);
+      this.updateHistory();
+    } catch (error) {
+      this.historyElement.textContent = 'Could not load older output. Scroll up to retry.';
+    } finally {
+      this.loading = false;
+    }
+  }
+}
+
 // A log has scrollback, but no fixed terminal width: only explicit cursor moves
 // replace text. Soft wrapping in the browser must not change cursor positions.
 class TerminalLog {

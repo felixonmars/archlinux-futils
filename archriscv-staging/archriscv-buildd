@@ -90,6 +90,26 @@ def utf8(value)
   value.to_s.dup.force_encoding('UTF-8').scrub
 end
 
+def read_log_page(path, before = nil)
+  return { text: '', before: 0, offset: 0 } unless File.exist?(path)
+
+  File.open(path, 'rb') do |file|
+    finish = before ? [[before, 0].max, file.size].min : file.size
+    start = [finish - 131_072, 0].max
+    file.seek(start)
+    text = file.read(finish - start).to_s
+    if start.positive?
+      # Prefer whole lines, but keep reads bounded even for a very long line.
+      newline = text.index("\n")
+      skip = newline && newline < 65_536 ? newline + 1 : 0
+      skip += 1 while skip < 3 && text.getbyte(skip)&.between?(0x80, 0xbf)
+      text = text.byteslice(skip..)
+      start += skip
+    end
+    { text: utf8(text), before: start, offset: finish }
+  end
+end
+
 def status_class(status)
   case status
   when 'running' then 'is-info'
@@ -1023,7 +1043,7 @@ class WebApp
   private
 
   def view_path?(path)
-    ['/', '/log-viewer.js'].include?(path) || path.match?(%r{\A/builds/[^/]+/(?:log|raw|events)\z})
+    ['/', '/log-viewer.js'].include?(path) || path.match?(%r{\A/builds/[^/]+/(?:log|log-chunk|raw|events)\z})
   end
 
   def dashboard_path(path = '')
@@ -1039,6 +1059,8 @@ class WebApp
     case req.path
     when %r{\A/builds/([^/]+)/log\z}
       show_log(req, res, Regexp.last_match(1))
+    when %r{\A/builds/([^/]+)/log-chunk\z}
+      log_chunk(req, res, Regexp.last_match(1))
     when %r{\A/builds/([^/]+)/raw\z}
       raw_log(res, Regexp.last_match(1))
     when %r{\A/builds/([^/]+)/events\z}
@@ -1179,8 +1201,11 @@ class WebApp
     build = @manager.find(id)
     return not_found(res) unless build
 
-    log, offset = read_log(build.log_path)
-    build.read_package_version(log)
+    page = read_log_page(build.log_path)
+    unless build.package_version
+      header, = read_log(build.log_path, 0, 65_536)
+      build.read_package_version(header)
+    end
     host_style = build.build_host ? '' : ' style="display:none"'
     host_text = build.build_host.to_s
 
@@ -1204,21 +1229,21 @@ class WebApp
           <span>started #{h(fmt_time(build.started_at))}</span>
           <span>duration <span id="duration">#{h(duration(build))}</span></span>
         </div>
+        #{decision_panel(build, live: true)}
       </section>
-
-      #{decision_panel(build, live: true)}
 
       <section class="box log-panel p-3">
         <div class="build-toolbar mb-2">
           #{status_tag(build.status, id: 'status')}
           <span class="is-size-7 has-text-grey">live log</span>
         </div>
-        <pre id="log" class="is-size-7"></pre>
+        <div id="log-history" class="is-size-7 has-text-grey" role="status"></div>
+        <pre id="log" class="is-size-7" style="overflow-anchor: none"></pre>
       </section>
       <a class="button is-medium is-warning top-link" href="#top" title="Back to top">&uarr; Top</a>
       <button id="end-link" class="button is-medium is-info end-link" type="button" title="Back to end">&darr; End</button>
 
-      <script src="../../log-viewer.js?v=1"></script>
+      <script src="../../log-viewer.js?v=3"></script>
       <script>
         const statusEl = document.querySelector('#status');
         const hostEl = document.querySelector('#build-host');
@@ -1228,9 +1253,7 @@ class WebApp
         const durationEl = document.querySelector('#duration');
         const logEl = document.querySelector('#log');
         const endLink = document.querySelector('#end-link');
-        let offset = #{offset};
-
-        const terminal = new TerminalLog(logEl);
+        let offset = #{page[:offset]};
 
         function statusClass(status) {
           if (status === 'running') return 'is-info';
@@ -1256,11 +1279,24 @@ class WebApp
           endLink.style.display = nearBottom() ? 'none' : '';
         }
 
-        const initialLog = #{JSON.generate(utf8(log)).gsub('<') { '\\u003c' }};
-        terminal.write(initialLog);
-        requestAnimationFrame(() => window.scrollTo(0, document.body.scrollHeight));
-        requestAnimationFrame(updateEndLink);
-        window.addEventListener('scroll', updateEndLink, { passive: true });
+        const initialLog = #{JSON.generate(page[:text]).gsub('<') { '\\u003c' }};
+        const terminal = new PagedLog(logEl, document.querySelector('#log-history'), initialLog, #{page[:before]});
+        let lastScrollY = window.scrollY;
+        let ready = false;
+        requestAnimationFrame(() => {
+          window.scrollTo(0, document.body.scrollHeight);
+          lastScrollY = window.scrollY;
+          ready = true;
+          updateEndLink();
+          terminal.loadOlder(window.innerHeight).then(updateEndLink);
+        });
+        window.addEventListener('scroll', () => {
+          if (ready && window.scrollY < lastScrollY && logEl.getBoundingClientRect().top > -300) {
+            terminal.loadOlder();
+          }
+          lastScrollY = window.scrollY;
+          updateEndLink();
+        }, { passive: true });
         endLink.addEventListener('click', () => {
           window.scrollTo(0, document.body.scrollHeight);
           updateEndLink();
@@ -1291,6 +1327,18 @@ class WebApp
         });
       </script>
     HTML
+  end
+
+  def log_chunk(req, res, id)
+    return not_found(res) unless %w[GET HEAD].include?(req.request_method)
+
+    build = @manager.find(id)
+    return not_found(res) unless build
+
+    before = Integer(req.query.fetch('before', ''), 10)
+    res['Content-Type'] = 'application/json; charset=utf-8'
+    res['Cache-Control'] = 'no-store'
+    res.body = JSON.generate(read_log_page(build.log_path, before))
   end
 
   def raw_log(res, id)
@@ -1820,7 +1868,7 @@ class WebApp
           .deferred-row:last-child { border-bottom: 0; }
           .deferred-row p { flex: 1; min-width: 0; overflow-wrap: anywhere; color: var(--muted); }
           .empty-state { color: var(--muted); font-size: .8rem; padding: 1.5rem 1rem; }
-          .log-heading { margin-bottom: 1rem; }
+          .log-heading { position: sticky; top: 0; z-index: 10; margin-bottom: 1rem; box-shadow: 0 .2rem .75rem #17201820; }
           .log-panel { margin-top: 1rem; }
           pre#log { min-height: 62vh; padding: 1rem; border-radius: 5px; color: #eaf5dc; background: #172018; white-space: pre-wrap; word-break: break-word; font-family: var(--bulma-family-code); }
           .top-link, .end-link { position: fixed; right: 1.25rem; z-index: 20; box-shadow: 0 .2rem .75rem #17201820; font-weight: 600; }

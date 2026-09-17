@@ -362,10 +362,13 @@ class BuildRestartTest < Minitest::Test
     assert_includes dashboard, 'href="./builds/running/log"'
     assert_includes dashboard, 'action="./" method="get"'
     log_page = request.call('GET', '/builds/running/log').body
-    assert_includes log_page, 'src="../../log-viewer.js?v=1"'
+    assert_includes log_page, 'src="../../log-viewer.js?v=3"'
     assert_includes log_page, 'new EventSource(`events?offset=${offset}`)'
     assert_equal 'build output', request.call('GET', '/builds/running/raw').body.read
     assert_equal 200, request.call('GET', '/builds/running/events').status
+    chunk = request.call('GET', '/builds/running/log-chunk?before=5')
+    assert_equal 200, chunk.status
+    assert_equal({'text' => 'build', 'before' => 0, 'offset' => 5}, JSON.parse(chunk.body))
     assert_equal 200, request.call('GET', '/log-viewer.js').status
     assert_equal 200, request.call('HEAD', '/').status
 
