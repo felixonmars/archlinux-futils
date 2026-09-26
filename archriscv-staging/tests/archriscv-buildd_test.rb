@@ -96,6 +96,198 @@ class BuildDurationTest < Minitest::Test
   end
 end
 
+class BuildDashboardTest < Minitest::Test
+  def setup
+    @builds = []
+    manager = Struct.new(:all_builds, :refresh_pending, :deferred_retries).new(@builds, [], [])
+    @app = WebApp.new(manager)
+  end
+
+  def add_build(id, command_line: 'example', status: 'failed', pkgbase: command_line.sub(/:nocheck\z/, ''))
+    timestamp = Time.utc(2026, 9, 20) + @builds.size
+    build = Build.new(id: id, command_line: command_line, argv: ['riscvu', command_line],
+      pkgbase: pkgbase, log_path: File.join(TEST_ROOT, "#{id}.log"), status: status,
+      created_at: timestamp, started_at: timestamp,
+      finished_at: ACTIVE_STATUSES.include?(status) ? nil : timestamp + 1)
+    @builds << build
+    build
+  end
+
+  def dashboard(query = '')
+    req = WEBrick::HTTPRequest.new(WEBrick::Config::HTTP)
+    req.parse(StringIO.new("GET /#{query} HTTP/1.1\r\nHost: localhost\r\n\r\n"))
+    res = WEBrick::HTTPResponse.new(WEBrick::Config::HTTP)
+    @app.call(req, res)
+    assert_equal 200, res.status
+    res.body
+  end
+
+  def latest_build_ids(html)
+    html.scan(/<article class="build-card .*?<\/article>/m).filter_map do |card|
+      card[/href="\/builds\/([^"\/]+)\/log"/, 1] if card.include?('class="tag is-info latest-build"')
+    end
+  end
+
+  def test_latest_marker_identifies_one_completed_build_per_pkgbase_for_every_terminal_status
+    TERMINAL_STATUSES.each do |status|
+      add_build("#{status}-old", command_line: "package-#{status}", status: status)
+      add_build("#{status}-latest", command_line: "package-#{status}", status: status)
+    end
+
+    assert_equal TERMINAL_STATUSES.reverse.map { |status| "#{status}-latest" }, latest_build_ids(dashboard)
+  end
+
+  def test_latest_marker_follows_recent_build_completion_order
+    latest = add_build('finished-last')
+    add_build('created-last')
+    latest.finished_at += 60
+
+    assert_equal ['finished-last'], latest_build_ids(dashboard)
+  end
+
+  def test_latest_marker_is_suppressed_by_any_active_build_until_it_finishes
+    ACTIVE_STATUSES.each do |status|
+      add_build("#{status}-old", command_line: "package-#{status}")
+      add_build("#{status}-active", command_line: "package-#{status}:nocheck", status: status, pkgbase: nil)
+    end
+    add_build('unrelated', command_line: 'unrelated')
+
+    assert_equal ['unrelated'], latest_build_ids(dashboard)
+
+    @builds.select(&:active?).each do |build|
+      build.status = 'succeeded'
+      build.finished_at = build.started_at + 60
+    end
+    assert_equal ACTIVE_STATUSES.reverse.map { |status| "#{status}-active" } + ['unrelated'], latest_build_ids(dashboard)
+  end
+
+  def test_latest_marker_groups_nocheck_builds_and_legacy_builds_by_pkgbase
+    add_build('checked')
+    add_build('unchecked', command_line: 'example:nocheck', pkgbase: nil)
+    add_build('other', command_line: 'other', pkgbase: nil)
+
+    assert_equal %w[other unchecked], latest_build_ids(dashboard)
+  end
+
+  def test_search_does_not_mark_an_older_build_when_the_latest_does_not_match
+    add_build('older', status: 'failed')
+    add_build('latest', status: 'succeeded')
+
+    html = dashboard('?q=failed')
+    assert_includes html, 'href="/builds/older/log"'
+    refute_includes html, 'href="/builds/latest/log"'
+    assert_empty latest_build_ids(html)
+    assert_equal ['latest'], latest_build_ids(dashboard('?q=succeeded'))
+  end
+
+  def test_search_matches_latest_tag_case_insensitively_and_excludes_active_retries
+    add_build('older')
+    add_build('newest', status: 'succeeded')
+    ACTIVE_STATUSES.each do |status|
+      add_build("#{status}-old", command_line: "package-#{status}")
+      add_build("#{status}-active", command_line: "package-#{status}:nocheck", status: status)
+    end
+
+    %w[latest LaTeSt late].each do |query|
+      html = dashboard("?q=#{query}")
+      assert_equal ['newest'], latest_build_ids(html)
+      refute_includes html, 'href="/builds/older/log"'
+      ACTIVE_STATUSES.each { |status| refute_includes html, "href=\"/builds/#{status}-old/log\"" }
+    end
+  end
+
+  def test_latest_search_preserves_existing_metadata_matches
+    add_build('older', command_line: 'latest-package')
+    add_build('newest', command_line: 'latest-package')
+    add_build('other', command_line: 'other')
+
+    html = dashboard('?q=latest')
+    assert_includes html, 'href="/builds/older/log"'
+    assert_equal %w[other newest], latest_build_ids(html)
+  end
+
+  def test_search_combines_status_and_latest_tag_in_any_order
+    add_build('older')
+    add_build('newest')
+    add_build('fixed-old', command_line: 'fixed')
+    add_build('fixed-new', command_line: 'fixed', status: 'succeeded')
+    ACTIVE_STATUSES.each do |status|
+      add_build("#{status}-old", command_line: "package-#{status}")
+      add_build("#{status}-active", command_line: "package-#{status}:nocheck", status: status)
+    end
+
+    ['fail latest', 'latest fail', "  FaIl\t  LaTeSt  "].each do |query|
+      html = dashboard("?q=#{CGI.escape(query)}")
+      assert_equal ['newest'], latest_build_ids(html)
+      %w[older fixed-old fixed-new].each { |id| refute_includes html, "href=\"/builds/#{id}/log\"" }
+      ACTIVE_STATUSES.each { |status| refute_includes html, "href=\"/builds/#{status}-old/log\"" }
+    end
+  end
+
+  def test_search_requires_every_term_to_match_across_metadata_fields
+    build = add_build('target', command_line: 'target-package:nocheck')
+    build.build_host = 'builder-one'
+    build.note = 'missing dependency'
+    build.exit_status = 2
+    add_build('other', command_line: 'other', status: 'succeeded')
+
+    query = 'target nocheck fail BUILDER missing 2 latest'
+    assert_equal ['target'], latest_build_ids(dashboard("?q=#{CGI.escape(query)}"))
+    html = dashboard("?q=#{CGI.escape("#{query} absent")}")
+    assert_empty latest_build_ids(html)
+    refute_includes html, 'href="/builds/target/log"'
+    assert_includes html, 'No matching completed builds.'
+  end
+
+  def test_latest_search_filters_before_pagination_and_preserves_the_query
+    (RECENT_PAGE_SIZE + 1).times do |index|
+      add_build("older-#{index}", command_line: "package-#{index}")
+      add_build("newest-#{index}", command_line: "package-#{index}")
+    end
+
+    ['latest', 'fail latest'].each do |search|
+      query = CGI.escape(search)
+      html = dashboard("?q=#{query}")
+      assert_equal RECENT_PAGE_SIZE, latest_build_ids(html).size
+      assert_includes html, "href=\"/?page=2&amp;q=#{query}\""
+      html = dashboard("?page=2&q=#{query}")
+      assert_equal ['newest-0'], latest_build_ids(html)
+      refute_match(%r{href="/builds/older-}, html)
+      assert_includes html, "href=\"/?page=1&amp;q=#{query}\""
+    end
+  end
+
+  def test_latest_failed_shortcut_is_next_to_search_and_opens_the_first_page
+    (RECENT_PAGE_SIZE + 1).times do |index|
+      add_build("failed-#{index}", command_line: "package-#{index}")
+    end
+    add_build('succeeded', command_line: 'other', status: 'succeeded')
+
+    html = dashboard('?page=2&q=package')
+    shortcut = html.match(%r{<button[^>]*>Search</button></div>\s*<div class="control"><a class="button is-small is-light" href="([^"]+)">Latest failed</a>})
+    refute_nil shortcut
+    assert_equal '/?q=latest+failed', shortcut[1]
+
+    html = dashboard(shortcut[1].delete_prefix('/'))
+    assert_equal RECENT_PAGE_SIZE.downto(1).map { |index| "failed-#{index}" }, latest_build_ids(html)
+    refute_includes html, 'href="/builds/succeeded/log"'
+    assert_includes html, 'value="latest failed"'
+    assert_includes html, 'href="/?page=2&amp;q=latest+failed"'
+  end
+
+  def test_pagination_does_not_mark_an_older_build_when_the_latest_is_on_another_page
+    add_build('older')
+    RECENT_PAGE_SIZE.times { |index| add_build("filler-#{index}", command_line: 'filler') }
+    add_build('latest')
+
+    assert_equal ['latest', "filler-#{RECENT_PAGE_SIZE - 1}"], latest_build_ids(dashboard)
+    html = dashboard('?page=2')
+    assert_includes html, 'href="/builds/older/log"'
+    refute_includes html, 'href="/builds/latest/log"'
+    assert_empty latest_build_ids(html)
+  end
+end
+
 class BuildRestartTest < Minitest::Test
   def setup
     Dir.children(TEST_ROOT).each { |name| FileUtils.rm_rf(File.join(TEST_ROOT, name)) }

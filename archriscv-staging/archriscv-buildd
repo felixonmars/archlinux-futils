@@ -1635,13 +1635,16 @@ class WebApp
     recent = builds.reject(&:active?).sort_by do |build|
       build.finished_at || build.prompt_answered_at || build.started_at || build.created_at
     end.reverse
+    latest_build_ids = (active + recent).uniq do |build|
+      build.pkgbase || build.command_line.sub(/:nocheck\z/, '')
+    end.reject(&:active?).to_h { |build| [build.id, true] }
     search = req.query['q'].to_s.strip
     unless search.empty?
-      needle = search.downcase
+      terms = search.downcase.split
       recent = recent.select do |build|
-        [build.pkgbase, build.command_line, build.status, build.build_host, build.note, build.exit_status].compact.any? do |value|
-          value.to_s.downcase.include?(needle)
-        end
+        text = [build.pkgbase, build.command_line, build.status, build.build_host, build.note, build.exit_status,
+                ('latest' if latest_build_ids.key?(build.id))].compact.join(' ').downcase
+        terms.all? { |term| text.include?(term) }
       end
     end
     page_count = [(recent.size + RECENT_PAGE_SIZE - 1) / RECENT_PAGE_SIZE, 1].max
@@ -1697,11 +1700,12 @@ class WebApp
                 <input class="input is-small" name="q" type="search" value="#{h(search)}" aria-label="Search recent builds" placeholder="Search recent builds">
               </div>
               <div class="control"><button class="button is-small is-light" type="submit">Search</button></div>
+              <div class="control"><a class="button is-small is-light" href="#{h(dashboard_path('?q=latest+failed'))}">Latest failed</a></div>
               #{%(<div class="control"><a class="button is-small is-light" href="#{h(dashboard_path)}">Clear</a></div>) unless search.empty?}
             </form>
           </div>
           <div class="build-list">
-            #{recent_page.empty? ? empty_state(recent_empty) : recent_page.map { |build| build_card(build) }.join}
+            #{recent_page.empty? ? empty_state(recent_empty) : recent_page.map { |build| build_card(build, latest: latest_build_ids.key?(build.id)) }.join}
           </div>
           #{%(<div class="history-pagination">#{pagination}</div>) unless pagination.empty?}
         </section>
@@ -1734,7 +1738,7 @@ class WebApp
     HTML
   end
 
-  def build_card(build)
+  def build_card(build, latest: false)
     host = build.build_host
     unless host && build.package_version
       log, = read_log(build.log_path, 0, 65_536)
@@ -1750,6 +1754,7 @@ class WebApp
           <h3><a href="#{h(dashboard_path("builds/#{build.id}/log"))}">#{h(build.pkgbase || build.command_line.sub(/:nocheck\z/, ''))}</a></h3>
           #{%(<span class="has-text-grey">#{h(build.package_version)}</span>) if build.package_version}
           #{nocheck_tag(build.command_line)}
+          #{%(<span class="tag is-info latest-build" title="Latest completed build for this pkgbase; no build is queued, running, or waiting for upload">latest</span>) if latest}
         </div>
         <div class="build-details">
           <div class="build-meta">
@@ -2143,7 +2148,7 @@ class WebApp
           .pending-tag { gap: .4rem; height: auto; padding: .35rem .55rem; cursor: pointer; border: 1px solid var(--line); }
           input[type=checkbox] { accent-color: var(--moss); }
           .checkbox { color: #656d5f; white-space: nowrap; }
-          .history-search { flex: 1 1 10rem; max-width: 17rem; margin: 0 !important; }
+          .history-search { flex: 1 1 21rem; max-width: 24rem; margin: 0 !important; }
           .history-pagination { display: flex; justify-content: flex-end; margin-top: .75rem; }
           .delete-build { position: absolute; right: .7rem; top: .9rem; margin: 0; }
           .delete-build .delete { background: #959c8d; opacity: .45; }

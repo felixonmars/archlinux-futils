@@ -251,6 +251,8 @@ class BuildAuthTest < Minitest::Test
     html = request('GET', '/').body
     assert_includes html, 'href="/buildd/auth/github"'
     assert_includes html, 'href="/buildd/builds/test/log"'
+    assert_includes html, 'href="/buildd/?q=latest+failed">Latest failed</a>'
+    assert_includes request('GET', '/', cookie: editor).body, 'href="/buildd/?q=latest+failed">Latest failed</a>'
     assert_equal '/buildd/', request('POST', '/builds', cookie: editor,
       params: {command: 'test', _csrf: token}, headers: {'Origin' => 'https://buildd.example.com'})['Location']
     assert_equal 403, request('POST', '/builds', cookie: editor,
