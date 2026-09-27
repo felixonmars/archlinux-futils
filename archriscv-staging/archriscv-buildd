@@ -25,6 +25,7 @@ BUILD_COMMAND = ENV.fetch('ARCHRISCV_BUILDD_BUILD_COMMAND', 'riscvu')
 BUILDER_USER = ENV.fetch('ARCHRISCV_BUILDD_BUILDER_USER', '').strip
 BUILDER_CACHE_DIR = ENV.fetch('ARCHRISCV_BUILDD_BUILDER_CACHE_DIR', '/tmp/felixbuild-server-select')
 MEMORY_KILLER_LIST = File.join(Dir.home, 'projects/archriscv/packages/memory-killer.txt')
+OVERLAY_REPO = File.join(Dir.home, 'projects/archriscv/packages')
 REFRESH_COMMAND = ENV.fetch('ARCHRISCV_BUILDD_REFRESH_COMMAND', 'archrv-refresh')
 REFRESH_STATE_FILE = File.join(Dir.home, '.cache/archriscv/reported.json')
 BUILD_WORKDIR = ENV['ARCHRISCV_BUILDD_WORKDIR']
@@ -227,6 +228,10 @@ class Build
 
   def terminal?
     TERMINAL_STATUSES.include?(status)
+  end
+
+  def can_push_branch?
+    status == 'succeeded' && environment['SWITCHBRANCH'] == '1'
   end
 end
 
@@ -477,6 +482,7 @@ class BuildManager
   def initialize(service: SystemdBuildService.new)
     @service = service
     @mutex = Mutex.new
+    @overlay_mutex = Mutex.new
     @builds = {}
     @refresh_pending = []
     @deferred_retries = []
@@ -676,6 +682,39 @@ class BuildManager
     end
   end
 
+  def overlay_branch_exists?(pkgbase)
+    _, status = Open3.capture2e('git', 'show-ref', '--verify', '--quiet', "refs/heads/#{pkgbase}", chdir: OVERLAY_REPO)
+    status.success?
+  rescue SystemCallError
+    false
+  end
+
+  def push_branch(id)
+    @overlay_mutex.synchronize do
+      pkgbase = @mutex.synchronize do
+        refresh_workers_locked
+        build = @builds[id] || raise(ArgumentError, 'unknown build')
+        unless build.can_push_branch?
+          raise ArgumentError, 'only succeeded builds with Switch overlay branch enabled can push a branch'
+        end
+
+        name = build.pkgbase || build.command_line.sub(/:nocheck\z/, '')
+        unless name.match?(COMMAND_PATTERN) && !name.end_with?(':nocheck') && name != 'master'
+          raise ArgumentError, 'invalid package overlay branch'
+        end
+        check_duplicate_locked(name)
+        name
+      end
+
+      current_branch = overlay_git('branch', '--show-current').strip
+      overlay_git('switch', 'master') if current_branch == pkgbase
+      overlay_git('pushbranch', pkgbase)
+      pkgbase
+    end
+  rescue SystemCallError => e
+    raise ArgumentError, e.message
+  end
+
   def deferred_retries
     @mutex.synchronize { @deferred_retries.map(&:dup) }
   end
@@ -833,6 +872,13 @@ class BuildManager
     File.unlink(File.join(BUILDER_CACHE_DIR, "#{pkgbase}-riscv64"))
   rescue Errno::ENOENT
     nil
+  end
+
+  def overlay_git(*args)
+    output, status = Open3.capture2e('git', *args, chdir: OVERLAY_REPO)
+    raise ArgumentError, "git #{args.join(' ')} failed: #{output.strip}" unless status.success?
+
+    output
   end
 
   def prepare_worker(build, new_builder: false)
@@ -1301,6 +1347,8 @@ class WebApp
       defer_build(req, res, Regexp.last_match(1))
     when %r{\A/builds/([^/]+)/memory-killer\z}
       mark_memory_killer(req, res, Regexp.last_match(1))
+    when %r{\A/builds/([^/]+)/push-branch\z}
+      push_branch(req, res, Regexp.last_match(1))
     when %r{\A/deferred/([^/]+)/cancel\z}
       cancel_deferred(req, res, Regexp.last_match(1))
     when %r{\A/builds/([^/]+)/stop\z}
@@ -1393,6 +1441,13 @@ class WebApp
     redirect(res, '/')
   end
 
+  def push_branch(req, res, id)
+    not_found(res) && return unless req.request_method == 'POST'
+
+    pkgbase = @manager.push_branch(id)
+    redirect(res, "https://github.com/felixonmars/archriscv-packages/compare/master...#{CGI.escape(pkgbase)}?quick_pull=1")
+  end
+
   def stop_build(req, res, id)
     not_found(res) && return unless req.request_method == 'POST'
 
@@ -1453,6 +1508,7 @@ class WebApp
             <a class="button is-light" href="raw">Raw log</a>
             #{account_controls}
             #{retry_button(build) unless build.status == 'waiting_upload'}
+            #{push_branch_button(build)}
             #{stop_button(build)}
           </div>
         </div>
@@ -1767,6 +1823,7 @@ class WebApp
             <a class="raw-link" href="#{h(dashboard_path("builds/#{build.id}/raw"))}">Raw</a>
             #{stop_button(build)}
             #{retry_button(build) unless build.status == 'waiting_upload'}
+            #{push_branch_button(build)}
           </div>
         </div>
         #{%(<p class="help is-danger mb-1">#{h(build.note)}</p>) if build.note}
@@ -1865,6 +1922,17 @@ class WebApp
         #{new_builder_checkbox(build)}
         #{keep_chroot_checkbox(checked: build.environment['KEEPCHROOT'] == '1')}
         #{switch_branch_checkbox(checked: build.environment['SWITCHBRANCH'] == '1')}
+      </form>
+    HTML
+  end
+
+  def push_branch_button(build)
+    return '' if @read_only || !build.can_push_branch?
+    return '' unless @manager.overlay_branch_exists?(build.pkgbase || build.command_line.sub(/:nocheck\z/, ''))
+
+    <<~HTML
+      <form class="inline" action="#{h(dashboard_path("builds/#{build.id}/push-branch"))}" method="post">
+        <button class="button is-small is-primary" type="submit" onclick="return confirm('Push this overlay branch and delete the local branch?')">Push branch</button>
       </form>
     HTML
   end

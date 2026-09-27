@@ -33,6 +33,7 @@ class BuildAuthTest < Minitest::Test
       log_path: '/nonexistent-buildd-auth-test.log', status: 'waiting_upload')
     @manager = Struct.new(:all_builds, :refresh_pending, :deferred_retries, :calls).new([@build], [], [], [])
     @manager.define_singleton_method(:find) { |id| all_builds.find { |build| build.id == id } }
+    @manager.define_singleton_method(:overlay_branch_exists?) { |pkgbase| all_builds.any? { |build| build.pkgbase == pkgbase } }
     @manager.define_singleton_method(:enqueue) do |command, **options|
       calls << [command, options]
       all_builds.first
@@ -132,7 +133,7 @@ class BuildAuthTest < Minitest::Test
   def test_anonymous_unapproved_and_forged_sessions_cannot_mutate_any_route
     viewer = login('UnlistedUser')
     paths = %w[/builds /refresh /refresh/add /refresh/clear /deferred/test/cancel] +
-      %w[upload retry defer memory-killer stop kill delete].map { |action| "/builds/test/#{action}" }
+      %w[upload retry defer memory-killer push-branch stop kill delete].map { |action| "/builds/test/#{action}" }
     [nil, viewer, "#{GitHubAuth::COOKIE}=forged"].each do |session_cookie|
       paths.each do |path|
         assert_equal 403, request('POST', path, cookie: session_cookie, params: {command: 'test', _csrf: csrf(viewer)}).status
@@ -166,6 +167,101 @@ class BuildAuthTest < Minitest::Test
     assert_equal 303, request('POST', '/builds', cookie: editor, params: {command: 'test', _csrf: token}, headers: {'Origin' => 'https://buildd.example.com'}).status
     assert_equal 201, request('POST', '/builds', cookie: editor, params: {command: 'test'}, headers: {'X-CSRF-Token' => token, 'Accept' => 'application/json'}).status
     assert_equal 2, @manager.calls.length
+  end
+
+  def test_push_branch_button_requires_a_successful_opted_in_build_and_an_editor
+    editor = login
+    @build.environment = {'SWITCHBRANCH' => '1'}
+    (ACTIVE_STATUSES + TERMINAL_STATUSES).each do |status|
+      @build.status = status
+      ['/', '/builds/test/log'].each do |path|
+        html = request('GET', path, cookie: editor).body
+        if status == 'succeeded'
+          assert_includes html, 'action="/builds/test/push-branch"'
+          assert_includes html, '>Push branch</button>'
+        else
+          refute_includes html, 'action="/builds/test/push-branch"'
+        end
+      end
+    end
+
+    @build.status = 'succeeded'
+    [{}, {'SWITCHBRANCH' => '0'}, {'SWITCHBRANCH' => 'true'}].each do |environment|
+      @build.environment = environment
+      refute_includes request('GET', '/', cookie: editor).body, 'action="/builds/test/push-branch"'
+    end
+    @build.environment = {'SWITCHBRANCH' => '1'}
+    [nil, login('UnlistedUser')].each do |session_cookie|
+      ['/', '/builds/test/log'].each do |path|
+        refute_includes request('GET', path, cookie: session_cookie).body, 'action="/builds/test/push-branch"'
+      end
+    end
+  end
+
+  def test_push_branch_button_checks_branch_existence_on_each_request
+    @build.status = 'succeeded'
+    @build.environment = {'SWITCHBRANCH' => '1'}
+    branches = ['test']
+    @manager.define_singleton_method(:overlay_branch_exists?) { |pkgbase| branches.include?(pkgbase) }
+    editor = login
+    ['/', '/builds/test/log'].each do |path|
+      assert_includes request('GET', path, cookie: editor).body, 'action="/builds/test/push-branch"'
+    end
+
+    branches.clear
+
+    ['/', '/builds/test/log'].each do |path|
+      refute_includes request('GET', path, cookie: editor).body, 'action="/builds/test/push-branch"'
+    end
+  end
+
+  def test_push_branch_action_requires_post_and_csrf_and_redirects_to_github
+    @auth = FakeGitHubAuth.new(client_id: 'client-id', client_secret: 'client-secret',
+      public_url: 'https://buildd.example.com/buildd/', editors: 'alloweduser')
+    @app = WebApp.new(@manager, auth: @auth)
+    @build.status = 'succeeded'
+    @build.environment = {'SWITCHBRANCH' => '1'}
+    @manager.define_singleton_method(:push_branch) do |id|
+      calls << ['push-branch', id]
+      all_builds.first.pkgbase
+    end
+    editor = login
+    token = csrf(editor)
+    ['/', '/builds/test/log'].each do |path|
+      html = request('GET', path, cookie: editor).body
+      form = html[%r{<form[^>]*action="/buildd/builds/test/push-branch"[^>]*>(.*?)</form>}m, 1]
+      refute_nil form
+      assert_includes form, %(name="_csrf" value="#{token}")
+      assert_includes form, 'delete the local branch?'
+    end
+
+    %w[GET HEAD].each { |method| assert_equal 404, request(method, '/builds/test/push-branch', cookie: editor).status }
+    assert_equal 403, request('POST', '/builds/test/push-branch', cookie: editor).status
+    assert_equal 403, request('POST', '/builds/test/push-branch', cookie: editor, params: {_csrf: 'wrong'}).status
+    assert_empty @manager.calls
+    response = request('POST', '/builds/test/push-branch', cookie: editor, params: {_csrf: token, pkgbase: 'other'})
+    assert_equal 303, response.status
+    assert_equal 'https://github.com/felixonmars/archriscv-packages/compare/master...test?quick_pull=1', response['Location']
+    assert_equal [['push-branch', 'test']], @manager.calls
+
+    @manager.define_singleton_method(:push_branch) { |_| raise ArgumentError, 'git switch master failed: <blocked>' }
+    response = request('POST', '/builds/test/push-branch', cookie: editor, params: {_csrf: token})
+    assert_equal 400, response.status
+    assert_nil response['Location']
+    assert_includes response.body, 'git switch master failed: &lt;blocked&gt;'
+  end
+
+  def test_push_branch_redirect_escapes_the_pkgbase_without_nocheck
+    @build.pkgbase = 'libc++'
+    @build.command_line = 'libc++:nocheck'
+    @build.status = 'succeeded'
+    @build.environment = {'SWITCHBRANCH' => '1'}
+    @manager.define_singleton_method(:push_branch) { |_| all_builds.first.pkgbase }
+    editor = login
+
+    response = request('POST', '/builds/test/push-branch', cookie: editor, params: {_csrf: csrf(editor)})
+    assert_equal 303, response.status
+    assert_equal 'https://github.com/felixonmars/archriscv-packages/compare/master...libc%2B%2B?quick_pull=1', response['Location']
   end
 
   def test_logout_expiry_and_allowlist_removal_revoke_editing

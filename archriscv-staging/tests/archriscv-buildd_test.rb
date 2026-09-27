@@ -23,6 +23,8 @@ ENV.delete('SWITCHBRANCH')
 load File.expand_path('../archriscv-buildd', __dir__)
 Object.send(:remove_const, :MEMORY_KILLER_LIST)
 MEMORY_KILLER_LIST = File.join(TEST_ROOT, 'packages', 'memory-killer.txt')
+Object.send(:remove_const, :OVERLAY_REPO)
+OVERLAY_REPO = File.join(TEST_ROOT, 'overlay')
 
 Minitest.after_run { FileUtils.remove_entry(TEST_ROOT) }
 
@@ -285,6 +287,170 @@ class BuildDashboardTest < Minitest::Test
     assert_includes html, 'href="/builds/older/log"'
     refute_includes html, 'href="/builds/latest/log"'
     assert_empty latest_build_ids(html)
+  end
+end
+
+class BuildPushBranchTest < Minitest::Test
+  def setup
+    Dir.children(TEST_ROOT).each { |name| FileUtils.rm_rf(File.join(TEST_ROOT, name)) }
+    FileUtils.mkdir_p(OVERLAY_REPO)
+    @remote = File.join(TEST_ROOT, 'remote.git')
+    git('init', '--bare', @remote)
+    git('init', '--initial-branch=master')
+    git('remote', 'add', 'origin', @remote)
+    git('config', 'alias.pushbranch', '!f() { git push origin "refs/heads/$1:refs/heads/$1" && git branch -D -- "$1"; }; f')
+    File.write(File.join(OVERLAY_REPO, 'overlay.txt'), 'master')
+    git('add', 'overlay.txt')
+    git('commit', '-m', 'Initial overlay')
+    git('switch', '-c', 'example')
+    File.write(File.join(OVERLAY_REPO, 'overlay.txt'), 'package changes')
+    git('commit', '-am', 'Package overlay')
+    @package_commit = git('rev-parse', 'example')
+    build = Build.new(id: 'push-test', command_line: 'example:nocheck', argv: ['riscvu', 'example:nocheck'],
+      pkgbase: 'example', log_path: File.join(TEST_ROOT, 'build.log'), status: 'succeeded',
+      environment: {'SWITCHBRANCH' => '1'})
+    write_json(STATE_FILE, 'builds' => [build.to_h])
+    @manager = BuildManager.new(service: TestBuildService.new)
+    @build = @manager.find(build.id)
+  end
+
+  def git(*args)
+    output, status = Open3.capture2e('git', '-c', 'user.name=Test', '-c', 'user.email=test@example.com',
+      '-c', 'commit.gpgsign=false', *args, chdir: OVERLAY_REPO)
+    assert status.success?, "git #{args.join(' ')} failed: #{output}"
+    output.strip
+  end
+
+  def assert_pushed
+    assert_empty git('branch', '--list', 'example')
+    assert_equal "#{@package_commit}\trefs/heads/example", git('ls-remote', 'origin', 'refs/heads/example')
+  end
+
+  def assert_not_pushed
+    assert_equal @package_commit, git('rev-parse', 'example')
+    assert_empty git('ls-remote', 'origin', 'refs/heads/example')
+  end
+
+  def test_push_switches_the_package_branch_to_master_before_pushing_and_deleting_it
+    assert_equal 'example', @manager.push_branch(@build.id)
+    assert_equal 'master', git('branch', '--show-current')
+    assert_pushed
+  end
+
+  def test_push_branch_button_disappears_after_the_local_branch_is_deleted
+    @build.pkgbase = nil
+    app = WebApp.new(@manager)
+    app.instance_variable_set(:@read_only, false)
+    assert @manager.overlay_branch_exists?('example')
+    refute @manager.overlay_branch_exists?('missing')
+    git('tag', 'tag-only')
+    refute @manager.overlay_branch_exists?('tag-only')
+    assert_includes app.send(:push_branch_button, @build), 'action="/builds/push-test/push-branch"'
+
+    @manager.push_branch(@build.id)
+
+    assert_pushed
+    refute @manager.overlay_branch_exists?('example')
+    assert_empty app.send(:push_branch_button, @build)
+  end
+
+  def test_push_leaves_an_unrelated_checkout_and_its_changes_untouched
+    git('switch', '-c', 'unrelated', 'master')
+    File.write(File.join(OVERLAY_REPO, 'overlay.txt'), 'unrelated local changes')
+
+    assert_equal 'example', @manager.push_branch(@build.id)
+    assert_equal 'unrelated', git('branch', '--show-current')
+    assert_equal 'unrelated local changes', File.read(File.join(OVERLAY_REPO, 'overlay.txt'))
+    assert_pushed
+  end
+
+  def test_push_leaves_a_detached_checkout_untouched
+    git('switch', '--detach', 'master')
+    original = git('rev-parse', 'HEAD')
+
+    assert_equal 'example', @manager.push_branch(@build.id)
+    assert_empty git('branch', '--show-current')
+    assert_equal original, git('rev-parse', 'HEAD')
+    assert_pushed
+  end
+
+  def test_push_uses_the_pkgbase_without_nocheck_for_legacy_builds
+    @build.pkgbase = nil
+
+    assert_equal 'example', @manager.push_branch(@build.id)
+    assert_equal 'master', git('branch', '--show-current')
+    assert_pushed
+  end
+
+  def test_failed_switch_preserves_local_changes_and_does_not_push
+    File.write(File.join(OVERLAY_REPO, 'overlay.txt'), 'uncommitted package changes')
+
+    error = assert_raises(ArgumentError) { @manager.push_branch(@build.id) }
+    assert_includes error.message, 'git switch master failed:'
+    assert_equal 'example', git('branch', '--show-current')
+    assert_equal 'uncommitted package changes', File.read(File.join(OVERLAY_REPO, 'overlay.txt'))
+    assert_not_pushed
+  end
+
+  def test_master_attached_to_another_worktree_is_not_forced_or_detached
+    worktree = File.join(TEST_ROOT, 'master-worktree')
+    git('worktree', 'add', worktree, 'master')
+
+    error = assert_raises(ArgumentError) { @manager.push_branch(@build.id) }
+    assert_includes error.message, 'git switch master failed:'
+    assert_includes error.message, worktree
+    assert_equal 'example', git('branch', '--show-current')
+    assert_includes git('worktree', 'list', '--porcelain'), "branch refs/heads/master"
+    assert_not_pushed
+  end
+
+  def test_failed_push_keeps_the_local_package_branch_and_reports_git_output
+    git('config', 'remote.origin.pushurl', File.join(TEST_ROOT, 'missing.git'))
+
+    error = assert_raises(ArgumentError) { @manager.push_branch(@build.id) }
+    assert_includes error.message, 'git pushbranch example failed:'
+    assert_includes error.message, 'missing.git'
+    assert_equal 'master', git('branch', '--show-current')
+    assert_not_pushed
+  end
+
+  def test_push_rejects_unsuccessful_builds_and_builds_without_the_checkbox
+    (ACTIVE_STATUSES + %w[failed interrupted]).each do |status|
+      @build.status = status
+      error = assert_raises(ArgumentError) { @manager.push_branch(@build.id) }
+      assert_includes error.message, 'only succeeded builds with Switch overlay branch enabled'
+    end
+    @build.status = 'succeeded'
+    [{}, {'SWITCHBRANCH' => '0'}, {'SWITCHBRANCH' => 'true'}].each do |environment|
+      @build.environment = environment
+      assert_raises(ArgumentError) { @manager.push_branch(@build.id) }
+    end
+
+    assert_equal 'example', git('branch', '--show-current')
+    assert_not_pushed
+  end
+
+  def test_push_rejects_an_unknown_build_or_invalid_package_branch
+    assert_raises(ArgumentError) { @manager.push_branch('missing') }
+    ['master', '--force', 'example; touch marker', 'example:nocheck'].each do |pkgbase|
+      @build.pkgbase = pkgbase
+      error = assert_raises(ArgumentError) { @manager.push_branch(@build.id) }
+      assert_includes error.message, 'invalid package overlay branch'
+    end
+
+    assert_equal 'example', git('branch', '--show-current')
+    assert_not_pushed
+  end
+
+  def test_push_rejects_a_package_that_is_queued_again
+    pending = @build.to_h.merge('id' => 'pending', 'status' => 'queued')
+    write_json(STATE_FILE, 'builds' => [@build.to_h, pending])
+    @manager = BuildManager.new(service: TestBuildService.new)
+
+    error = assert_raises(ArgumentError) { @manager.push_branch(@build.id) }
+    assert_includes error.message, 'example is already queued or building'
+    assert_equal 'example', git('branch', '--show-current')
+    assert_not_pushed
   end
 end
 
@@ -603,7 +769,7 @@ class BuildRestartTest < Minitest::Test
     assert_equal 200, request.call('HEAD', '/').status
 
     actions = %w[/builds /refresh /refresh/add /refresh/clear /deferred/later/cancel] +
-      %w[upload retry defer memory-killer stop kill delete].map { |action| "/builds/waiting_upload/#{action}" }
+      %w[upload retry defer memory-killer push-branch stop kill delete].map { |action| "/builds/waiting_upload/#{action}" }
     actions.each { |path| assert_equal 403, request.call('POST', path).status }
     %w[PUT PATCH DELETE].each { |method| assert_equal 403, request.call(method, '/').status }
     assert_equal 403, request.call('GET', '/builds/running/stop').status
