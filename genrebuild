@@ -30,7 +30,7 @@ HASKELL_REAL_MAKEDEPEND = {
     'uusi',
 }
 
-parser = argparse.ArgumentParser(description='Rebuild generator and orderer, generates all haskell reverse deps too')
+parser = argparse.ArgumentParser(description='Rebuild generator and orderer, outputs pkgbases and generates all haskell reverse deps too')
 parser.add_argument('-H', '--haskell-check', action="store_true",
                                              help='Filter results for haskell-only rebuilds, also implies --expand, --expand-make, --expand-check, and --ignore ghc,ghc-static')
 parser.add_argument('-e', '--expand', action="store_true",
@@ -48,7 +48,7 @@ parser.add_argument('--dbpath', nargs='?', default="/var/lib/pacman",
                                            help='Pacman sync db location. Default: /var/lib/pacman')
 parser.add_argument('--dep', nargs='?', default="",
                                         help='Additional dependencies to consider, as colon-separated pairs separated by comma. Example: foo:bar means foo depends on bar.')
-parser.add_argument('package', nargs='+', help='Packages to rebuild')
+parser.add_argument('package', nargs='+', help='Packages or pkgbases to rebuild')
 args = parser.parse_args()
 
 if args.haskell_check:
@@ -68,11 +68,7 @@ handler = colorlog.StreamHandler()
 handler.setFormatter(colorlog.ColoredFormatter())
 logger.addHandler(handler)
 
-rebuild_list = set(filter(lambda p: not p.endswith(":nocheck"), args.package))
-original_rebuild_list = rebuild_list.copy()
-
 package_db = defaultdict(dict)
-pkglist = rebuild_list.copy()
 reverse_deps = defaultdict(set)
 G = nx.DiGraph()
 handle = pyalpm.Handle(".", args.dbpath)
@@ -82,7 +78,7 @@ for db in args.db:
     for package in db_handle.search(""):
         if package.name in args.ignore:
             continue
-        for field in ("depends", "makedepends", "checkdepends", "provides", "arch"):
+        for field in ("depends", "makedepends", "checkdepends", "provides", "base"):
             package_db[package.name][field] = getattr(package, field)
 
 for pkg in package_db:
@@ -92,6 +88,25 @@ for pkg in package_db:
     package_db[pkg]["provides"] = {dep.split("=")[0].split(">")[0].split("<")[0] for dep in package_db[pkg]["provides"]}
 
 
+package_bases = {pkg: metadata["base"] or pkg for pkg, metadata in package_db.items()}
+base_db = defaultdict(lambda: defaultdict(set))
+haskell_packages = set()
+for pkg, metadata in package_db.items():
+    base = package_bases[pkg]
+    base_db[base]["packages"].add(pkg)
+    if {"ghc", "ghc-libs"} & metadata["depends"]:
+        haskell_packages.add(base)
+    for field in ("depends", "makedepends", "checkdepends", "provides"):
+        base_db[base][field].update(package_bases.get(dep, dep) for dep in metadata[field])
+        if field != "provides":
+            base_db[base][field].discard(base)
+package_db = base_db
+
+rebuild_list = {package_bases.get(pkg, pkg) for pkg in args.package if not pkg.endswith(":nocheck")}
+original_rebuild_list = rebuild_list.copy()
+pkglist = rebuild_list.copy()
+
+
 def resolve_pkg(pkg):
     newpkgs = set()
     if pkg not in reverse_deps:
@@ -99,16 +114,15 @@ def resolve_pkg(pkg):
             logger.error(f"Package {pkg} not found in any db")
             exit(1)
 
-        if args.haskell_check and (not ({"ghc", "ghc-libs"} & set(package_db[pkg]["depends"]) and package_db[pkg]["arch"] != "any")):
-           return reverse_deps[pkg]
-
         for _pkg in package_db:
-            if args.haskell_check and not ({"ghc", "ghc-libs"} & set(package_db[_pkg]["depends"]) and package_db[_pkg]["arch"] != "any"):
+            if _pkg == pkg:
+                continue
+            if args.haskell_check and _pkg not in haskell_packages:
                 continue
             if ({pkg} | package_db[pkg]["provides"]) & (package_db[_pkg]["depends"] | package_db[_pkg]["makedepends"] | \
                                                         package_db[_pkg]["checkdepends"]):
                 reverse_deps[pkg].add(_pkg)
-                if args.haskell_check and pkg in HASKELL_DO_NOT_EXPAND:
+                if args.haskell_check and package_db[pkg]["packages"] <= HASKELL_DO_NOT_EXPAND:
                     pass
                 else:
                     if args.expand and ({pkg} | package_db[pkg]["provides"]) & package_db[_pkg]["depends"]:
@@ -143,6 +157,8 @@ for dep_pair in args.dep.split(","):
     if not dep_pair:
         continue
     pkg, dep = dep_pair.split(":")
+    pkg = package_bases.get(pkg, pkg)
+    dep = package_bases.get(dep, dep)
     G.add_edge(dep, pkg)
 
 
@@ -202,7 +218,7 @@ def pass1(pkg):
         found = False
         while True:
             node = random.choice(list(NG))
-            if node in HASKELL_REAL_MAKEDEPEND:
+            if package_db[node]["packages"] & HASKELL_REAL_MAKEDEPEND:
                 continue
             for rdep in list(NG.successors(node)):
                 if node not in package_db[rdep]["depends"]:
