@@ -18,17 +18,29 @@ handle = pyalpm.Handle(".", "/var/lib/pacman")
 for db in ["core", "extra", "community", "multilib"]:
     db_handle = handle.register_syncdb(db, 0)
     for package in db_handle.search(""):
-        for field in ("depends", "makedepends", "checkdepends"):
+        for field in ("depends", "makedepends", "checkdepends", "base"):
             package_db[package.name][field] = getattr(package, field)
+
+
+package_bases = {pkg: metadata["base"] or pkg for pkg, metadata in package_db.items()}
+base_db = defaultdict(dict)
+for pkg, metadata in package_db.items():
+    base = package_bases[pkg]
+    for field in ("depends", "makedepends", "checkdepends"):
+        dependencies = {dep.split("=")[0].split(">")[0].split("<")[0] for dep in metadata[field]}
+        base_db[base].setdefault(field, set()).update(package_bases.get(dep, dep) for dep in dependencies)
+        base_db[base][field].discard(base)
+package_db = base_db
 
 
 parser = argparse.ArgumentParser(description='Rebuild simulator, simulates a rebuild and yell out when broken')
 parser.add_argument('-M', '--makedepends-are-checkdepends', action="store_true", help="Treat makedepends as checkdepends (ignore brokenness in nocheck builds)")
 parser.add_argument('-1', '--immediate-fail', action="store_true", help="Exit on first failure")
-parser.add_argument('package', nargs='+', help='Packages to rebuild')
+parser.add_argument('package', nargs='+', help='Packages or pkgbases to rebuild')
 args = parser.parse_args()
 
-rebuild_list = {pkg for pkg in args.package if not pkg.endswith(":nocheck")}
+rebuild_list = {pkg.removesuffix(":nocheck") for pkg in args.package}
+rebuild_list = {package_bases.get(pkg, pkg) for pkg in rebuild_list}
 package_broken = {package: False for package in rebuild_list}
 
 
@@ -44,17 +56,18 @@ def make_broken(pkg, rebuilt_package):
     if not package_broken[pkg]:
         package_broken[pkg] = True
         logger.warning(f"Package {pkg} is broken after rebuilding {rebuilt_package}")
-    for p in package_db:
-        if p in rebuilt_package and p in package_db[p]["depends"] and not package_broken[p]:
-            make_broken(p, rebuilt_package)
+    for dependent in package_db:
+        if dependent in rebuild_list and pkg in package_db[dependent]["depends"] and not package_broken[dependent]:
+            make_broken(dependent, rebuilt_package)
 
 
 logger.info("Starting rebuild")
 for package in args.package:
     logger.info(f"Rebuilding {package}")
-    if package.endswith(":nocheck"):
-        package = package[:-8]
-    else:
+    nocheck = package.endswith(":nocheck")
+    package = package.removesuffix(":nocheck")
+    package = package_bases.get(package, package)
+    if not nocheck:
         check_broken(package_db[package]["checkdepends"])
         if args.makedepends_are_checkdepends:
             check_broken(package_db[package]["makedepends"])
@@ -64,10 +77,9 @@ for package in args.package:
         check_broken(package_db[package]["makedepends"])
 
     package_broken[package] = False
-    for p in package_db:
-        if p in rebuild_list:
-            if package in package_db[p]["depends"]:
-                make_broken(p, package)
+    for dependent in package_db:
+        if dependent in rebuild_list and package in package_db[dependent]["depends"]:
+            make_broken(dependent, package)
 
 for package in package_broken:
     if package_broken[package]:
