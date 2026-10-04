@@ -72,6 +72,48 @@ class GenrebuildTest(unittest.TestCase):
             with self.subTest(roots=roots):
                 self.assertEqual(self.run_genrebuild("-H", *roots), ["split-source", "client"])
 
+    def test_pkgname_outputs_all_split_packages_once_per_build(self):
+        self.add_package("split-tools", base="split-source", depends=["ghc-libs", "split-lib=1"])
+        self.add_package("split-lib", base="split-source", depends=["ghc-libs"])
+        self.add_package("client", depends=["ghc-libs", "split-tools>=1"])
+        for option in ("-n", "--pkgname"):
+            for roots in (("split-lib",), ("split-source",), ("split-lib", "split-tools")):
+                with self.subTest(option=option, roots=roots):
+                    self.assertEqual(self.run_genrebuild(option, "-H", *roots),
+                                     ["split-lib", "split-tools", "client"])
+
+    def test_pkgname_preserves_merged_dependency_order(self):
+        self.add_package("root")
+        self.add_package("split-lib", base="a-source", depends=["root"])
+        self.add_package("split-tools", base="a-source", depends=["z-dependency"])
+        self.add_package("z-dependency", depends=["root"])
+        self.add_package("client", depends=["split-lib"])
+        self.assertEqual(self.run_genrebuild("--pkgname", "-e", "root"),
+                         ["root", "z-dependency", "split-lib", "split-tools", "client"])
+
+    def test_pkgname_preserves_nocheck_and_repeated_builds(self):
+        self.add_package("first-lib", base="first-source", checkdepends=["second-lib"])
+        self.add_package("first-tools", base="first-source", depends=["first-lib"])
+        self.add_package("second-lib", base="second-source", depends=["first-tools"])
+        self.assertEqual(self.run_genrebuild("--pkgname", "-e", "-c", "first-lib"),
+                         ["first-lib:nocheck", "first-tools:nocheck", "second-lib",
+                          "first-lib", "first-tools", "second-lib"])
+
+    def test_pkgname_excludes_ignored_split_packages(self):
+        self.add_package("split-lib", base="split-source")
+        self.add_package("split-tools", base="split-source")
+        self.assertEqual(self.run_genrebuild("--pkgname", "--ignore", "split-tools", "split-lib"),
+                         ["split-lib"])
+
+    def test_pkgname_preserves_additional_dependencies_missing_from_database(self):
+        self.add_package("split-lib", base="split-source")
+        self.assertEqual(self.run_genrebuild("--pkgname", "--dep", "split-lib:external", "split-lib"),
+                         ["external", "split-lib"])
+
+    def test_pkgname_falls_back_to_name_when_base_is_missing(self):
+        self.add_package("standalone", base="")
+        self.assertEqual(self.run_genrebuild("--pkgname", "standalone"), ["standalone"])
+
     def test_split_package_dependencies_are_merged_before_ordering(self):
         self.add_package("root")
         self.add_package("split-lib", base="a-source", depends=["root"])

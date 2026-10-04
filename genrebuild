@@ -30,7 +30,9 @@ HASKELL_REAL_MAKEDEPEND = {
     'uusi',
 }
 
-parser = argparse.ArgumentParser(description='Rebuild generator and orderer, outputs pkgbases and generates all haskell reverse deps too')
+parser = argparse.ArgumentParser(description='Rebuild generator and orderer, outputs pkgbases by default and generates all haskell reverse deps too')
+parser.add_argument('-n', '--pkgname', action="store_true",
+                                       help='Output package names instead of pkgbases, including all non-ignored split packages')
 parser.add_argument('-H', '--haskell-check', action="store_true",
                                              help='Filter results for haskell-only rebuilds, also implies --expand, --expand-make, --expand-check, and --ignore ghc,ghc-static')
 parser.add_argument('-e', '--expand', action="store_true",
@@ -318,5 +320,13 @@ for pkg in nx.topological_sort(G):
                     logger.info("Cycle Solver found a better build order (length: %d -> %d)" % (len(best_build_order), len(_pass1) + len(_pass2)))
                 best_build_order = _pass1 + _pass2
         result.extend(best_build_order)
+
+if args.pkgname:
+    package_result = []
+    for entry in result:
+        base, separator, suffix = entry.partition(":")
+        for package in sorted(package_db[base]["packages"] or {base}):
+            package_result.append(package + separator + suffix)
+    result = package_result
 
 print(" ".join(result))
