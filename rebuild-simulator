@@ -15,7 +15,7 @@ logger.addHandler(handler)
 package_db = defaultdict(dict)
 handle = pyalpm.Handle(".", "/var/lib/pacman")
 
-for db in ["core", "extra", "community", "multilib"]:
+for db in ["core", "extra", "multilib"]:
     db_handle = handle.register_syncdb(db, 0)
     for package in db_handle.search(""):
         for field in ("depends", "makedepends", "checkdepends", "base"):
