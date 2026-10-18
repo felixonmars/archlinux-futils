@@ -11,38 +11,57 @@ $repos = ARGV[1] || "all"
 
 $repos = $repos == "all" ? ["core", "extra", "multilib", "core-testing", "extra-testing", "multilib-testing"] : $repos.split(",")
 
+`sudo pacman -Fy`
+
 CACHEDIR = "#{Dir.home}/.cache/python-reverse-lookup"
 Dir.mkdir(CACHEDIR) unless Dir.exist?(CACHEDIR)
 
 POOL = Concurrent::FixedThreadPool.new(Concurrent.processor_count)
-PACMAN_LOCK = Mutex.new
+
+def cached_archives
+    Dir.glob("/var/cache/pacman/pkg/*.pkg.tar.zst").to_h do |path|
+        [File.basename(path).rpartition("-").first, path]
+    end
+end
 
 def parse_metadata(pattern)
-    `pacman -Fx #{pattern}`.split(/\n/).each do |line|
+    files = `pacman -Fx #{pattern}`.split(/\n/).filter_map do |line|
         case line.split
         in [file, "is", "owned", "by", package, version]
             repo, package = package.split("/")
             next unless $repos.include?(repo)
 
-            POOL.post do
-                cachefile = "#{CACHEDIR}/" + "#{package}-#{version}-#{file}".gsub("/", "_")
+            cachefile = "#{CACHEDIR}/" + "#{package}-#{version}-#{file}".gsub("/", "_")
+            [repo, package, version, file, cachefile]
+        end
+    end
 
-                unless File.exist?(cachefile)
-                    path = "/var/cache/pacman/pkg/#{package}-#{version}-*.pkg.tar.zst"
-                    if ! File.exist? path
-                        PACMAN_LOCK.synchronize do
-                            out = `sudo pacman -Sw --noconfirm #{repo}/#{package} 2>&1`
-                            puts out unless $?.success?
-                        end
-                    end
-                    content = `bsdtar xOf #{path} #{file}`
-                    File.write(cachefile, content) if $?.success?
-                end
+    archives = cached_archives
+    missing = files.filter_map do |repo, package, version, _file, cachefile|
+        next if File.exist?(cachefile) || archives.key?("#{package}-#{version}")
 
-                File.readlines(cachefile).each do |line|
-                    yield [repo, package].join("/"), line
-                end if File.exist?(cachefile)
+        "#{repo}/#{package}"
+    end.uniq
+
+    missing.group_by { |package| package.split("/").first }.each_value do |packages|
+        out = `sudo pacman -Sw --noconfirm #{packages.join(" ")} 2>&1`
+        puts out unless $?.success?
+    end
+    archives = cached_archives unless missing.empty?
+
+    files.each do |repo, package, version, file, cachefile|
+        POOL.post do
+            unless File.exist?(cachefile)
+                path = archives["#{package}-#{version}"]
+                next unless path
+
+                content = `bsdtar xOf #{path} #{file}`
+                File.write(cachefile, content) if $?.success?
             end
+
+            File.readlines(cachefile).each do |line|
+                yield [repo, package].join("/"), line
+            end if File.exist?(cachefile)
         end
     end
 end
