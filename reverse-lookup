@@ -1,0 +1,228 @@
+#!/usr/bin/ruby
+
+require 'concurrent'
+require 'fileutils'
+require 'open3'
+
+module ReverseLookup
+    PATTERNS = {
+        'python' => '^usr/lib/python3\.[0-9]+/site-packages/.*\.(dist-info/METADATA|egg-info/(requires\.txt|PKG-INFO))$',
+        'ruby' => '^usr/lib/ruby/gems/[^/]+/specifications/(default/)?[^/]+\.gemspec$',
+        'lua' => '^usr/(lib|share)/luarocks/rocks[^/]*/.*\.rockspec$',
+        'pc' => '^usr/(lib(32)?|share)/pkgconfig/[^/]+\.pc$',
+        'ocaml' => '^usr/lib/ocaml/(.*/)?META(\.[^/]+)?$'
+    }
+    REPOSITORIES = %w[core extra multilib core-testing extra-testing multilib-testing]
+    USAGE = <<~USAGE
+        Usage: reverse-lookup {#{PATTERNS.keys.join('|')}} upstream_package
+
+        Find reverse dependencies in language metadata shipped by Arch packages.
+        Includes optional, development, build/test, and conditional dependencies.
+        Searches all official stable and testing repositories.
+        Refreshes pacman package and file databases and downloads missing archives using sudo.
+        Highlights matching dependency names when writing to a terminal.
+
+        Examples:
+          reverse-lookup python requests
+          reverse-lookup ruby rack
+          reverse-lookup lua luafilesystem
+          reverse-lookup pc gtk+-3.0
+          reverse-lookup ocaml lwt.unix
+    USAGE
+
+    def self.highlight(text, offset, length, color)
+        return text unless color
+
+        text.dup.insert(offset + length, "\e[0m").insert(offset, "\e[1;31m")
+    end
+
+    def self.matching_lines(language, package, file, content, color: false)
+        case language
+        when 'lua'
+            return lua_lines(package, content, color: color)
+        when 'pc'
+            return pc_lines(package, content, color: color)
+        when 'ocaml'
+            return ocaml_lines(package, content, color: color)
+        when 'ruby'
+            return content.each_line.filter_map do |line|
+                line = line.strip
+                match = line.match(/^\s*\w+\.add_(?:runtime_|development_)?dependency\s*\(?\s*(?:%q<([^>]+)>|["']([^"']+)["'])/)
+                next unless match && (match[1] || match[2]) == package
+
+                group = match[1] ? 1 : 2
+                highlight(line, match.begin(group), match[group].length, color)
+            end.uniq
+        end
+
+        package = package.downcase.gsub(/[-_.]+/, '-')
+        extra = ''
+        unless file.end_with?('/requires.txt')
+            content = content.split(/\r?\n\r?\n/, 2).first.to_s.gsub(/\r?\n[ \t]+/, ' ')
+        end
+        content.each_line.filter_map do |line|
+            line = line.strip
+            if file.end_with?('/requires.txt')
+                if line.match?(/\A\[.*\]\z/)
+                    extra = line == '[]' ? '' : " #{line}"
+                    next
+                end
+                match = line.match(/\A([A-Za-z0-9][A-Za-z0-9._-]*)/)
+            else
+                match = line.match(/\ARequires-Dist:\s*([A-Za-z0-9][A-Za-z0-9._-]*)/i)
+            end
+            if match && match[1].downcase.gsub(/[-_.]+/, '-') == package
+                highlight("#{line}#{extra}", match.begin(1), match[1].length, color)
+            end
+        end
+    end
+
+    def self.lua_lines(package, content, color: false)
+        tokens = content.to_enum(:scan, /--\[(=*)\[.*?\]\1\]|--[^\n]*|\[(=*)\[.*?\]\2\]|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[A-Za-z_]\w*|[{}=]/m)
+            .map { Regexp.last_match[0] }.reject { |token| token.start_with?('--') }
+        stack = []
+        results = []
+        tokens.each_with_index do |token, index|
+            case token
+            when '{'
+                field = tokens[index - 1] == '=' ? tokens[index - 2] : nil
+                stack << field&.delete("'\"")
+            when '}'
+                stack.pop
+            else
+                next unless %w[dependencies build_dependencies test_dependencies].include?(stack.first)
+                next unless token.start_with?("'", '"', '[') && tokens[index + 1] != '='
+
+                value = token.start_with?('[') ? token.sub(/\A\[=*\[/, '').sub(/\]=*\]\z/, '').strip : token[1...-1]
+                if value[/\A[A-Za-z0-9][A-Za-z0-9_.\/-]*/] == package
+                    results << "#{stack.compact.join('.')}: #{highlight(value, 0, package.length, color)}"
+                end
+            end
+        end
+        results.uniq
+    end
+
+    def self.pc_lines(package, content, color: false)
+        variables = {}
+        content.gsub(/\\\r?\n/, '').each_line.filter_map do |line|
+            line = line.sub(/(?<!\\)#.*/, '').strip
+                .gsub(/(?<!\$)\$\{([^}]+)\}/) { variables.fetch(Regexp.last_match[1], '') }.gsub('$${', '${')
+            if (match = line.match(/\A([\w.]+)\s*=(.*)\z/))
+                variables[match[1]] = match[2].strip
+                next
+            end
+            match = line.match(/\ARequires(?:\.(?:private|internal|shared))?:\s*(.*)\z/)
+            next unless match
+
+            found = false
+            dependencies = match[1].gsub(/([^\s,<>!=]+)(?:\s*(?:<=|>=|!=|[=<>])\s*[^\s,]+)?/) do |dependency|
+                name = Regexp.last_match[1]
+                next dependency unless name == package
+
+                found = true
+                highlight(dependency, 0, name.length, color)
+            end
+            "#{line[0...match.begin(1)]}#{dependencies}" if found
+        end
+    end
+
+    def self.ocaml_lines(package, content, color: false)
+        tokens = content.scan(/#[^\n]*|"(?:\\.|[^"\\])*"|[\w.]+|\+=|[()=,-]/).reject { |token| token.start_with?('#') }
+        tokens.each_index.filter_map do |index|
+            next unless tokens[index] == 'requires'
+
+            finish = index + 1
+            if tokens[finish] == '('
+                finish += 1 until finish >= tokens.size || tokens[finish] == ')'
+                finish += 1
+            end
+            value = tokens[finish + 1]
+            next unless %w[= +=].include?(tokens[finish]) && value&.start_with?('"')
+            next unless value[1...-1].split(/[,\s]+/).include?(package)
+
+            value = value.gsub(/\s+/, ' ').gsub(/[^",\s]+/) do |name|
+                name == package ? highlight(name, 0, name.length, color) : name
+            end
+            "#{tokens[index..finish].join} #{value}"
+        end
+    end
+
+    def self.cached_archives
+        Dir.glob('/var/cache/pacman/pkg/*.pkg.tar.{zst,xz,gz}').to_h do |path|
+            [File.basename(path).rpartition('-').first.sub(/-\d+:/, '-'), path]
+        end
+    end
+
+    def self.run(language, name)
+        raise 'Failed to refresh pacman package databases' unless system('sudo', 'pacman', '-Sy', out: $stderr)
+        raise 'Failed to refresh pacman file databases' unless system('sudo', 'pacman', '-Fy', out: $stderr)
+
+        output, error, status = Open3.capture3('pacman', '-Fx', '--machinereadable', PATTERNS.fetch(language))
+        unless status.success? || (status.exitstatus == 1 && output.empty? && error.empty?)
+            raise "Failed to search pacman file databases: #{error.strip}"
+        end
+        cache_dir = "#{Dir.home}/.cache/reverse-lookup"
+        FileUtils.mkdir_p(cache_dir)
+        files = output.each_line.filter_map do |line|
+            repo, package, version, file = line.chomp.split("\0")
+            next unless REPOSITORIES.include?(repo)
+
+            cachefile = "#{cache_dir}/" + "#{repo}-#{package}-#{version}-#{file}".tr('/', '_')
+            [repo, package, version.sub(/\A\d+:/, ''), file, cachefile]
+        end.uniq.sort
+
+        archives = cached_archives
+        missing = files.filter_map do |repo, package, version, _file, cachefile|
+            "#{repo}/#{package}" unless File.exist?(cachefile) || archives.key?("#{package}-#{version}")
+        end.uniq
+        missing.group_by { |package| package.split('/').first }.each_value do |packages|
+            unless system('sudo', 'pacman', '-Swdd', '--noconfirm', *packages, out: $stderr)
+                raise "Failed to download #{packages.join(' ')}"
+            end
+        end
+        archives = cached_archives unless missing.empty?
+
+        pool = Concurrent::FixedThreadPool.new(Concurrent.processor_count)
+        begin
+            results = files.map do |repo, package, version, file, cachefile|
+                Concurrent::Promises.future_on(pool) do
+                    unless File.exist?(cachefile)
+                        path = archives.fetch("#{package}-#{version}") do
+                            raise "Missing cached archive for #{repo}/#{package} #{version}; package and file databases may be out of sync"
+                        end
+                        content, error, status = Open3.capture3('bsdtar', 'xOf', path, file)
+                        raise "Failed to extract #{repo}/#{package}: #{error.strip}" unless status.success?
+
+                        File.write(cachefile, content)
+                    end
+                    matching_lines(language, name, file, File.read(cachefile), color: $stdout.tty?).map do |line|
+                        "#{repo}/#{package}: #{line}"
+                    end
+                end
+            end
+            results.each { |result| puts result.value! }
+        ensure
+            pool.shutdown
+            pool.wait_for_termination
+        end
+    end
+
+    def self.main(args)
+        if args == ['--help'] || args == ['-h']
+            puts USAGE
+            return 0
+        end
+        language, package = args
+        unless args.size == 2 && PATTERNS.key?(language) && package.match?(/\A[A-Za-z0-9][A-Za-z0-9._+\/-]*\z/)
+            warn USAGE
+            return 1
+        end
+        run(language, package)
+        0
+    rescue StandardError => error
+        warn error.message
+        1
+    end
+end
+
+exit ReverseLookup.main(ARGV) if $PROGRAM_NAME == __FILE__
