@@ -1,0 +1,168 @@
+#!/usr/bin/python
+"""List incomplete Arch todo pkgbases whose dependency trees are ready."""
+
+import argparse
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+import json
+import re
+import sys
+import tarfile
+from urllib.parse import urlsplit, urlunsplit
+from urllib.request import urlopen
+
+
+MIRROR = "https://mirror.pkgbuild.com"
+REPOSITORIES = ("core", "extra", "multilib")
+DEPENDENCIES = ("depends", "makedepends", "checkdepends")
+
+
+def todo_api_url(url):
+    parsed = urlsplit(url)
+    match = re.fullmatch(r"/(?:api/v1/)?todo/([^/]+)(?:/json)?/?", parsed.path)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc or not match:
+        raise ValueError("expected an Arch todo URL such as https://archlinux.org/todo/example/")
+    return urlunsplit((parsed.scheme, parsed.netloc,
+                       f"/api/v1/todo/{match[1]}/", "", ""))
+
+
+def dependency_name(dependency):
+    # Versions determine installability, but rebuild ordering follows package identity.
+    return re.split(r"[<>=]", dependency, maxsplit=1)[0]
+
+
+def read_repository(stream):
+    packages = []
+    with tarfile.open(fileobj=stream, mode="r|*") as database:
+        for entry in database:
+            if not entry.isfile() or not entry.name.endswith("/desc"):
+                continue
+            fields = {}
+            for section in database.extractfile(entry).read().decode().strip().split("\n\n"):
+                key, *values = section.splitlines()
+                fields[key.strip("%").lower()] = values
+            package = {
+                "pkgname": fields["name"][0],
+                "pkgbase": fields.get("base", fields["name"])[0],
+            }
+            for field in (*DEPENDENCIES, "provides"):
+                package[field] = fields.get(field, [])
+            packages.append(package)
+    if not packages:
+        raise ValueError("empty repository database")
+    return sorted(packages, key=lambda package: package["pkgname"])
+
+
+def fetch_repository(repo):
+    url = f"{MIRROR}/{repo}/os/x86_64/{repo}.db"
+    with urlopen(url, timeout=30) as response:
+        return read_repository(response)
+
+
+def ready_pkgbases(rows, packages):
+    statuses = defaultdict(set)
+    for row in rows:
+        if row is None:  # Removed packages can appear as null in older todo feeds.
+            continue
+        status = row["status_str"]
+        if status not in ("Incomplete", "Complete", "In-progress"):
+            raise ValueError(f"unknown todo status for {row['pkgname']}: {status}")
+        statuses[row["pkgbase"]].add(status)
+
+    # Packages arrive in repository priority, then package-name order.
+    by_name = {}
+    for package in packages:
+        by_name.setdefault(package["pkgname"], package)
+    missing = {row["pkgname"] for row in rows if row is not None} - by_name.keys()
+    if missing:
+        raise ValueError("todo packages missing from repository metadata (mirror may be out of sync): "
+                         + ", ".join(sorted(missing)))
+    # The feed may be newer than the mirror. Keep its metadata for listed packages,
+    # and use the repositories to fill in split siblings and alternative providers.
+    by_name.update((row["pkgname"], row) for row in rows if row is not None)
+    providers = {}
+    dependencies = defaultdict(set)
+    recursive_dependencies = defaultdict(set)
+    for package in by_name.values():
+        base = package["pkgbase"]
+        for provide in package["provides"]:
+            # Match the default provider prompt in a clean chroot, even when
+            # a later provider would be ready sooner.
+            providers.setdefault(dependency_name(provide), {package["pkgname"]})
+        for field in DEPENDENCIES:
+            deps = {dependency_name(dep) for dep in package[field]}
+            dependencies[base].update(deps)
+            if field == "depends":
+                recursive_dependencies[package["pkgname"]].update(deps)
+
+    # An explicitly named package takes priority over virtual providers.
+    providers.update((name, {name}) for name in by_name)
+
+    dependency_targets = defaultdict(list)
+    recursive_targets = defaultdict(list)
+    for base, deps in dependencies.items():
+        for dep in deps:
+            targets = providers.get(dep, set())
+            # The target build includes all its split siblings.
+            if targets and not any(by_name[name]["pkgbase"] == base for name in targets):
+                dependency_targets[base].append(targets)
+    for name, deps in recursive_dependencies.items():
+        for dep in deps:
+            targets = providers.get(dep, set())
+            if targets:
+                recursive_targets[name].append(targets)
+
+    # Make and check dependencies apply only to the build being considered.
+    # Installed dependencies need only their own runtime dependencies, without
+    # pulling in unrelated split siblings. Virtual dependencies follow their
+    # default provider. Iteration handles cycles and deep dependency trees.
+    unfinished = {base for base, states in statuses.items() if states != {"Complete"}}
+    blocked = {name for name, package in by_name.items() if package["pkgbase"] in unfinished}
+    while True:
+        newly_blocked = {
+            name for name, groups in recursive_targets.items()
+            if name not in blocked and any(targets <= blocked for targets in groups)
+        }
+        if not newly_blocked:
+            break
+        blocked.update(newly_blocked)
+
+    return [
+        base for base, states in sorted(statuses.items())
+        if "Incomplete" in states and "In-progress" not in states
+        and not any(targets <= blocked for targets in dependency_targets[base])
+    ]
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Print ready-to-build Arch todo pkgbases, one per line.",
+        epilog="Uses live todo status and stable x86_64 repository metadata. Checks runtime, "
+               "make and check dependencies for the target build, then follows only runtime "
+               "dependencies of the required binary packages, including provides. "
+               "Assumes clean-chroot default providers: repository order, then package name. "
+               "Completed packages and packages outside the todo are traversed "
+               "too. Versions and optional dependencies are ignored. Cycles reaching an "
+               "unfinished todo package remain blocked.",
+    )
+    parser.add_argument("todo", help="todo page URL")
+    args = parser.parse_args(argv)
+    try:
+        with urlopen(todo_api_url(args.todo), timeout=30) as response:
+            rows = json.load(response)["packages"]
+        if not any(row is not None and row["status_str"] == "Incomplete" for row in rows):
+            return 0
+        with ThreadPoolExecutor(max_workers=len(REPOSITORIES)) as pool:
+            packages = [package for repo in pool.map(fetch_repository, REPOSITORIES)
+                        for package in repo]
+        ready = ready_pkgbases(rows, packages)
+    except (OSError, ValueError, KeyError, TypeError, tarfile.TarError) as error:
+        print(f"todoready: {error}", file=sys.stderr)
+        return 1
+    for base in ready:
+        print(base)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
