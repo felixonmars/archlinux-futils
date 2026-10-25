@@ -38,7 +38,7 @@ fi
 
 # Try to fetch logs
 fetch_logs() {
-  PKGPREFIX=$(source PKGBUILD; echo $PKGNAME-$epoch${epoch:+:}$pkgver-$pkgrel)
+  PKGPREFIX=$(ssh $BUILDHOST "cd packages/$PKGNAME && source PKGBUILD && echo $PKGNAME-\$epoch\${epoch:+:}\$pkgver-\$pkgrel") || return
   rsync -avzz $BUILDHOST:packages/$PKGNAME/$PKGPREFIX-*.log ./
 }
 trap fetch_logs EXIT
