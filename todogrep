@@ -4,17 +4,37 @@ import aiohttp
 import argparse
 import asyncio
 import colorlog
+import logging
 import os
 import pyalpm
 import re
+import sys
 import tempfile
 
+ARCHWEB = "https://archlinux.org"
 MIRROR = "https://mirror.pkgbuild.com/"
 
 logger = colorlog.getLogger()
 logger.setLevel(colorlog.INFO)
 
-handler = colorlog.StreamHandler()
+class ProgressHandler(colorlog.StreamHandler):
+    progress = ''
+
+    def show_progress(self, text):
+        if self.stream.isatty():
+            self.progress = text
+            self.stream.write('\r\033[K' + text)
+            self.flush()
+
+    def emit(self, record):
+        if self.progress:
+            self.stream.write('\r\033[K')
+        super().emit(record)
+        if self.progress:
+            self.show_progress(self.progress)
+
+handler = ProgressHandler()
+handler.setLevel(logging.INFO)
 handler.setFormatter(colorlog.ColoredFormatter())
 logger.addHandler(handler)
 
@@ -26,57 +46,85 @@ async def get_db(db, session, callback):
         await callback(db, db_content)
 
 async def get_todo(todo_url, session, callback):
-    logger.debug(f"Fetching {todo_url}")
-    full_url = f'https://www.archlinux.org{todo_url}json'
+    full_url = f'{ARCHWEB}/api/v1{todo_url}'
+    logger.debug(f"Fetching {full_url}")
     async with session.get(full_url) as resp:
         todo = await resp.json()
         todo["url"] = todo_url
         await callback(todo)
 
 async def analyze_overlaps(todo_callback, db_callback):
-    tasks = []
-    logger.debug("Fetching todo lists")
-    async with aiohttp.ClientSession() as session:
-        for db in ("staging", "community-staging", "multilib-staging"):
-            task = asyncio.ensure_future(get_db(db, session, db_callback))
-            tasks.append(task)
-
-        async with session.get('https://www.archlinux.org/todo') as resp:
+    logger.info("Fetching todo lists")
+    # Avoid a burst of connections that triggers archlinux.org's firewall.
+    connector = aiohttp.TCPConnector(limit_per_host=2)
+    async with aiohttp.ClientSession(connector=connector, raise_for_status=True,
+                                     timeout=aiohttp.ClientTimeout(total=60)) as session:
+        async with session.get(f'{ARCHWEB}/todo/') as resp:
             todolist_page = await resp.text()
             todolist = re.findall('(/todo/.*?)"', todolist_page)
             completelist = re.findall('span class="(complete|incomplete)"', todolist_page)
+            if 'id="dev-todo-lists"' not in todolist_page or len(todolist) != len(completelist):
+                raise ValueError(f"{resp.url}: expected a todo list, possibly blocked by the firewall")
 
-            for todo_url, iscomplete in zip(todolist, completelist):
-                if iscomplete == "incomplete":
-                    task = asyncio.ensure_future(get_todo(todo_url, session, todo_callback))
-                    tasks.append(task)
+        tasks = [get_db(db, session, db_callback)
+                 for db in ("core-staging", "extra-staging", "multilib-staging")]
+        tasks.extend(get_todo(todo_url, session, todo_callback)
+                     for todo_url, iscomplete in zip(todolist, completelist)
+                     if iscomplete == "incomplete")
 
-            responses = await asyncio.gather(*tasks)
-            return responses
+        completed = 0
 
-async def main():
-    parser = argparse.ArgumentParser(description='Grep for packages in ongoing todos')
+        async def with_progress(task):
+            nonlocal completed
+            result = await task
+            completed += 1
+            handler.show_progress(f'[{completed}/{len(tasks)}] Checking todos and staging repositories')
+            return result
+
+        handler.show_progress(f'[0/{len(tasks)}] Checking todos and staging repositories')
+        try:
+            return await asyncio.gather(*(with_progress(task) for task in tasks))
+        finally:
+            handler.show_progress('')
+
+async def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description='Grep for packages in ongoing todos',
+        epilog='Exit status: 0 if no overlaps are found, 1 if any are found, 2 if the check fails.')
     parser.add_argument('-b', '--pkgbase', action='store_true', help='Look for pkgbases instead of pkgnames')
     parser.add_argument('-d', '--debug', action='store_true', help='Enable debug logging')
+    parser.add_argument('--log-file', metavar='PATH', help='Save debug output and failure tracebacks to a file')
     parser.add_argument('package', nargs='+', help='Packages to look for')
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    if args.debug:
-        logger.setLevel(colorlog.colorlog.logging.DEBUG)
+    logger.setLevel(logging.DEBUG if args.debug or args.log_file else logging.INFO)
+    handler.setLevel(logging.DEBUG if args.debug else logging.INFO)
+    if args.log_file:
+        try:
+            file_handler = logging.FileHandler(args.log_file, encoding='utf-8')
+        except OSError as exc:
+            parser.error(f"cannot open log file: {exc}")
+        file_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s: %(message)s'))
+        logger.addHandler(file_handler)
+
+    matched = False
 
     async def check_todo(todo):
+        nonlocal matched
         for p in args.package:
             for package in todo["packages"]:
                 if package is None:
                     # Package was removed
                     continue
                 if args.pkgbase and package["pkgbase"] == p or package["pkgname"] == p:
+                    matched = True
                     if todo["kind"] == "Rebuild":
                         logger.error(f"{p} overlaps with {todo['url']}: {todo['name']}")
                     else:
                         logger.warning(f"{p} overlaps with {todo['url']}: {todo['name']}")
 
     async def check_db(db, db_content):
+        nonlocal matched
         with tempfile.TemporaryDirectory() as tmpdirname:
             os.mkdir(f'{tmpdirname}/sync')
             with open(f"{tmpdirname}/sync/{db}.db", "wb") as f:
@@ -87,9 +135,21 @@ async def main():
             for package in db_handle.search(""):
                 for p in args.package:
                     if args.pkgbase and package.base == p or package.name == p:
+                        matched = True
                         logger.error(f"{p} is already in [{db}]")
 
-    await analyze_overlaps(check_todo, check_db)
+    try:
+        logger.debug("Checking packages: %s", ' '.join(args.package))
+        await analyze_overlaps(check_todo, check_db)
+    except Exception as exc:
+        logger.debug("Overlap check failed", exc_info=True)
+        logger.error("Overlap check failed: %s", exc)
+        return 2
+    finally:
+        if args.log_file:
+            logger.removeHandler(file_handler)
+            file_handler.close()
+    return 1 if matched else 0
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(asyncio.run(main()))
