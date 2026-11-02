@@ -84,9 +84,21 @@ if [[ "$KEEPCHROOT" == "1" ]]; then
     chroot_args=(--worker "keep-${PKGBASE}-${CHROOT_ID}")
 fi
 
+RVBRANCH=master
 if [[ "$SWITCHBRANCH" == "1" ]]; then
-    git -C "$RVPATCHREPO" switch "$PKGBASE" || exit 1
+    RVBRANCH=$PKGBASE
 fi
+
+# Keep the shared checkout on master and give each build its own overlay snapshot.
+(
+    flock 9 || exit 1
+    git -C "$RVPATCHREPO" switch master || exit 1
+    git -C "$RVPATCHREPO" pull --ff-only || exit 1
+    git -C "$RVPATCHREPO" archive --output="$WORKDIR/overlay.tar" "refs/heads/$RVBRANCH"
+) 9< "$RVPATCHREPO" || exit 1
+mkdir "$WORKDIR/overlay" || exit 1
+tar -xf "$WORKDIR/overlay.tar" -C "$WORKDIR/overlay" || exit 1
+export RVPATCHREPO="$WORKDIR/overlay"
 
 SERVER=$(felixbuild-server-select riscv64)
 

@@ -45,7 +45,9 @@ trap fetch_logs EXIT
 
 # === Handle riscv64 patches ===
 if [[ "$CMD" =~ "--arch riscv64" ]]; then
-  . /usr/local/bin/riscvenv
+  if [[ -z "$RVPATCHREPO" ]]; then
+    . /usr/local/bin/riscvenv
+  fi
   if [[ -d "$RVPATCHREPO/$PKGNAME" ]]; then
     msg "Applying RISC-V patches..."
     rsync -avzzP $RVPATCHREPO/$PKGNAME/ $BUILDHOST:packages/$PKGNAME/ --exclude=*.src.tar* --exclude=*.pkg.tar* --exclude=src/ --exclude=pkg/ --exclude=.git/
