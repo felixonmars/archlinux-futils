@@ -4,15 +4,20 @@ import aiohttp
 import argparse
 import asyncio
 import colorlog
+import json
 import logging
 import os
 import pyalpm
 import re
 import sys
 import tempfile
+import time
+from urllib.parse import quote
 
 ARCHWEB = "https://archlinux.org"
 MIRROR = "https://mirror.pkgbuild.com/"
+TODO_CACHE_DIR = os.path.expanduser('~/.cache/todogrep')
+TODO_CACHE_TTL = 24 * 60 * 60
 
 logger = colorlog.getLogger()
 logger.setLevel(colorlog.INFO)
@@ -38,6 +43,33 @@ handler.setLevel(logging.INFO)
 handler.setFormatter(colorlog.ColoredFormatter())
 logger.addHandler(handler)
 
+def read_todo_cache(cache_path):
+    try:
+        with open(cache_path, encoding='utf-8') as f:
+            if not 0 <= time.time() - os.fstat(f.fileno()).st_mtime < TODO_CACHE_TTL:
+                return None
+            todo = json.load(f)
+        if not isinstance(todo, dict) or not isinstance(todo.get('packages'), list):
+            raise ValueError('expected a todo with a package list')
+        return todo
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        logger.debug("Ignoring todo cache: %s", exc)
+        return None
+
+def write_todo_cache(cache_path, todo):
+    try:
+        directory = os.path.dirname(cache_path)
+        os.makedirs(directory, exist_ok=True)
+        # Avoid partial cache reads from concurrent invocations.
+        with tempfile.TemporaryDirectory(dir=directory) as tmpdirname:
+            with open(f'{tmpdirname}/todo.json', 'w', encoding='utf-8') as f:
+                json.dump(todo, f)
+            os.replace(f'{tmpdirname}/todo.json', cache_path)
+    except OSError as exc:
+        logger.warning("Cannot save todo cache: %s", exc)
+
 async def get_db(db, session, callback):
     full_url = f"{MIRROR}{db}/os/x86_64/{db}.db"
     logger.debug(f"Fetching {full_url}")
@@ -47,11 +79,18 @@ async def get_db(db, session, callback):
 
 async def get_todo(todo_url, session, callback):
     full_url = f'{ARCHWEB}/api/v1{todo_url}'
+    cache_path = os.path.join(TODO_CACHE_DIR, quote(todo_url, safe='') + '.json')
+    todo = read_todo_cache(cache_path)
+    if todo is not None:
+        logger.debug("Using cached %s", full_url)
+        await callback(todo)
+        return
     logger.debug(f"Fetching {full_url}")
     async with session.get(full_url) as resp:
         todo = await resp.json()
         todo["url"] = todo_url
         await callback(todo)
+    write_todo_cache(cache_path, todo)
 
 async def analyze_overlaps(todo_callback, db_callback):
     logger.info("Fetching todo lists")
@@ -90,7 +129,9 @@ async def analyze_overlaps(todo_callback, db_callback):
 async def main(argv=None):
     parser = argparse.ArgumentParser(
         description='Grep for packages in ongoing todos',
-        epilog='Exit status: 0 if no overlaps are found, 1 if any are found, 2 if the check fails.')
+        epilog='Individual todo details are cached for 24 hours in ~/.cache/todogrep/; '
+               'the todo index and staging repositories are always fetched live. '
+               'Exit status: 0 if no overlaps are found, 1 if any are found, 2 if the check fails.')
     parser.add_argument('-b', '--pkgbase', action='store_true', help='Look for pkgbases instead of pkgnames')
     parser.add_argument('-d', '--debug', action='store_true', help='Enable debug logging')
     parser.add_argument('--log-file', metavar='PATH', help='Save debug output and failure tracebacks to a file')

@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import logging
+import os
 from pathlib import Path
 import tarfile
 import tempfile
@@ -33,8 +34,11 @@ class TodoGrepTest(unittest.IsolatedAsyncioTestCase):
         self.server = TestServer(app)
         await self.server.start_server()
         self.addAsyncCleanup(self.server.close)
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        self.cache = Path(directory) / 'cache' / '%2Ftodo%2Factive%2F.json'
         self.patch = mock.patch.multiple(todogrep, ARCHWEB=str(self.server.make_url('')).rstrip('/'),
-                                         MIRROR=str(self.server.make_url('/')))
+                                         MIRROR=str(self.server.make_url('/')),
+                                         TODO_CACHE_DIR=str(self.cache.parent))
         self.patch.start()
         self.addCleanup(self.patch.stop)
         self.addCleanup(todogrep.logger.setLevel, todogrep.logger.level)
@@ -82,7 +86,137 @@ class TodoGrepTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('/api/v1/todo/finished/', self.requests)
         self.assertEqual(len(self.requests), len(states) + 4)
 
+    async def test_todo_details_are_cached_for_one_day_but_index_and_databases_are_live(self):
+        self.index({'active': 'incomplete'})
+        todo = {'name': 'Active', 'kind': 'Rebuild',
+                'packages': [None, {'pkgname': 'split', 'pkgbase': 'base'}]}
+        self.responses['/api/v1/todo/active/'] = (200, 'application/json', json.dumps(todo))
+        first = mock.AsyncMock()
+        await todogrep.analyze_overlaps(first, mock.AsyncMock())
+        cached_at = self.cache.stat().st_mtime - 23 * 60 * 60
+        os.utime(self.cache, (cached_at, cached_at))
+        modified = self.cache.stat().st_mtime_ns
+
+        # Details are still reusable after 23 hours, without extending expiry.
+        del self.responses['/api/v1/todo/active/']
+        self.requests.clear()
+        second = mock.AsyncMock()
+        databases = mock.AsyncMock()
+        await todogrep.analyze_overlaps(second, databases)
+        self.assertEqual(second.await_args_list, first.await_args_list)
+        self.assertEqual(second.await_args.args[0]['packages'], todo['packages'])
+        self.assertEqual(databases.await_count, 3)
+        self.assertEqual(len(self.requests), 4)
+        self.assertIn('/todo/', self.requests)
+        self.assertNotIn('/api/v1/todo/active/', self.requests)
+        self.assertEqual(self.cache.stat().st_mtime_ns, modified)
+
+        updated = todo | {'packages': []}
+        self.responses['/api/v1/todo/active/'] = (200, 'application/json', json.dumps(updated))
+        expired = cached_at - 60 * 60
+        os.utime(self.cache, (expired, expired))
+        self.requests.clear()
+        third = mock.AsyncMock()
+        await todogrep.analyze_overlaps(third, mock.AsyncMock())
+        third.assert_awaited_once_with(updated | {'url': '/todo/active/'})
+        self.assertIn('/todo/', self.requests)
+        self.assertIn('/api/v1/todo/active/', self.requests)
+        self.assertEqual(json.loads(self.cache.read_text()), updated | {'url': '/todo/active/'})
+
+    async def test_live_index_detects_new_completed_and_removed_todos_with_fresh_caches(self):
+        self.index({'active': 'incomplete', 'finished': 'incomplete', 'removed': 'incomplete'})
+        for slug in ('active', 'finished', 'removed', 'new'):
+            self.responses[f'/api/v1/todo/{slug}/'] = (
+                200, 'application/json', json.dumps({'name': slug, 'packages': []}))
+        await todogrep.analyze_overlaps(mock.AsyncMock(), mock.AsyncMock())
+        modified = self.cache.stat().st_mtime_ns
+
+        self.index({'active': 'incomplete', 'finished': 'complete', 'new': 'incomplete'})
+        self.requests.clear()
+        callback = mock.AsyncMock()
+        await todogrep.analyze_overlaps(callback, mock.AsyncMock())
+        self.assertEqual({call.args[0]['url'] for call in callback.await_args_list},
+                         {'/todo/active/', '/todo/new/'})
+        self.assertIn('/todo/', self.requests)
+        self.assertIn('/api/v1/todo/new/', self.requests)
+        self.assertNotIn('/api/v1/todo/active/', self.requests)
+        self.assertNotIn('/api/v1/todo/finished/', self.requests)
+        self.assertNotIn('/api/v1/todo/removed/', self.requests)
+        self.assertEqual(self.cache.stat().st_mtime_ns, modified)
+
+    async def test_empty_todo_list_is_fetched_live(self):
+        self.index({'finished': 'complete'})
+        await todogrep.analyze_overlaps(mock.AsyncMock(), mock.AsyncMock())
+        self.requests.clear()
+        callback = mock.AsyncMock()
+        await todogrep.analyze_overlaps(callback, mock.AsyncMock())
+        callback.assert_not_awaited()
+        self.assertEqual(len(self.requests), 4)
+        self.assertIn('/todo/', self.requests)
+
+    async def test_invalid_cache_is_refetched(self):
+        self.index({'active': 'incomplete'})
+        todo = {'name': 'Active', 'packages': []}
+        self.responses['/api/v1/todo/active/'] = (200, 'application/json', json.dumps(todo))
+        self.cache.parent.mkdir()
+        for content in (b'{', b'[]', b'{}', b'\xff'):
+            with self.subTest(content=content):
+                self.cache.write_bytes(content)
+                self.requests.clear()
+                await todogrep.analyze_overlaps(mock.AsyncMock(), mock.AsyncMock())
+                self.assertIn('/todo/', self.requests)
+                self.assertIn('/api/v1/todo/active/', self.requests)
+                self.assertEqual(json.loads(self.cache.read_text()), todo | {'url': '/todo/active/'})
+
+    async def test_unavailable_cache_does_not_prevent_live_check(self):
+        self.index({'active': 'incomplete'})
+        todo = {'name': 'Active', 'packages': []}
+        self.responses['/api/v1/todo/active/'] = (200, 'application/json', json.dumps(todo))
+        self.cache.parent.write_text('not a directory')
+        callback = mock.AsyncMock()
+        databases = mock.AsyncMock()
+        with self.assertLogs(todogrep.logger, level='WARNING') as captured:
+            await todogrep.analyze_overlaps(callback, databases)
+        self.assertIn('/todo/', self.requests)
+        callback.assert_awaited_once_with(todo | {'url': '/todo/active/'})
+        self.assertEqual(databases.await_count, 3)
+        self.assertTrue(any('Cannot save todo cache' in line for line in captured.output))
+
+    async def test_failed_refresh_keeps_expired_file_and_other_todos_are_cached_independently(self):
+        self.index({'active': 'incomplete'})
+        self.responses['/api/v1/todo/active/'] = (
+            200, 'application/json', json.dumps({'name': 'Active', 'packages': []}))
+        await todogrep.analyze_overlaps(mock.AsyncMock(), mock.AsyncMock())
+        original = self.cache.read_bytes()
+        expired = self.cache.stat().st_mtime - todogrep.TODO_CACHE_TTL
+        os.utime(self.cache, (expired, expired))
+        modified = self.cache.stat().st_mtime_ns
+
+        self.index({'new': 'incomplete', 'active': 'incomplete'})
+        self.responses['/api/v1/todo/new/'] = (
+            200, 'application/json', json.dumps({'name': 'New', 'packages': []}))
+        self.responses['/api/v1/todo/active/'] = (200, 'text/html', '<h1>Challenge</h1>')
+        with self.assertRaises(aiohttp.ContentTypeError):
+            await todogrep.analyze_overlaps(mock.AsyncMock(), mock.AsyncMock())
+        self.assertEqual(self.cache.read_bytes(), original)
+        self.assertEqual(self.cache.stat().st_mtime_ns, modified)
+
+        self.responses['/api/v1/todo/active/'] = (
+            200, 'application/json', json.dumps({'name': 'Unblocked', 'packages': []}))
+        self.requests.clear()
+        callback = mock.AsyncMock()
+        await todogrep.analyze_overlaps(callback, mock.AsyncMock())
+        self.assertIn('/todo/', self.requests)
+        self.assertIn('/api/v1/todo/active/', self.requests)
+        self.assertNotIn('/api/v1/todo/new/', self.requests)
+        self.assertEqual(callback.await_count, 2)
+        self.assertEqual(json.loads(self.cache.read_text())['name'], 'Unblocked')
+
     async def test_http_block_is_reported_before_callbacks(self):
+        self.index({'active': 'incomplete'})
+        self.responses['/api/v1/todo/active/'] = (
+            200, 'application/json', json.dumps({'name': 'Active', 'packages': []}))
+        await todogrep.analyze_overlaps(mock.AsyncMock(), mock.AsyncMock())
         self.responses['/todo/'] = (403, 'text/html', '<h1>Forbidden</h1>')
         todo_callback = mock.AsyncMock()
         db_callback = mock.AsyncMock()
