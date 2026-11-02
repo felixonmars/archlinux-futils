@@ -34,6 +34,7 @@ class BuildAuthTest < Minitest::Test
     @manager = Struct.new(:all_builds, :refresh_pending, :deferred_retries, :calls).new([@build], [], [], [])
     @manager.define_singleton_method(:find) { |id| all_builds.find { |build| build.id == id } }
     @manager.define_singleton_method(:overlay_branch_exists?) { |pkgbase| all_builds.any? { |build| build.pkgbase == pkgbase } }
+    @manager.define_singleton_method(:overlay_branches) { all_builds.to_h { |build| [build.pkgbase, true] } }
     @manager.define_singleton_method(:enqueue) do |command, **options|
       calls << [command, options]
       all_builds.first
@@ -203,6 +204,7 @@ class BuildAuthTest < Minitest::Test
     @build.environment = {'SWITCHBRANCH' => '1'}
     branches = ['test']
     @manager.define_singleton_method(:overlay_branch_exists?) { |pkgbase| branches.include?(pkgbase) }
+    @manager.define_singleton_method(:overlay_branches) { branches.to_h { |name| [name, true] } }
     editor = login
     ['/', '/builds/test/log'].each do |path|
       assert_includes request('GET', path, cookie: editor).body, 'action="/builds/test/push-branch"'

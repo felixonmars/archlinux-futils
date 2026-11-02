@@ -101,8 +101,9 @@ end
 class BuildDashboardTest < Minitest::Test
   def setup
     @builds = []
-    manager = Struct.new(:all_builds, :refresh_pending, :deferred_retries).new(@builds, [], [])
-    @app = WebApp.new(manager)
+    @manager = Struct.new(:all_builds, :refresh_pending, :deferred_retries, :overlay_branches).new(@builds, [], [], {})
+    @auth = GitHubAuth.new(editors: 'tester')
+    @app = WebApp.new(@manager, auth: @auth)
   end
 
   def add_build(id, command_line: 'example', status: 'failed', pkgbase: command_line.sub(/:nocheck\z/, ''))
@@ -115,11 +116,11 @@ class BuildDashboardTest < Minitest::Test
     build
   end
 
-  def dashboard(query = '')
+  def dashboard(query = '', editor: false)
     req = WEBrick::HTTPRequest.new(WEBrick::Config::HTTP)
     req.parse(StringIO.new("GET /#{query} HTTP/1.1\r\nHost: localhost\r\n\r\n"))
     res = WEBrick::HTTPResponse.new(WEBrick::Config::HTTP)
-    @app.call(req, res)
+    @auth.stub(:session, editor ? {login: 'tester', csrf: 'test-csrf'} : nil) { @app.call(req, res) }
     assert_equal 200, res.status
     res.body
   end
@@ -128,6 +129,66 @@ class BuildDashboardTest < Minitest::Test
     html.scan(/<article class="build-card .*?<\/article>/m).filter_map do |card|
       card[/href="\/builds\/([^"\/]+)\/log"/, 1] if card.include?('class="tag is-info latest-build"')
     end
+  end
+
+  def card_ids(html)
+    html.scan(%r{<h3><a href="/builds/([^/]+)/log"}).flatten
+  end
+
+  def test_upload_decisions_are_first_without_reordering_other_active_builds
+    add_build('queued', status: 'queued')
+    add_build('running-old', status: 'running')
+    add_build('waiting-old', status: 'waiting_upload')
+    add_build('running-new', status: 'running')
+    waiting = add_build('waiting-new', status: 'waiting_upload')
+    @builds.reverse!
+
+    assert_equal %w[waiting-new waiting-old running-new running-old queued], card_ids(dashboard(editor: true))
+    waiting.status = 'running'
+    assert_equal %w[waiting-old waiting-new running-new running-old queued], card_ids(dashboard(editor: true))
+  end
+
+  def test_pushable_latest_entries_are_pinned_before_pagination_and_branch_checks_are_batched
+    add_build('older', status: 'succeeded').environment = {'SWITCHBRANCH' => '1'}
+    add_build('push-first', command_line: 'example:nocheck', pkgbase: nil, status: 'succeeded').environment = {'SWITCHBRANCH' => '1'}
+    add_build('push-second', command_line: 'other', status: 'succeeded').environment = {'SWITCHBRANCH' => '1'}
+    add_build('missing-branch', command_line: 'missing', status: 'succeeded').environment = {'SWITCHBRANCH' => '1'}
+    add_build('not-opted-in', command_line: 'disabled', status: 'succeeded')
+    RECENT_PAGE_SIZE.times { |index| add_build("filler-#{index}", command_line: 'filler') }
+    checks = 0
+    branches = {'example' => true, 'other' => true, 'disabled' => true}
+    @manager.define_singleton_method(:overlay_branches) { checks += 1; branches }
+
+    html = dashboard(editor: true)
+    assert_equal 1, checks
+    assert_equal %w[push-second push-first] + (RECENT_PAGE_SIZE - 1).downto(2).map { |i| "filler-#{i}" }, card_ids(html)
+    assert_equal 2, html.scan('>Push branch</button>').size
+    html = dashboard('?page=2', editor: true)
+    assert_equal %w[filler-1 filler-0 not-opted-in missing-branch older], card_ids(html)
+    refute_includes html, '>Push branch</button>'
+
+    branches.clear
+    assert_equal (RECENT_PAGE_SIZE - 1).downto(0).map { |i| "filler-#{i}" }, card_ids(dashboard(editor: true))
+    assert_equal (RECENT_PAGE_SIZE - 1).downto(0).map { |i| "filler-#{i}" }, card_ids(dashboard)
+  end
+
+  def test_search_and_active_builds_do_not_promote_stale_push_actions
+    add_build('older', status: 'succeeded').environment = {'SWITCHBRANCH' => '1'}
+    add_build('newer', status: 'failed')
+    pushable = add_build('pushable', command_line: 'other', status: 'succeeded')
+    pushable.environment = {'SWITCHBRANCH' => '1'}
+    add_build('ordinary', command_line: 'ordinary', status: 'succeeded')
+    @manager.overlay_branches = {'example' => true, 'other' => true}
+
+    assert_equal %w[pushable ordinary older], card_ids(dashboard('?q=succeeded', editor: true))
+    html = dashboard('?q=example', editor: true)
+    assert_equal %w[newer older], card_ids(html)
+    refute_includes html, '>Push branch</button>'
+
+    add_build('active', command_line: 'other:nocheck', status: 'running', pkgbase: nil)
+    html = dashboard('?q=succeeded', editor: true)
+    assert_equal %w[active ordinary pushable older], card_ids(html)
+    refute_includes html, '>Push branch</button>'
   end
 
   def test_latest_marker_identifies_one_completed_build_per_pkgbase_for_every_terminal_status
@@ -345,12 +406,14 @@ class BuildPushBranchTest < Minitest::Test
     refute @manager.overlay_branch_exists?('missing')
     git('tag', 'tag-only')
     refute @manager.overlay_branch_exists?('tag-only')
+    assert_equal %w[example master], @manager.overlay_branches.keys.sort
     assert_includes app.send(:push_branch_button, @build), 'action="/builds/push-test/push-branch"'
 
     @manager.push_branch(@build.id)
 
     assert_pushed
     refute @manager.overlay_branch_exists?('example')
+    assert_equal ['master'], @manager.overlay_branches.keys
     assert_empty app.send(:push_branch_button, @build)
   end
 

@@ -689,6 +689,13 @@ class BuildManager
     false
   end
 
+  def overlay_branches
+    output, status = Open3.capture2e('git', 'for-each-ref', '--format=%(refname:strip=2)', 'refs/heads/', chdir: OVERLAY_REPO)
+    status.success? ? output.lines(chomp: true).to_h { |name| [name, true] } : {}
+  rescue SystemCallError
+    {}
+  end
+
   def push_branch(id)
     @overlay_mutex.synchronize do
       pkgbase = @mutex.synchronize do
@@ -1699,6 +1706,7 @@ class WebApp
 
   def render_index(req, error: nil)
     active, recent, latest_build_ids = build_history
+    active = active.partition { |build| build.status == 'waiting_upload' }.flatten
     search = req.query['q'].to_s.strip
     unless search.empty?
       terms = search.downcase.split
@@ -1708,6 +1716,16 @@ class WebApp
         terms.all? { |term| text.include?(term) }
       end
     end
+    push_branch_buttons = {}
+    branches = nil
+    recent.each do |build|
+      next if @read_only || !latest_build_ids.key?(build.id) || !build.can_push_branch?
+
+      branches ||= @manager.overlay_branches
+      button = push_branch_button(build, latest: true, branches: branches)
+      push_branch_buttons[build.id] = button unless button.empty?
+    end
+    recent = recent.partition { |build| push_branch_buttons.key?(build.id) }.flatten
     page_count = [(recent.size + RECENT_PAGE_SIZE - 1) / RECENT_PAGE_SIZE, 1].max
     page = [[req.query['page'].to_i, 1].max, page_count].min
     recent_page = recent[((page - 1) * RECENT_PAGE_SIZE), RECENT_PAGE_SIZE] || []
@@ -1766,7 +1784,7 @@ class WebApp
             </form>
           </div>
           <div class="build-list">
-            #{recent_page.empty? ? empty_state(recent_empty) : recent_page.map { |build| build_card(build, latest: latest_build_ids.key?(build.id)) }.join}
+            #{recent_page.empty? ? empty_state(recent_empty) : recent_page.map { |build| build_card(build, latest: latest_build_ids.key?(build.id), push_branch: push_branch_buttons.fetch(build.id, '')) }.join}
           </div>
           #{%(<div class="history-pagination">#{pagination}</div>) unless pagination.empty?}
         </section>
@@ -1799,7 +1817,7 @@ class WebApp
     HTML
   end
 
-  def build_card(build, latest: false)
+  def build_card(build, latest: false, push_branch: '')
     host = build.build_host
     unless host && build.package_version
       log, = read_log(build.log_path, 0, 65_536)
@@ -1828,7 +1846,7 @@ class WebApp
             <a class="raw-link" href="#{h(dashboard_path("builds/#{build.id}/raw"))}">Raw</a>
             #{stop_button(build)}
             #{retry_button(build) unless build.status == 'waiting_upload'}
-            #{push_branch_button(build, latest: latest)}
+            #{push_branch}
           </div>
         </div>
         #{%(<p class="help is-danger mb-1">#{h(build.note)}</p>) if build.note}
@@ -1931,11 +1949,12 @@ class WebApp
     HTML
   end
 
-  def push_branch_button(build, latest: nil)
+  def push_branch_button(build, latest: nil, branches: nil)
     return '' if @read_only || !build.can_push_branch?
     latest = build_history.last.key?(build.id) if latest.nil?
     return '' unless latest
-    return '' unless @manager.overlay_branch_exists?(build.pkgbase || build.command_line.sub(/:nocheck\z/, ''))
+    pkgbase = build.pkgbase || build.command_line.sub(/:nocheck\z/, '')
+    return '' unless branches ? branches.key?(pkgbase) : @manager.overlay_branch_exists?(pkgbase)
 
     <<~HTML
       <form class="inline" action="#{h(dashboard_path("builds/#{build.id}/push-branch"))}" method="post">
