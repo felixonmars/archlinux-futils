@@ -1052,7 +1052,7 @@ class GitHubAuth
   class Error < StandardError; end
 
   COOKIE = 'archriscv_buildd_session'
-  SESSION_SECONDS = 43_200
+  SESSION_SECONDS = 7 * 86_400
   CLI_SESSION_SECONDS = 30 * 86_400
 
   def initialize(client_id: ENV.fetch('ARCHRISCV_BUILDD_GITHUB_CLIENT_ID', ''),
