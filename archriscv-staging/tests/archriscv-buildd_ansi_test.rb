@@ -19,7 +19,7 @@ class AnsiLogTest < Minitest::Test
     res = WEBrick::HTTPResponse.new(WEBrick::Config::HTTP)
     @app.send(:show_log, nil, res, @build.id)
     script = res.body[/<script>(.*?)<\/script>/m, 1]
-    @parser = File.read(File.expand_path('../archriscv-log.js', __dir__))
+    @parser = LOG_JS
     @log_callback = script[/events\.addEventListener\('log', \(event\) => (.*?)\);/, 1]
   end
 

@@ -101,7 +101,7 @@ end
 class BuildDashboardTest < Minitest::Test
   def setup
     @builds = []
-    @manager = Struct.new(:all_builds, :refresh_pending, :deferred_retries, :overlay_branches).new(@builds, [], [], {})
+    @manager = Struct.new(:all_builds, :refresh_pending, :deferred_retries, :overlay_branches, :codex_sessions).new(@builds, [], [], {}, [])
     @auth = GitHubAuth.new(editors: 'tester')
     @app = WebApp.new(@manager, auth: @auth)
   end
@@ -797,7 +797,7 @@ class BuildRestartTest < Minitest::Test
     end
     File.write(builds.first.log_path, 'build output')
     deferred = {'build' => {'id' => 'later', 'command_line' => 'deferred-package'}, 'wait_for' => 'dependency'}
-    manager = Struct.new(:all_builds, :refresh_pending, :deferred_retries).new(builds, ['pending-package'], [deferred])
+    manager = Struct.new(:all_builds, :refresh_pending, :deferred_retries, :codex_sessions).new(builds, ['pending-package'], [deferred], [])
     manager.define_singleton_method(:find) { |id| all_builds.find { |build| build.id == id } }
     view = WebApp.new(manager)
     request = lambda do |method, path, app = view|

@@ -31,7 +31,7 @@ class BuildAuthTest < Minitest::Test
       public_url: 'https://buildd.example.com', editors: 'other,alloweduser')
     @build = Build.new(id: 'test', command_line: 'test', argv: ['test'], pkgbase: 'test',
       log_path: '/nonexistent-buildd-auth-test.log', status: 'waiting_upload')
-    @manager = Struct.new(:all_builds, :refresh_pending, :deferred_retries, :calls).new([@build], [], [], [])
+    @manager = Struct.new(:all_builds, :refresh_pending, :deferred_retries, :calls, :codex_sessions).new([@build], [], [], [], [])
     @manager.define_singleton_method(:find) { |id| all_builds.find { |build| build.id == id } }
     @manager.define_singleton_method(:overlay_branch_exists?) { |pkgbase| all_builds.any? { |build| build.pkgbase == pkgbase } }
     @manager.define_singleton_method(:overlay_branches) { all_builds.to_h { |build| [build.pkgbase, true] } }
