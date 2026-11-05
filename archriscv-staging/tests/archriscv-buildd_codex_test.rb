@@ -16,6 +16,49 @@ Object.send(:remove_const, :OVERLAY_REPO)
 OVERLAY_REPO = CODEX_TEST_ROOT
 Minitest.after_run { FileUtils.remove_entry(CODEX_TEST_ROOT) }
 
+class CodexReplayTest < Minitest::Test
+  IDLE = "\e[?2026h\e[39m\e[49m\e[0m\e[28;3H\e[?25h\e[?2026l".b
+
+  def test_reduces_long_idle_runs_but_keeps_real_output
+    replay = CodexReplay.new
+    assert_equal IDLE, replay.compact((IDLE + "\e]2;working\a") * 10_000)
+    ["text", "\e[1A", "\e[K", "\e[2;20r", "\e7", "\e[?6h"].each do |change|
+      assert_equal change + IDLE, replay.compact(change + IDLE * 2)
+    end
+    replay.resize
+    assert_equal IDLE, replay.compact(IDLE * 2)
+  end
+
+  def test_keeps_relative_redraws_printing_and_non_title_terminal_strings
+    relative = "\e[?2026h\e[1A\e[?2026l"
+    printing = "\e[?2026h\e[1;1Htext\e[?2026l"
+    strings = ["\e]8;;https://example.com\a", "\ePtext #{IDLE}\e\\", "\e]9;#{IDLE}\a",
+      "\e]2;aborted\x18visible\a", "\e]0;aborted\x1avisible\a", "\e]2;aborted\e[2J\a"]
+    data = relative * 3 + printing * 3 + strings.join
+    assert_equal data, CodexReplay.new.compact(data)
+  end
+
+  def test_chunk_boundaries_preserve_unfinished_sequences_and_utf8
+    [IDLE, "\e]2;⠋ title\a".b, "\eP#{IDLE}\e\\".b, "\e[31m", "café".b].each do |sequence|
+      (1...sequence.bytesize).each do |split|
+        replay = CodexReplay.new
+        first = sequence.byteslice(0, split)
+        assert_equal first, replay.compact(first)
+        # An already-emitted prefix must never be removed or duplicated.
+        assert_equal sequence.byteslice(split..), replay.compact(sequence.byteslice(split..))
+      end
+    end
+    replay = CodexReplay.new
+    unfinished = "\e]2;#{'x' * 65_536}"
+    assert_equal unfinished, replay.compact(unfinished)
+    assert_equal "\a#{IDLE * 2}", replay.compact("\a#{IDLE * 2}")
+    replay = CodexReplay.new
+    assert_equal "\e]2;", replay.compact("\e]2;")
+    replay.resize
+    assert_equal "title\a#{IDLE}", replay.compact("title\a#{IDLE * 2}")
+  end
+end
+
 class CodexTestService
   attr_reader :pids, :starts
   attr_accessor :failure
@@ -138,10 +181,11 @@ class CodexIntegrationTest < Minitest::Test
     @manager.codex_input(session.id, 'action' => 'input', 'data' => [text].pack('m0'))
   end
 
-  def request(method, path, editor: true, csrf: true, params: {}, body: nil)
+  def request(method, path, editor: true, csrf: true, params: {}, body: nil, encoding: nil)
     body ||= URI.encode_www_form(params)
     headers = "Host: buildd.example\r\nContent-Type: #{body.start_with?('{') ? 'application/json' : 'application/x-www-form-urlencoded'}\r\nContent-Length: #{body.bytesize}\r\n"
     headers += "X-CSRF-Token: test-csrf\r\n" if csrf
+    headers += "Accept-Encoding: #{encoding}\r\n" if encoding
     req = WEBrick::HTTPRequest.new(WEBrick::Config::HTTP)
     req.parse(StringIO.new("#{method} #{path} HTTP/1.1\r\n#{headers}\r\n#{body}"))
     res = WEBrick::HTTPResponse.new(WEBrick::Config::HTTP)
@@ -251,10 +295,51 @@ class CodexIntegrationTest < Minitest::Test
     assert_equal 'a' * 40_000 + 'b' * 200_000, events.filter_map { |event| event['data']&.unpack1('m0') }.join
     batches.each do |batch|
       assert_equal journal.bytesize, batch.fetch('finish')
-      assert_operator batch.fetch('events').sum { |event| event['data']&.unpack1('m0')&.bytesize || 0 }, :<=, 131_072
+      assert_operator batch.fetch('events').sum { |event| event['data']&.unpack1('m0')&.bytesize || 0 }, :<, 262_144
     end
     refute batches.last.fetch('more')
     assert_equal 'live', @manager.codex_frames(session.id, batches.last.fetch('cursor'))[:events].first.fetch('data').unpack1('m0')
+  end
+
+  def test_recording_compression_negotiation_compaction_and_raw_resume
+    session = CodexSession.new(id: 'a' * 24, status: 'exited')
+    @manager.instance_variable_get(:@codex_sessions)[session.id] = session
+    directory = File.join(CODEX_TEST_ROOT, 'codex', session.id)
+    FileUtils.mkdir_p(directory)
+    idle = CodexReplayTest::IDLE
+    bytes = "start\r\n" + (idle + "\e]2;idle\a") * 12_000 + "end\e[31"
+    File.binwrite(File.join(directory, 'output'), bytes)
+    [nil, 'identity', 'br, gzip', 'gzip;q=0', 'br, gzip;q=0.5'].each do |encoding|
+      response = request('GET', "/codex/#{session.id}/recording", encoding: encoding)
+      assert_equal 'no-store', response['Cache-Control']
+      assert_equal 'Accept-Encoding', response['Vary']
+      stream = StringIO.new
+      response.body.call(stream)
+      refute stream.closed?
+      compressed = ['br, gzip', 'br, gzip;q=0.5'].include?(encoding)
+      if compressed
+        assert_equal 'gzip', response['Content-Encoding']
+        assert_operator stream.string.bytesize, :<, bytes.bytesize / 100
+      else
+        assert_nil response['Content-Encoding']
+      end
+      body = compressed ? Zlib.gunzip(stream.string) : stream.string
+      batches = body.lines.map { |line| JSON.parse(line) }
+      output = batches.flat_map { |batch| batch.fetch('events') }.filter_map { |event| event['data']&.unpack1('m0') }.join
+      assert_operator output.bytesize, :<, bytes.bytesize / 100
+      assert output.start_with?("start\r\n#{idle}")
+      assert output.end_with?("end\e[31")
+      assert_equal bytes.bytesize, batches.last.fetch('cursor')
+      refute batches.last.fetch('more')
+    end
+    # A resumed request has no prior parser state: preserve every remaining byte,
+    # including a suffix that completes the browser's unfinished escape sequence.
+    resumed = request('GET', "/codex/#{session.id}/recording?cursor=#{bytes.bytesize - 2}", encoding: 'gzip')
+    stream = StringIO.new
+    resumed.body.call(stream)
+    events = Zlib.gunzip(stream.string).lines.flat_map { |line| JSON.parse(line).fetch('events') }
+    assert_equal '31', events.map { |event| event.fetch('data').unpack1('m0') }.join
+    assert_equal bytes, File.binread(File.join(directory, 'output'))
   end
 
   def test_incomplete_frame_is_retried_and_legacy_output_is_bounded

@@ -8,6 +8,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const {spawn} = require('node:child_process');
+const http = require('node:http');
+const {gunzipSync} = require('node:zlib');
 
 (async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-browser-'));
@@ -40,7 +42,12 @@ const {spawn} = require('node:child_process');
   resize(110, 40);
   for (let i = 0; i < 600; i++) output(`\x1b[${i % 2 ? 31 : 32}mhistory ${i} ${'wrapped '.repeat(i % 20)}\x1b[0m\r\n`);
   output('\x1b[38;1Hworking…\x1b[K'.repeat(70000));
+  const idle = '\x1b[?2026h\x1b[39m\x1b[49m\x1b[0m\x1b[38;3H\x1b[?25h\x1b[?2026l';
+  output((idle + '\x1b]2;working\x07').repeat(12000));
+  output('\x1b]2;cancelled\x18visible\x07\x1b]0;cancelled\x1avisible\x07');
+  output('\x1b]2;cancelled\x1b[1Avisible\x07');
   resize(87, 39);
+  output(idle.repeat(2));
   output('\x1b[8;5Hsaved\x1b7\x1b[2;35r\x1b[12;4Hactive\x1b[?25l\x1b[6n\x1b[33');
 
   const server = spawn('ruby', ['-e', `
@@ -190,6 +197,12 @@ const {spawn} = require('node:child_process');
     await ready();
     await compare();
 
+    // Exercise the decoder used by browsers without Uint8Array.fromBase64.
+    await page.addInitScript(() => { Uint8Array.fromBase64 = undefined; });
+    await page.reload();
+    await ready();
+    await compare();
+
     setState({status: 'running', activity: 'working'});
     await page.reload();
     await ready();
@@ -259,6 +272,20 @@ const {spawn} = require('node:child_process');
 
     if (process.argv[3]) {
       for (const name of ['output', 'frames']) fs.copyFileSync(path.join(process.argv[3], name), path.join(recording, name));
+      const wire = await new Promise((resolve, reject) => {
+        http.get(`${url}/recording`, {headers: {'Accept-Encoding': 'gzip'}}, response => {
+          const chunks = [];
+          response.on('data', chunk => chunks.push(chunk));
+          response.on('end', () => resolve({headers: response.headers, bytes: Buffer.concat(chunks)}));
+          response.on('error', reject);
+        }).on('error', reject);
+      });
+      assert.equal(wire.headers['content-encoding'], 'gzip');
+      const payload = gunzipSync(wire.bytes).toString();
+      const batches = payload.trim().split('\n').map(line => JSON.parse(line));
+      const replayBytes = batches.flatMap(batch => batch.events).reduce((total, event) =>
+        total + (event.data ? Buffer.from(event.data, 'base64').length : 0), 0);
+      console.log(`Recording transfer: ${wire.bytes.length} compressed bytes; ${replayBytes} terminal bytes in ${batches.length} batches`);
       let requests = 0;
       page.on('request', request => { if (request.url().includes('/recording?')) requests++; });
       started = performance.now();

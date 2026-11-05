@@ -14,9 +14,11 @@ require 'rbconfig'
 require 'securerandom'
 require 'shellwords'
 require 'socket'
+require 'strscan'
 require 'time'
 require 'timeout'
 require 'webrick'
+require 'zlib'
 
 APP_NAME = 'archriscv-buildd'
 APP_TITLE = 'Arch Linux RISC-V Build Scheduler'
@@ -507,6 +509,54 @@ class CodexSession < Struct.new(:id, :build_id, :pkgbase, :unit_name, :status, :
 
   def active?
     %w[queued running].include?(status)
+  end
+end
+
+# Ignore repeated absolute cursor/style-only redraws during replay. These cannot
+# change screen contents. Keep text, relative movement, erases, and terminal
+# strings intact, and never optimize through an unfinished escape sequence.
+# Historical window titles are unused: activity comes from the live status API.
+class CodexReplay
+  IDLE = /\e\[\?2026h(?:\e\[[0-9;]*[Hm]|\e\[\?25[hl])+\e\[\?2026l/n
+  TOKEN = /\e\][^\a]*?(?:\a|\e\\)|\e[PX^_].*?\e\\|\e\[[0-?]*[ -\/]*[@-~]|\e(?![\[\]PX^_])[ -\/]*[0-~]|[^\e]+/mn
+
+  def initialize
+    @tail = ''.b
+    @previous = nil
+  end
+
+  def compact(data)
+    return data unless @tail
+
+    prefix = @tail.bytesize
+    scanner = StringScanner.new(@tail + data)
+    output = ''.b
+    until scanner.eos?
+      start = scanner.pos
+      idle = scanner.scan(IDLE)
+      token = idle || scanner.scan(TOKEN)
+      unless token
+        @tail = scanner.rest
+        # An unusually large unfinished string is passed through unchanged.
+        @tail = nil if @tail.bytesize > 65_536
+        output << scanner.rest.byteslice([prefix - start, 0].max..).to_s
+        return output
+      end
+      title = token.match?(/\A\e\](?:0|2);[^\e\a\x18\x1a]*(?:\a|\e\\)\z/n)
+      redundant = start >= prefix && (title || (idle && idle == @previous))
+      if idle
+        @previous = idle
+      elsif !title
+        @previous = nil
+      end
+      output << token.byteslice([prefix - start, 0].max..).to_s unless redundant
+    end
+    @tail = ''.b
+    output
+  end
+
+  def resize
+    @previous = nil
   end
 end
 
@@ -2784,19 +2834,59 @@ class WebApp
         res['Content-Type'] = 'application/json'
         res.body = JSON.generate(@manager.codex_output(id, Integer(req.query.fetch('offset', '0'), 10)))
       when ['GET', 'recording']
-        result = @manager.codex_frames(id, Integer(req.query.fetch('cursor', '0'), 10))
+        cursor = Integer(req.query.fetch('cursor', '0'), 10)
+        result = @manager.codex_frames(id, cursor)
+        replay = CodexReplay.new if cursor.zero?
         res['Content-Type'] = 'application/x-ndjson'
         res['Cache-Control'] = 'no-store'
+        res['Vary'] = 'Accept-Encoding'
+        compress = req['accept-encoding'].to_s.split(',').any? do |encoding|
+          name, quality = encoding.strip.split(/\s*;\s*q=/i, 2)
+          name.casecmp?('gzip') && (!quality || quality.to_f.positive?)
+        end
+        res['Content-Encoding'] = 'gzip' if compress
         res.chunked = true
         # One streamed response avoids a network round trip per replay chunk.
         # Its fixed endpoint lets attachment finish even while Codex is writing.
         res.body = proc do |output|
+          gzip = Zlib::GzipWriter.new(output) if compress
           loop do
-            output.write(JSON.generate(result) + "\n")
+            events = []
+            bytes = 0
+            deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 0.1
+            loop do
+              result[:events].each do |event|
+                if event['data']
+                  data = event['data'].unpack1('m0')
+                  data = replay.compact(data) if replay
+                  bytes += data.bytesize
+                  if events.last&.key?('data')
+                    events.last['data'] << data
+                  elsif !data.empty?
+                    events << {'data' => data}
+                  end
+                else
+                  replay&.resize
+                  events << event
+                end
+              end
+              # Keep compacted batches useful without delaying progress on a
+              # long idle recording. One source batch can add up to 128 KiB.
+              break if !result[:more] || bytes >= 131_072 || events.size >= 256 ||
+                Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+
+              result = @manager.codex_frames(id, result[:cursor], finish: result[:finish])
+            end
+            events.each { |event| event['data'] = [event['data']].pack('m0') if event['data'] }
+            result[:events] = events
+            (gzip || output).write(JSON.generate(result) + "\n")
+            gzip&.flush(Zlib::SYNC_FLUSH)
             break unless result[:more]
 
             result = @manager.codex_frames(id, result[:cursor], finish: result[:finish])
           end
+        ensure
+          gzip&.finish
         end
       when ['GET', 'frames']
         res['Content-Type'] = 'application/json'
@@ -3230,7 +3320,13 @@ CODEX_TERMINAL_JS = <<~'JAVASCRIPT'
     const view = container.querySelector('.xterm');
     view.style.visibility = 'hidden';
     container.setAttribute('aria-busy', 'true');
-    const decode = data => Uint8Array.from(atob(data), char => char.charCodeAt(0));
+    function decode(data) {
+      if (Uint8Array.fromBase64) return Uint8Array.fromBase64(data);
+      const text = atob(data);
+      const bytes = new Uint8Array(text.length);
+      for (let i = 0; i < text.length; i++) bytes[i] = text.charCodeAt(i);
+      return bytes;
+    }
     const write = data => new Promise(resolve => terminal.write(data, resolve));
     let cursor = 0;
     let legacy = false;
