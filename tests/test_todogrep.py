@@ -82,9 +82,9 @@ class TodoGrepTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({call.args[0]['url'] for call in todo_callback.await_args_list},
                          {f'/todo/{slug}/' for slug in states})
         self.assertEqual({call.args[0] for call in db_callback.await_args_list},
-                         {'core-staging', 'extra-staging', 'multilib-staging'})
+                         set(todogrep.REPOSITORIES))
         self.assertNotIn('/api/v1/todo/finished/', self.requests)
-        self.assertEqual(len(self.requests), len(states) + 4)
+        self.assertEqual(len(self.requests), len(states) + len(todogrep.REPOSITORIES) + 1)
 
     async def test_todo_details_are_cached_for_one_day_but_index_and_databases_are_live(self):
         self.index({'active': 'incomplete'})
@@ -105,8 +105,8 @@ class TodoGrepTest(unittest.IsolatedAsyncioTestCase):
         await todogrep.analyze_overlaps(second, databases)
         self.assertEqual(second.await_args_list, first.await_args_list)
         self.assertEqual(second.await_args.args[0]['packages'], todo['packages'])
-        self.assertEqual(databases.await_count, 3)
-        self.assertEqual(len(self.requests), 4)
+        self.assertEqual(databases.await_count, len(todogrep.REPOSITORIES))
+        self.assertEqual(len(self.requests), len(todogrep.REPOSITORIES) + 1)
         self.assertIn('/todo/', self.requests)
         self.assertNotIn('/api/v1/todo/active/', self.requests)
         self.assertEqual(self.cache.stat().st_mtime_ns, modified)
@@ -151,7 +151,7 @@ class TodoGrepTest(unittest.IsolatedAsyncioTestCase):
         callback = mock.AsyncMock()
         await todogrep.analyze_overlaps(callback, mock.AsyncMock())
         callback.assert_not_awaited()
-        self.assertEqual(len(self.requests), 4)
+        self.assertEqual(len(self.requests), len(todogrep.REPOSITORIES) + 1)
         self.assertIn('/todo/', self.requests)
 
     async def test_invalid_cache_is_refetched(self):
@@ -179,7 +179,7 @@ class TodoGrepTest(unittest.IsolatedAsyncioTestCase):
             await todogrep.analyze_overlaps(callback, databases)
         self.assertIn('/todo/', self.requests)
         callback.assert_awaited_once_with(todo | {'url': '/todo/active/'})
-        self.assertEqual(databases.await_count, 3)
+        self.assertEqual(databases.await_count, len(todogrep.REPOSITORIES))
         self.assertTrue(any('Cannot save todo cache' in line for line in captured.output))
 
     async def test_failed_refresh_keeps_expired_file_and_other_todos_are_cached_independently(self):
@@ -302,6 +302,24 @@ class TodoGrepTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(todogrep.handler.level, logging.DEBUG)
         self.assertTrue(any('ERROR:' in line and 'base overlaps' in line for line in captured.output))
         self.assertTrue(any('WARNING:' in line and 'base overlaps' in line for line in captured.output))
+
+    async def test_pkgbase_mode_matches_only_the_supplied_pkgbases(self):
+        async def overlaps(todo_callback, db_callback):
+            await todo_callback({'packages': [{'pkgname': 'split', 'pkgbase': 'base'}],
+                                 'kind': 'Rebuild', 'url': '/todo/example/', 'name': 'Example'})
+
+        with mock.patch.object(todogrep, 'analyze_overlaps', side_effect=overlaps):
+            self.assertEqual(await todogrep.main(['--pkgbase', 'base', 'other']), 1)
+            self.assertEqual(await todogrep.main(['--pkgbase', 'split']), 0)
+
+    async def test_missing_arguments_read_a_pkgbase_list_from_stdin(self):
+        async def overlaps(todo_callback, db_callback):
+            await todo_callback({'packages': [{'pkgname': 'split', 'pkgbase': 'base'}],
+                                 'kind': 'Rebuild', 'url': '/todo/example/', 'name': 'Example'})
+
+        with mock.patch.object(todogrep, 'analyze_overlaps', side_effect=overlaps):
+            with mock.patch.object(todogrep.sys, 'stdin', io.StringIO('base\n\nother\n')):
+                self.assertEqual(await todogrep.main(['--pkgbase']), 1)
 
 
 if __name__ == '__main__':

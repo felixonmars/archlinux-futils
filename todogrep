@@ -16,6 +16,10 @@ from urllib.parse import quote
 
 ARCHWEB = "https://archlinux.org"
 MIRROR = "https://mirror.pkgbuild.com/"
+REPOSITORIES = (
+    "core-staging", "extra-staging", "multilib-staging",
+    "core-testing", "extra-testing", "multilib-testing",
+)
 TODO_CACHE_DIR = os.path.expanduser('~/.cache/todogrep')
 TODO_CACHE_TTL = 24 * 60 * 60
 
@@ -105,8 +109,7 @@ async def analyze_overlaps(todo_callback, db_callback):
             if 'id="dev-todo-lists"' not in todolist_page or len(todolist) != len(completelist):
                 raise ValueError(f"{resp.url}: expected a todo list, possibly blocked by the firewall")
 
-        tasks = [get_db(db, session, db_callback)
-                 for db in ("core-staging", "extra-staging", "multilib-staging")]
+        tasks = [get_db(db, session, db_callback) for db in REPOSITORIES]
         tasks.extend(get_todo(todo_url, session, todo_callback)
                      for todo_url, iscomplete in zip(todolist, completelist)
                      if iscomplete == "incomplete")
@@ -117,10 +120,10 @@ async def analyze_overlaps(todo_callback, db_callback):
             nonlocal completed
             result = await task
             completed += 1
-            handler.show_progress(f'[{completed}/{len(tasks)}] Checking todos and staging repositories')
+            handler.show_progress(f'[{completed}/{len(tasks)}] Checking todos and repositories')
             return result
 
-        handler.show_progress(f'[0/{len(tasks)}] Checking todos and staging repositories')
+        handler.show_progress(f'[0/{len(tasks)}] Checking todos and repositories')
         try:
             return await asyncio.gather(*(with_progress(task) for task in tasks))
         finally:
@@ -130,13 +133,20 @@ async def main(argv=None):
     parser = argparse.ArgumentParser(
         description='Grep for packages in ongoing todos',
         epilog='Individual todo details are cached for 24 hours in ~/.cache/todogrep/; '
-               'the todo index and staging repositories are always fetched live. '
+               'the todo index and repositories are always fetched live. With no positional '
+               'arguments, read one package or pkgbase per line from standard input. '
                'Exit status: 0 if no overlaps are found, 1 if any are found, 2 if the check fails.')
     parser.add_argument('-b', '--pkgbase', action='store_true', help='Look for pkgbases instead of pkgnames')
     parser.add_argument('-d', '--debug', action='store_true', help='Enable debug logging')
     parser.add_argument('--log-file', metavar='PATH', help='Save debug output and failure tracebacks to a file')
-    parser.add_argument('package', nargs='+', help='Packages to look for')
+    parser.add_argument('package', nargs='*', help='Packages or pkgbases to look for')
     args = parser.parse_args(argv)
+    if not args.package:
+        if sys.stdin.isatty():
+            parser.error('at least one package or pkgbase is required')
+        args.package = [line.strip() for line in sys.stdin if line.strip()]
+        if not args.package:
+            parser.error('standard input did not contain any packages or pkgbases')
 
     logger.setLevel(logging.DEBUG if args.debug or args.log_file else logging.INFO)
     handler.setLevel(logging.DEBUG if args.debug else logging.INFO)
@@ -157,7 +167,8 @@ async def main(argv=None):
                 if package is None:
                     # Package was removed
                     continue
-                if args.pkgbase and package["pkgbase"] == p or package["pkgname"] == p:
+                if ((args.pkgbase and package["pkgbase"] == p)
+                        or (not args.pkgbase and package["pkgname"] == p)):
                     matched = True
                     if todo["kind"] == "Rebuild":
                         logger.error(f"{p} overlaps with {todo['url']}: {todo['name']}")
@@ -175,7 +186,8 @@ async def main(argv=None):
             db_handle = handle.register_syncdb(db, 0)
             for package in db_handle.search(""):
                 for p in args.package:
-                    if args.pkgbase and package.base == p or package.name == p:
+                    if ((args.pkgbase and package.base == p)
+                            or (not args.pkgbase and package.name == p)):
                         matched = True
                         logger.error(f"{p} is already in [{db}]")
 
