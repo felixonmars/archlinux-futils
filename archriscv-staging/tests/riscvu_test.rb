@@ -70,7 +70,13 @@ class RiscvuTest < Minitest::Test
           cat "$RVPATCHREPO/$PKGNAME/branch" > "$RISCVU_TEST_BRANCH_CAPTURE"
         fi
       }
-      felixbuild-server-select() { printf 'test-builder\n'; }
+      felixbuild-server-select() {
+        if [[ "$RISCVU_TEST_SELECT_EXIT" != 0 ]]; then
+          printf 'No eligible servers for %s (riscv64) after applying package restrictions\n' "$PKGBASE" >&2
+          return "$RISCVU_TEST_SELECT_EXIT"
+        fi
+        printf 'test-builder\n'
+      }
       felixbuild() {
         printf '%s\0' "$@" > "$RISCVU_TEST_CAPTURE"
         printf 'Running %s\n' "$*"
@@ -91,11 +97,12 @@ class RiscvuTest < Minitest::Test
   end
 
   def run_build(keepchroot: nil, noupload: nil, switchbranch: nil, exit_status: 0, add_exit_status: 0, nocheck: true,
-      pkgbase: 'example', environment: {})
+      pkgbase: 'example', select_exit_status: 0, environment: {})
     Open3.capture3(
       {'KEEPCHROOT' => keepchroot, 'NOUPLOAD' => noupload, 'SWITCHBRANCH' => switchbranch, 'FORCE_PKGVER' => nil,
        'RVPATCHREPO' => @overlay, 'RISCVU_TEST_BRANCH_CAPTURE' => @branch_capture,
        'RISCVU_TEST_CAPTURE' => @capture, 'RISCVU_TEST_EXIT' => exit_status.to_s,
+       'RISCVU_TEST_SELECT_EXIT' => select_exit_status.to_s,
        'RISCVU_TEST_ADD_EXIT' => add_exit_status.to_s, 'RISCVU_TEST_MKTEMP_CAPTURE' => @mktemp_capture,
        'RISCVU_TEST_TMPDIR' => @root, 'RISCVU_TEST_FELIXBUILD' => File.expand_path('../../felixbuild', __dir__)}.merge(environment),
       'bash', @harness, File.expand_path('../riscvu', __dir__), "#{pkgbase}#{':nocheck' if nocheck}", '--testing',
@@ -186,6 +193,17 @@ class RiscvuTest < Minitest::Test
     refute File.exist?(@capture)
     assert_equal 'master', overlay_git('branch', '--show-current')
     assert_empty Dir.glob(File.join(@root, 'tmp.*'))
+  end
+
+  def test_server_selection_failure_stops_before_building_in_both_upload_modes
+    [nil, '1'].each do |noupload|
+      output, error, status = run_build(noupload: noupload, select_exit_status: 1)
+      assert_equal 1, status.exitstatus, "#{output}\n#{error}"
+      assert_includes error, 'No eligible servers for example (riscv64)'
+      refute File.exist?(@capture)
+      refute_includes output, '.nocheck'
+      assert_empty Dir.glob(File.join(@root, 'tmp.*'))
+    end
   end
 
   def test_concurrent_builds_copy_independent_overlay_snapshots

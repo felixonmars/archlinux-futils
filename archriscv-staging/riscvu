@@ -100,7 +100,7 @@ mkdir "$WORKDIR/overlay" || exit 1
 tar -xf "$WORKDIR/overlay.tar" -C "$WORKDIR/overlay" || exit 1
 export RVPATCHREPO="$WORKDIR/overlay"
 
-SERVER=$(felixbuild-server-select riscv64)
+SERVER=$(felixbuild-server-select riscv64) || exit 1
 
 if [[ "$NOUPLOAD" == "1" ]]; then
     SYNCBACKPKGBUILD=1 felixbuild $SERVER pkgctl build --arch riscv64 "${chroot_args[@]}" $CMD $nocheck || exit 1
