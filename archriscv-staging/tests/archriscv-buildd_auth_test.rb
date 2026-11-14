@@ -31,7 +31,7 @@ class BuildAuthTest < Minitest::Test
       public_url: 'https://buildd.example.com', editors: 'other,alloweduser')
     @build = Build.new(id: 'test', command_line: 'test', argv: ['test'], pkgbase: 'test',
       log_path: '/nonexistent-buildd-auth-test.log', status: 'waiting_upload')
-    @manager = Struct.new(:all_builds, :refresh_pending, :deferred_retries, :calls, :codex_sessions).new([@build], [], [], [], [])
+    @manager = Struct.new(:all_builds, :refresh_pending, :deferred_retries, :calls, :codex_sessions, :refresh_queue).new([@build], [], [], [], [])
     @manager.define_singleton_method(:find) { |id| all_builds.find { |build| build.id == id } }
     @manager.define_singleton_method(:overlay_branch_exists?) { |pkgbase| all_builds.any? { |build| build.pkgbase == pkgbase } }
     @manager.define_singleton_method(:overlay_branches) { all_builds.to_h { |build| [build.pkgbase, true] } }
@@ -282,6 +282,27 @@ class BuildAuthTest < Minitest::Test
     @auth.instance_variable_set(:@editors, [])
     assert_equal 403, request('POST', '/builds', cookie: editor, params: {_csrf: token}).status
     assert_empty @manager.calls
+  end
+
+  def test_refresh_queue_status_requires_an_editor_and_submission_requires_csrf
+    @manager.refresh_queue = {'running' => true, 'total' => 2, 'processed' => 1, 'queued' => 1, 'errors' => []}
+    @manager.define_singleton_method(:enqueue_refresh) do |packages|
+      calls << packages
+      packages.size
+    end
+    assert_equal 403, request('GET', '/refresh/status').status
+    assert_equal 403, request('HEAD', '/refresh/status').status
+    assert_equal 403, request('GET', '/refresh/status', cookie: login('UnlistedUser')).status
+    editor = login
+    response = request('GET', '/refresh/status', cookie: editor)
+    assert_equal 200, response.status
+    assert_equal 'no-store', response['Cache-Control']
+    assert_equal @manager.refresh_queue, JSON.parse(response.body)
+    assert_equal 403, request('POST', '/refresh/add', cookie: editor, params: {pkgbase: 'example'}).status
+    assert_empty @manager.calls
+    response = request('POST', '/refresh/add', cookie: editor, params: {pkgbase: 'example', _csrf: csrf(editor)})
+    assert_equal 303, response.status
+    assert_equal [['example']], @manager.calls
   end
 
   def test_shared_app_keeps_concurrent_request_permissions_separate

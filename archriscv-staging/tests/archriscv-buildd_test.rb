@@ -101,7 +101,7 @@ end
 class BuildDashboardTest < Minitest::Test
   def setup
     @builds = []
-    @manager = Struct.new(:all_builds, :refresh_pending, :deferred_retries, :overlay_branches, :codex_sessions).new(@builds, [], [], {}, [])
+    @manager = Struct.new(:all_builds, :refresh_pending, :deferred_retries, :overlay_branches, :codex_sessions, :refresh_queue).new(@builds, [], [], {}, [])
     @auth = GitHubAuth.new(editors: 'tester')
     @app = WebApp.new(@manager, auth: @auth)
   end
@@ -797,7 +797,7 @@ class BuildRestartTest < Minitest::Test
     end
     File.write(builds.first.log_path, 'build output')
     deferred = {'build' => {'id' => 'later', 'command_line' => 'deferred-package'}, 'wait_for' => 'dependency'}
-    manager = Struct.new(:all_builds, :refresh_pending, :deferred_retries, :codex_sessions).new(builds, ['pending-package'], [deferred], [])
+    manager = Struct.new(:all_builds, :refresh_pending, :deferred_retries, :codex_sessions, :refresh_queue).new(builds, ['pending-package'], [deferred], [])
     manager.define_singleton_method(:find) { |id| all_builds.find { |build| build.id == id } }
     view = WebApp.new(manager)
     request = lambda do |method, path, app = view|
@@ -836,6 +836,7 @@ class BuildRestartTest < Minitest::Test
     actions.each { |path| assert_equal 403, request.call('POST', path).status }
     %w[PUT PATCH DELETE].each { |method| assert_equal 403, request.call(method, '/').status }
     assert_equal 403, request.call('GET', '/builds/running/stop').status
+    assert_equal 403, request.call('GET', '/refresh/status').status
     assert_includes request.call('GET', '/', editor_app(manager)).body, 'method="post"'
   end
 
@@ -853,6 +854,212 @@ class BuildRestartTest < Minitest::Test
     assert_equal 400, response.status
     assert_includes response.body, 'refresh failed'
     assert_equal %w[candidate-one candidate-two], @manager.refresh_pending
+  end
+
+  def refresh_status
+    req = WEBrick::HTTPRequest.new(WEBrick::Config::HTTP)
+    req.parse(StringIO.new("GET /refresh/status HTTP/1.1\r\nHost: localhost\r\n\r\n"))
+    res = WEBrick::HTTPResponse.new(WEBrick::Config::HTTP)
+    editor_app.call(req, res)
+    assert_equal 200, res.status
+    JSON.parse(res.body)
+  end
+
+  def wait_for_refresh
+    wait_for do
+      queue = @manager.refresh_queue
+      queue unless queue['running']
+    end
+  end
+
+  def test_bulk_refresh_redirects_and_status_remains_available_while_database_sync_is_blocked
+    packages = 100.times.map { |index| "candidate-#{index}" }
+    write_json(STATE_FILE, 'refresh_pending' => packages)
+    @manager = new_manager
+    entered = Queue.new
+    release = Queue.new
+    sync = lambda do |*args|
+      assert_equal ['pacman', '-Sy'], args
+      entered << true
+      release.pop
+      ['', Struct.new(:success?).new(true)]
+    end
+    @service.stub(:start, nil) do
+      Open3.stub(:capture2e, sync) do
+        begin
+          body = URI.encode_www_form(packages.map { |pkgbase| ['pkgbase', pkgbase] })
+          response = Timeout.timeout(2) { post_request('/refresh/add', body) }
+          assert_equal 303, response.status
+          assert_includes CGI.unescape(response['Location']), 'queueing 100 package(s) in the background'
+          Timeout.timeout(2) { entered.pop }
+          queue = Timeout.timeout(2) { refresh_status }
+          assert_equal({'running' => true, 'total' => 100, 'processed' => 0, 'queued' => 0, 'errors' => []}, queue)
+          queue['errors'] << 'must not mutate manager state'
+          assert_empty @manager.refresh_queue['errors']
+          assert_equal packages, @manager.refresh_pending
+          assert_equal 400, post_request('/refresh/add', body).status
+          assert_equal 400, post_request('/refresh/clear', body).status
+          html = editor_app.send(:refresh_panel, packages)
+          assert_includes html, '<fieldset disabled>'
+          assert_includes html, 'Queueing: 0 / 100 processed, 0 queued.'
+          assert_includes html, 'data-status-url="/refresh/status"'
+          release << true
+          result = wait_for_refresh
+          assert_equal 100, result['processed']
+          assert_equal 100, result['queued']
+          assert_empty result['errors']
+          assert_empty @manager.refresh_pending
+          assert_equal packages.sort, @manager.all_builds.map(&:pkgbase).sort
+          refute_includes editor_app.send(:refresh_panel, []), '<fieldset disabled>'
+          assert_empty entered
+        ensure
+          release << true
+          @manager.shutdown
+        end
+      end
+    end
+  end
+
+  def test_refresh_sync_failure_is_reported_and_can_be_retried_without_losing_packages
+    refresh_request
+    Open3.stub(:capture2e, ["error: <database locked>\n", Struct.new(:success?).new(false)]) do
+      assert_equal 303, post_request('/refresh/add', 'pkgbase=candidate-one').status
+      result = wait_for_refresh
+      assert_equal 0, result['processed']
+      assert_equal 0, result['queued']
+      assert_equal ['pacman -Sy failed: error: <database locked>'], result['errors']
+      assert_empty @manager.all_builds
+      assert_equal %w[candidate-one candidate-two], @manager.refresh_pending
+      html = editor_app.send(:refresh_panel, @manager.refresh_pending)
+      assert_includes html, 'error: &lt;database locked&gt;'
+      refute_includes html, '<fieldset disabled>'
+    end
+    Open3.stub(:capture2e, ['', Struct.new(:success?).new(true)]) do
+      assert_equal 303, post_request('/refresh/add', 'pkgbase=candidate-one').status
+      assert_equal 1, wait_for_refresh['queued']
+    end
+    assert_equal ['candidate-two'], @manager.refresh_pending
+  end
+
+  def test_refresh_progress_and_dashboard_remain_available_during_worker_startup
+    refresh_request
+    entered = Queue.new
+    release = Queue.new
+    start = lambda do |build, _directory|
+      entered << build.id
+      release.pop
+    end
+    @service.stub(:start, start) do
+      Open3.stub(:capture2e, ['', Struct.new(:success?).new(true)]) do
+        begin
+          assert_equal 303, Timeout.timeout(2) { post_request('/refresh/add', 'pkgbase=candidate-one&pkgbase=candidate-two') }.status
+          id = Timeout.timeout(2) { entered.pop }
+          Timeout.timeout(2) do
+            assert_equal 1, refresh_status['queued']
+            assert_equal 1, @manager.all_builds.size
+            req = Struct.new(:query).new({})
+            assert_includes editor_app.send(:render_index, req), 'Queueing: 1 / 2 processed, 1 queued.'
+            @manager.instance_variable_get(:@mutex).synchronize do
+              @manager.send(:refresh_workers_locked, check_units: true)
+            end
+            assert_equal 'queued', @manager.find(id).status
+            assert_includes assert_raises(ArgumentError) { @manager.stop_build(id) }.message, 'build worker is starting'
+          end
+          release.close
+          assert_equal 2, wait_for_refresh['queued']
+        ensure
+          release.close
+          @manager.shutdown
+        end
+      end
+    end
+  end
+
+  def test_refresh_worker_startup_failure_is_visible_and_does_not_abort_the_batch
+    refresh_request
+    start = lambda do |build, _directory|
+      raise 'systemd launch failed' if build.pkgbase == 'candidate-one'
+    end
+    @service.stub(:start, start) do
+      Open3.stub(:capture2e, ['', Struct.new(:success?).new(true)]) do
+        _, stderr = capture_io do
+          @manager.enqueue_refresh(%w[candidate-one candidate-two])
+          result = wait_for_refresh
+          assert_equal 2, result['processed']
+          assert_equal 2, result['queued']
+          assert_equal ['candidate-one: systemd launch failed'], result['errors']
+        end
+        assert_includes stderr, 'systemd launch failed'
+      end
+    end
+    builds = @manager.all_builds.to_h { |build| [build.pkgbase, build] }
+    assert_equal 'failed', builds['candidate-one'].status
+    assert_equal 'systemd launch failed', builds['candidate-one'].note
+    assert_equal 'queued', builds['candidate-two'].status
+    assert_empty @manager.refresh_pending
+  end
+
+  def test_refresh_queue_keeps_failed_entries_and_continues_with_other_packages
+    refresh_request
+    @service.stub(:start, nil) do
+      @manager.enqueue('candidate-one')
+      Open3.stub(:capture2e, ['', Struct.new(:success?).new(true)]) do
+        assert_equal 303, post_request('/refresh/add', 'pkgbase=candidate-one&pkgbase=candidate-two&pkgbase=candidate-two&pkgbase=missing&pkgbase=bad%3Bname').status
+        result = wait_for_refresh
+        assert_equal 2, result['total']
+        assert_equal 2, result['processed']
+        assert_equal 1, result['queued']
+        assert_equal ['candidate-one: candidate-one is already queued or building'], result['errors']
+        assert_equal ['candidate-one'], @manager.refresh_pending
+        assert_equal %w[candidate-one candidate-two], @manager.all_builds.map(&:pkgbase).sort
+        assert_equal result, new_manager.refresh_queue
+      end
+    end
+  end
+
+  def test_empty_or_stale_refresh_selection_does_not_sync_databases
+    Open3.stub(:capture2e, ->(*) { flunk 'unexpected database sync' }) do
+      ['', 'pkgbase=missing', 'pkgbase=bad%3Bname'].each do |body|
+        assert_equal 400, post_request('/refresh/add', body).status
+      end
+      assert_nil @manager.refresh_queue
+    end
+  end
+
+  def test_restart_preserves_accepted_builds_and_leaves_unprocessed_refresh_packages_pending
+    refresh_request
+    persisted = nil
+    @service.stub(:start, ->(*) { persisted ||= File.read(STATE_FILE) }) do
+      Open3.stub(:capture2e, ['', Struct.new(:success?).new(true)]) do
+        @manager.enqueue_refresh(%w[candidate-one candidate-two])
+        wait_for_refresh
+      end
+    end
+    File.write(STATE_FILE, persisted)
+    restarted = new_manager
+    assert_equal ['candidate-one'], restarted.all_builds.map(&:pkgbase)
+    assert_equal ['candidate-two'], restarted.refresh_pending
+    result = restarted.refresh_queue
+    refute result['running']
+    assert_equal 1, result['queued']
+    assert_equal 1, result['processed']
+    assert_equal ['Queueing interrupted by daemon restart; remaining packages are still pending.'], result['errors']
+    assert_equal result, new_manager.refresh_queue
+  end
+
+  def test_shutdown_stops_a_refresh_batch_between_packages
+    refresh_request
+    @service.stub(:start, ->(*) { @manager.instance_variable_set(:@shutting_down, true) }) do
+      Open3.stub(:capture2e, ['', Struct.new(:success?).new(true)]) do
+        @manager.enqueue_refresh(%w[candidate-one candidate-two])
+        result = wait_for_refresh
+        assert_equal 1, result['queued']
+        assert_equal ['candidate-two'], @manager.refresh_pending
+        assert_equal ['Queueing interrupted by shutdown; remaining packages are still pending.'], result['errors']
+      end
+    end
+    @manager.shutdown
+    assert_raises(ArgumentError) { @manager.enqueue_refresh(['candidate-two']) }
   end
 
   def test_memory_killer_action_records_pkgbase_once_and_keeps_upload_pending
