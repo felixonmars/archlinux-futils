@@ -143,6 +143,11 @@ def build_history_for(builds)
   [active, recent, latest]
 end
 
+def interrupted_retry_candidates(builds)
+  _, _, latest = build_history_for(builds)
+  builds.select { |build| build.status == 'interrupted' && latest.key?(build.id) }
+end
+
 class Build
   attr_accessor :id, :command_line, :argv, :pkgbase, :log_path, :status,
                 :created_at, :started_at, :finished_at, :exit_status,
@@ -770,6 +775,43 @@ class BuildManager
     raise
   rescue StandardError => e
     raise ArgumentError, e.message
+  end
+
+  def requeue_interrupted
+    retries = []
+    errors = []
+    @mutex.synchronize do
+      refresh_workers_locked
+      sources = interrupted_retry_candidates(@builds.values)
+      raise ArgumentError, 'no interrupted builds to re-queue' if sources.empty?
+
+      sources.each do |source|
+        if @codex_sessions.values.any? { |session| session.build_id == source.id && session.active? }
+          errors << "#{source.pkgbase}: an active Codex session still uses this build"
+          next
+        end
+
+        build = new_build(source.command_line, target_builder: source.target_builder, environment: source.environment)
+        enqueue_build_locked(build, ignore_active_id: source.id)
+        retries << [source, build]
+      rescue ArgumentError, SystemCallError => e
+        errors << "#{source.pkgbase}: #{e.message}"
+      end
+      raise ArgumentError, errors.join('; ') if retries.empty?
+
+      retries.each { |source, _| @builds.delete(source.id) }
+      persist_locked
+      retries.each { |_, build| launch_worker(build) }
+    end
+
+    deleted = retries.count do |source, _|
+      remove_build_files(source)
+      true
+    rescue SystemCallError => e
+      errors << "#{source.pkgbase}: could not delete interrupted log: #{e.message}"
+      false
+    end
+    {queued: retries.size, deleted: deleted, errors: errors}
   end
 
   def refresh_from_remote(extra_safe_deps: nil)
@@ -1892,6 +1934,8 @@ class WebApp
       stream_events(req, res, Regexp.last_match(1))
     when %r{\A/builds/([^/]+)/upload\z}
       answer_upload(req, res, Regexp.last_match(1))
+    when '/builds/interrupted/requeue'
+      requeue_interrupted(req, res)
     when %r{\A/builds/([^/]+)/retry\z}
       retry_build(req, res, Regexp.last_match(1))
     when %r{\A/builds/([^/]+)/defer\z}
@@ -1988,6 +2032,17 @@ class WebApp
     @manager.enqueue(build.command_line, target_builder: build.target_builder, ignore_active_id: id,
       new_builder: req.query['new_builder'] == '1', environment: build.environment.merge(build_environment(req)))
     redirect(res, '/')
+  end
+
+  def requeue_interrupted(req, res)
+    not_found(res) && return unless req.request_method == 'POST'
+
+    result = @manager.requeue_interrupted
+    message = "re-queued #{result[:queued]} interrupted build(s) and deleted #{result[:deleted]} interrupted log(s)"
+    unless result[:errors].empty?
+      message += "; skipped #{result[:errors].size}: #{result[:errors].first}"
+    end
+    redirect(res, "/?notice=#{CGI.escape(message)}")
   end
 
   def push_branch(req, res, id)
@@ -2240,7 +2295,9 @@ class WebApp
   end
 
   def render_index(req, error: nil)
-    active, recent, latest_build_ids = build_history
+    builds = @manager.all_builds
+    active, recent, latest_build_ids = build_history_for(builds)
+    interrupted = interrupted_retry_candidates(builds)
     active = active.partition { |build| build.status == 'waiting_upload' }.flatten
     search = req.query['q'].to_s.strip
     unless search.empty?
@@ -2290,6 +2347,7 @@ class WebApp
       #{flash('error', error) if error}
       #{flash('notice', notice) if notice}
 
+      #{interrupted_recovery_panel(interrupted)}
       #{start_build_form unless @read_only}
       #{refresh_panel(pending) unless @read_only}
       #{codex_panel unless @read_only}
@@ -2348,6 +2406,25 @@ class WebApp
           #{keep_chroot_checkbox}
           #{switch_branch_checkbox}
           <p class="help">Use <span class="is-family-monospace">:nocheck</span> to skip checks. Leave builder blank for automatic selection.</p>
+        </form>
+      </section>
+    HTML
+  end
+
+  def interrupted_recovery_panel(builds)
+    return '' if @read_only || builds.empty?
+
+    count = builds.size
+    label = count == 1 ? 'build' : 'builds'
+    log_label = count == 1 ? 'log' : 'logs'
+    <<~HTML
+      <section class="notification is-warning interrupted-recovery" role="status">
+        <div>
+          <strong>#{count} interrupted #{label}</strong>
+          <p>Re-queue the latest interrupted attempt for each package. Their old #{log_label} will be deleted.</p>
+        </div>
+        <form action="#{h(dashboard_path('builds/interrupted/requeue'))}" method="post">
+          <button class="button is-warning" type="submit" onclick="return confirm('Re-queue all #{count} interrupted #{label} and permanently delete their old #{log_label}?')">Re-queue all + delete logs</button>
         </form>
       </section>
     HTML
@@ -2771,7 +2848,10 @@ class WebApp
           .masthead h1 { font-size: clamp(1.3rem, 2.3vw, 1.8rem); font-weight: 600; letter-spacing: -.035em; line-height: 1.2; }
           .experimental { color: var(--muted); font-size: .65rem; font-weight: 500; letter-spacing: .1em; text-transform: uppercase; border: 1px solid #cdd1c4; border-radius: 4px; padding: .3rem .5rem; }
           .box { padding: 1rem 1.25rem; background: var(--paper); border: 1px solid var(--line); border-radius: 8px; box-shadow: none; }
-          .start-panel, .refresh-panel { margin-bottom: 1rem !important; }
+          .start-panel, .refresh-panel, .interrupted-recovery { margin-bottom: 1rem !important; }
+          .interrupted-recovery { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .75rem 1rem; }
+          .interrupted-recovery p { margin-top: .2rem; font-size: .78rem; }
+          .interrupted-recovery form { flex: none; margin: 0 0 0 auto; }
           .panel-label, .section-heading h2 { color: var(--ink); font-size: .85rem; font-weight: 600; }
           .section-heading { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: .5rem 1rem; min-height: 2rem; margin-bottom: .75rem; }
           .section-heading h2 { display: flex; align-items: center; gap: .6rem; }

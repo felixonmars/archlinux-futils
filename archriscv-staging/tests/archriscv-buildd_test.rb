@@ -232,6 +232,22 @@ class BuildDashboardTest < Minitest::Test
     assert_equal %w[other unchecked], latest_build_ids(dashboard)
   end
 
+  def test_interrupted_bulk_recovery_only_prompts_for_latest_attempts
+    add_build('already-recovered', status: 'interrupted')
+    add_build('recovered', status: 'succeeded')
+
+    html = dashboard(editor: true)
+    refute_includes html, 'action="/builds/interrupted/requeue"'
+
+    add_build('recover-one', command_line: 'recover-one', status: 'interrupted')
+    add_build('recover-two', command_line: 'recover-two', status: 'interrupted')
+    html = dashboard(editor: true)
+    assert_equal 1, html.scan('action="/builds/interrupted/requeue"').size
+    assert_includes html, '<strong>2 interrupted builds</strong>'
+    assert_includes html, 'Re-queue all 2 interrupted builds and permanently delete their old logs?'
+    refute_includes dashboard, 'action="/builds/interrupted/requeue"'
+  end
+
   def test_search_does_not_mark_an_older_build_when_the_latest_does_not_match
     add_build('older', status: 'failed')
     add_build('latest', status: 'succeeded')
@@ -831,7 +847,7 @@ class BuildRestartTest < Minitest::Test
     assert_equal 200, request.call('GET', '/log-viewer.js').status
     assert_equal 200, request.call('HEAD', '/').status
 
-    actions = %w[/builds /refresh /refresh/add /refresh/clear /deferred/later/cancel] +
+    actions = %w[/builds /builds/interrupted/requeue /refresh /refresh/add /refresh/clear /deferred/later/cancel] +
       %w[upload retry defer memory-killer push-branch stop kill delete].map { |action| "/builds/waiting_upload/#{action}" }
     actions.each { |path| assert_equal 403, request.call('POST', path).status }
     %w[PUT PATCH DELETE].each { |method| assert_equal 403, request.call(method, '/').status }
@@ -1509,6 +1525,40 @@ class BuildRestartTest < Minitest::Test
     assert_equal 10_002, @manager.all_builds.size
     restart
     assert_equal 10_002, @manager.all_builds.size
+  end
+
+  def test_bulk_recovery_requeues_interrupted_builds_and_deletes_their_logs
+    sources = [
+      @manager.enqueue('wait-recover-one', target_builder: 'builder-one',
+        environment: {'KEEPCHROOT' => '1', 'SERVER' => 'custom-host'}),
+      @manager.enqueue('wait-recover-two', target_builder: 'builder-two',
+        environment: {'SWITCHBRANCH' => '1'})
+    ]
+    wait_for { sources.all? { |build| @manager.find(build.id)&.status == 'running' } }
+    source_files = sources.to_h do |build|
+      [build.id, [build.log_path, File.join(WORKER_DIR, build.id)]]
+    end
+    assert source_files.values.flatten.all? { |path| File.exist?(path) }
+
+    @manager.shutdown
+    @service.cleanup
+    @manager = new_manager
+    @manager.start
+    assert sources.all? { |build| @manager.find(build.id)&.status == 'interrupted' }
+
+    response = post_request('/builds/interrupted/requeue')
+    assert_equal 303, response.status
+    message = CGI.unescape(response['Location'])
+    assert_includes message, 're-queued 2 interrupted build(s) and deleted 2 interrupted log(s)'
+
+    assert sources.all? { |build| @manager.find(build.id).nil? }
+    assert source_files.values.flatten.none? { |path| File.exist?(path) }
+    retries = @manager.all_builds
+    assert_equal sources.map(&:command_line).sort, retries.map(&:command_line).sort
+    assert_equal ['builder@builder-one', 'builder@builder-two'], retries.map(&:target_builder).sort
+    assert_equal({'KEEPCHROOT' => '1', 'SERVER' => 'custom-host'}, retries.find { |build| build.command_line == 'wait-recover-one' }.environment)
+    assert_equal({'SWITCHBRANCH' => '1'}, retries.find { |build| build.command_line == 'wait-recover-two' }.environment)
+    wait_for { retries.all? { |build| @manager.find(build.id)&.status == 'running' } }
   end
 
   def test_live_log_resumes_from_last_event_id

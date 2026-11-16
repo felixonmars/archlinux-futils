@@ -133,7 +133,7 @@ class BuildAuthTest < Minitest::Test
 
   def test_anonymous_unapproved_and_forged_sessions_cannot_mutate_any_route
     viewer = login('UnlistedUser')
-    paths = %w[/builds /refresh /refresh/add /refresh/clear /deferred/test/cancel] +
+    paths = %w[/builds /builds/interrupted/requeue /refresh /refresh/add /refresh/clear /deferred/test/cancel] +
       %w[upload retry defer memory-killer push-branch stop kill delete].map { |action| "/builds/test/#{action}" }
     [nil, viewer, "#{GitHubAuth::COOKIE}=forged"].each do |session_cookie|
       paths.each do |path|
