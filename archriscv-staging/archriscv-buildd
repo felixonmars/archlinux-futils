@@ -3022,7 +3022,7 @@ class WebApp
       return false unless method == 'POST'
 
       session = @manager.spawn_codex(match[1], rebuild: req.query['skip_rebuild'] != '1')
-      redirect(res, "/codex/#{session.id}")
+      redirect(res, '/')
     elsif (match = req.path.match(%r{\A/codex/([a-f0-9]{24})(?:/(output|recording|frames|input|rebuild|stop))?\z}))
       id, action = match.captures
       case [method, action]

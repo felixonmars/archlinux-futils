@@ -520,7 +520,7 @@ class CodexIntegrationTest < Minitest::Test
     refute_includes terminal, '/codex-xterm.'
   end
 
-  def test_terminal_output_input_assets_and_actions_require_editor_and_csrf
+  def test_spawn_redirects_to_dashboard_and_terminal_actions_require_editor_and_csrf
     source = failed_build
     path = "/builds/#{source.id}/codex"
     assert_equal 403, request('POST', path, editor: false).status
@@ -528,7 +528,7 @@ class CodexIntegrationTest < Minitest::Test
     assert_equal 404, request('GET', path).status
     response = request('POST', path, params: {'skip_rebuild' => '1'})
     assert_equal 303, response.status
-    assert_match(%r{\A/buildd/codex/[a-f0-9]{24}\z}, response['Location'])
+    assert_equal '/buildd/', response['Location']
     session = @manager.codex_sessions.first
     refute session.rebuild
     %W[/codex/#{session.id} /codex/status /codex-terminal.js].concat(
