@@ -611,14 +611,12 @@ class CodexWorker < BuildWorker
     @output.sync = true
     @frames = File.open(File.join(@directory, 'frames'), 'ab', 0o600)
     @frames.sync = true
+    @size = [30, 100]
+    @frames.puts(JSON.generate(cols: @size[1], rows: @size[0]))
     persist
-    # Codex asks the terminal for its cursor position during startup. Wait for
-    # a browser to attach so that request has a terminal ready to answer it.
-    until @size || @stopping
-      receive_input if IO.select([@server], nil, nil, 0.1)
-    end
-    return if @stopping
-
+    # Codex asks the terminal for its cursor position during startup. Start
+    # immediately at the browser's default geometry so detached sessions run;
+    # replay lets a later attachment answer the query and apply its real size.
     @reader, @writer, @pid = PTY.spawn(@request.fetch('environment').merge('TERM' => 'xterm-256color'),
       *@request.fetch('argv'), chdir: @request.fetch('workdir'), unsetenv_others: true)
     @reader.winsize = @size

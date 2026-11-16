@@ -115,7 +115,10 @@ class CodexIntegrationTest < Minitest::Test
       STDIN.raw!
       print "\e[6n"
       cursor = +''
-      Timeout.timeout(5) { cursor << STDIN.readpartial(4096) until cursor.match?(/\e\[\d+;\d+R/) }
+      begin
+        Timeout.timeout(0.5) { cursor << STDIN.readpartial(4096) until cursor.match?(/\e\[\d+;\d+R/) }
+      rescue Timeout::Error
+      end
       print "\e]2;packages\a"
       puts "\e[31mREADY café\e[0m"
       input = +''
@@ -434,15 +437,19 @@ class CodexIntegrationTest < Minitest::Test
     assert_equal 2, @manager.all_builds.size
   end
 
-  def test_queued_terminal_waits_for_attachment_and_survives_restart
+  def test_terminal_starts_before_attachment_and_survives_restart
     source = failed_build
     session = @manager.spawn_codex(source.id)
-    wait_for { @manager.codex_output(session.id, 0)[:ready] }
-    assert_equal 'queued', @manager.codex_sessions.first.status
-    assert_equal '', @manager.codex_output(session.id, 0)[:data]
+    wait_for { File.socket?(File.join(CODEX_TEST_ROOT, 'codex', session.id, 'terminal.sock')) }
+    wait_for { @manager.codex_sessions.first.status == 'running' }
+    wait_for { @manager.codex_output(session.id, 0)[:data].unpack1('m0').include?('READY') }
+    output = @manager.codex_output(session.id, 0)[:data].unpack1('m0')
+    assert_includes output, "\e[6n"
+    assert_equal({'cols' => 100, 'rows' => 30}, @manager.codex_frames(session.id, 0)[:events].first)
     @manager.shutdown
     @manager = BuildManager.new(service: @build_service, codex_service: @codex_service)
     @manager.start
+    assert_equal 'running', @manager.codex_sessions.first.status
     assert_equal [session.id], @codex_service.starts
     @manager.stop_codex(session.id)
     assert_equal 'stopped', @manager.codex_sessions.first.status
