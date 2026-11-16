@@ -1,0 +1,1972 @@
+#!/usr/bin/env python3
+"""Browse, add, and switch ~/.codex providers from a TUI or the command line.
+
+Providers live in config.toml under model_providers. The active provider
+occupies the OpenAI slot so Codex keeps using the OpenAI auth flow, and each
+provider's credentials are snapshotted as ~/.codex/auth.<name>.json.
+
+Codex only shows a provider's own models when the provider advertises a model
+catalog. This tool probes each provider's model endpoint: if it speaks Codex's
+catalog format it sets model_catalog_url; if it only returns an OpenAI-style
+model list it builds ~/.codex/model-catalog.<name>.json and points the active
+provider's model_catalog_json at it.
+
+Everything is read from disk for every action. If config.toml, an auth file, or
+a catalog changes while an action is being prepared, the action is retried
+against the new contents, so edits by Codex, sync-codex, or by hand are not
+overwritten.
+"""
+
+import argparse
+import contextlib
+import copy
+import fcntl
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from typing import ClassVar
+
+import tomlkit
+
+try:
+    from rich.text import Text
+    from textual import on
+    from textual.app import App as TextualApp
+    from textual.binding import Binding
+    from textual.containers import Horizontal, Vertical
+    from textual.screen import ModalScreen
+    from textual.widgets import (
+        Button,
+        DataTable,
+        Footer,
+        Header,
+        Input,
+        Label,
+        Select,
+        Static,
+        Switch,
+    )
+except ImportError as import_error:
+    TEXTUAL_ERROR = import_error
+else:
+    TEXTUAL_ERROR = None
+
+ACTIVE_SLOT = "OpenAI"
+OFFICIAL_NAME = "OpenAI-Official"
+LABEL_RE = re.compile(r"[A-Za-z0-9_-]+")
+COMMANDS = ("list", "models", "use", "add", "remove", "tui")
+RETRIES = 5
+CATALOG_PREFIX = "model-catalog."
+CATALOG_TIMEOUT = 5
+CATALOG_CACHE_SECONDS = 60
+MAX_CATALOG_MODELS = 40
+
+
+class StateError(ValueError):
+    """A provider file is missing, invalid, or cannot be changed."""
+
+
+class Conflict(RuntimeError):
+    """Files kept changing while an action was being saved."""
+
+
+HANDLED_ERRORS = (Conflict, OSError, ValueError, KeyError,
+                  tomlkit.exceptions.ParseError)
+
+ORIGIN_NOTES = {
+    "auth.json": "live auth.json",
+    "snapshot": "saved snapshot",
+    "fallback": "fallback snapshot",
+    "legacy": "legacy key in auth.json",
+    "missing": "no file",
+    "invalid": "invalid",
+}
+
+HELP_TEXT = """\
+How providers work
+
+Providers are listed in ~/.codex/config.toml under [model_providers]. The one
+in the OpenAI slot is active, and Codex reads its login from ~/.codex/auth.json.
+Every other provider keeps a saved credential snapshot in
+~/.codex/auth.<name>.json; switching copies that snapshot into auth.json and
+swaps the config entries.
+
+Codex's model picker only knows a provider's models when it is told about the
+provider's catalog. This tool probes that catalog on add/switch. A provider
+that speaks Codex's catalog format gets model_catalog_url. One that only has
+an OpenAI-style /models list gets a generated
+~/.codex/model-catalog.<name>.json used through model_catalog_json.
+
+This tool re-reads config.toml, the auth files, and the catalogs before every
+action and retries if they change meanwhile, so edits from Codex, sync-codex,
+or another terminal are preserved.
+
+Keys
+  up/down or j/k   select a provider
+  enter or u       switch to the selected provider
+  a                add a provider
+  i                import auth (API key or auth.json)
+  e                edit the provider endpoint
+  d                remove a provider (keeps its snapshot)
+  m                list models; choose the model to use
+  r                reload from disk
+  ?                show this help
+  q                quit
+"""
+
+
+def write_private(path, text):
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as f:
+        temporary = Path(f.name)
+        try:
+            f.write(text)
+            f.close()
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def read_text(path):
+    try:
+        return path.read_text()
+    except FileNotFoundError:
+        return None
+
+
+def short_path(path):
+    try:
+        return "~/" + str(Path(path).relative_to(Path.home()))
+    except ValueError:
+        return str(path)
+
+
+def json_text(obj):
+    return json.dumps(obj, indent=2) + "\n"
+
+
+def ensure_newline(text):
+    return text if text.endswith("\n") else text + "\n"
+
+
+def mask_key(key):
+    key = str(key)
+    return "***" if len(key) < 16 else key[:10] + "..."
+
+
+def parse_auth_object(text, where):
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise StateError(f"{where}: {error.msg}") from None
+    if not isinstance(obj, dict):
+        raise StateError(f"{where}: expected a JSON object")
+    return obj
+
+
+def check_auth(obj, where):
+    tokens = obj.get("tokens")
+    if not (obj.get("OPENAI_API_KEY") or
+            isinstance(tokens, dict) and tokens.get("refresh_token")):
+        raise StateError(f"{where}: no API key or ChatGPT login tokens")
+
+
+@dataclass
+class AuthInput:
+    obj: dict
+    text: str
+
+
+def load_auth_file(path):
+    text = read_text(path)
+    if text is None:
+        raise StateError(f"{short_path(path)}: file not found")
+    return AuthInput(parse_auth_object(text, short_path(path)),
+                     ensure_newline(text))
+
+
+def auth_from_key(key):
+    key = (key or "").strip()
+    if not key:
+        raise StateError("API key is empty")
+    obj = {"auth_mode": "apikey", "OPENAI_API_KEY": key}
+    return AuthInput(obj, json_text(obj))
+
+
+_CODEX_VERSION = None
+_BUNDLED_CATALOG = None
+
+
+def codex_version():
+    global _CODEX_VERSION
+    if _CODEX_VERSION is None:
+        try:
+            result = subprocess.run(["codex", "--version"], check=False,
+                                    capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError) as error:
+            raise StateError(f"cannot run codex: {error}") from None
+        words = result.stdout.strip().split()
+        if result.returncode != 0 or not words:
+            raise StateError("cannot determine the Codex version")
+        _CODEX_VERSION = words[-1]
+    return _CODEX_VERSION
+
+
+def bundled_catalog():
+    global _BUNDLED_CATALOG
+    if _BUNDLED_CATALOG is None:
+        try:
+            with tempfile.TemporaryDirectory() as scratch:
+                env = dict(os.environ, CODEX_HOME=scratch)
+                result = subprocess.run(
+                    ["codex", "debug", "models", "--bundled"],
+                    check=False, capture_output=True, text=True, timeout=60,
+                    env=env)
+        except (OSError, subprocess.SubprocessError) as error:
+            raise StateError(
+                f"cannot run codex debug models: {error}") from None
+        if result.returncode != 0:
+            detail = result.stderr.strip().splitlines()
+            raise StateError(
+                "cannot read the bundled model catalog"
+                + (f": {detail[-1]}" if detail else ""))
+        try:
+            models = json.loads(result.stdout).get("models")
+        except (json.JSONDecodeError, AttributeError) as error:
+            raise StateError(f"invalid bundled catalog: {error}") from None
+        if not isinstance(models, list) or not models:
+            raise StateError("the bundled model catalog is empty")
+        _BUNDLED_CATALOG = models
+    return _BUNDLED_CATALOG
+
+
+def catalog_token(auth_obj):
+    if not isinstance(auth_obj, dict):
+        return None
+    tokens = auth_obj.get("tokens")
+    if isinstance(tokens, dict) and tokens.get("access_token"):
+        return str(tokens["access_token"])
+    key = auth_obj.get("OPENAI_API_KEY")
+    return str(key) if key else None
+
+
+def catalog_fingerprint(token):
+    return hashlib.sha256(token.encode()).hexdigest()[:16] if token else ""
+
+
+def catalog_candidates(base_url):
+    base = base_url.rstrip("/")
+    candidates = [base + "/models"]
+    if not base.endswith("/v1"):
+        candidates.append(base + "/v1/models")
+    return candidates
+
+
+def request_json(endpoint, token):
+    separator = "&" if "?" in endpoint else "?"
+    url = (f"{endpoint}{separator}client_version="
+           f"{urllib.parse.quote(codex_version(), safe='')}")
+    headers = {"Accept": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(request, timeout=CATALOG_TIMEOUT) as response:
+        body = response.read(2 * 1024 * 1024)
+    return json.loads(body)
+
+
+def catalog_metadata(text):
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    meta = data.get("_codex_provider") if isinstance(data, dict) else None
+    return meta if isinstance(meta, dict) else None
+
+
+def parse_catalog(data):
+    models = data.get("models") if isinstance(data, dict) else None
+    if isinstance(models, list):
+        entries = []
+        for item in models:
+            if isinstance(item, dict) and item.get("slug"):
+                slug = str(item["slug"])
+                display = str(item.get("display_name") or slug)
+                entries.append((slug, display))
+        if entries:
+            return "codex", entries
+    data_models = data.get("data") if isinstance(data, dict) else None
+    if isinstance(data_models, list):
+        entries = []
+        for item in data_models:
+            if isinstance(item, dict) and item.get("id"):
+                slug = str(item["id"])
+                display = str(item.get("display_name") or slug)
+                entries.append((slug, display))
+        if entries:
+            return "openai", entries
+    return None, []
+
+
+def fetch_catalog(endpoint, token):
+    try:
+        data = request_json(endpoint, token)
+    except urllib.error.HTTPError as error:
+        error.close()
+        return None, [], f"HTTP {error.code}"
+    except urllib.error.URLError as error:
+        return None, [], str(error.reason)
+    except StateError as error:
+        return None, [], str(error)
+    except (TimeoutError, OSError) as error:
+        return None, [], str(error)
+    except json.JSONDecodeError as error:
+        return None, [], f"invalid JSON: {error.msg}"
+    kind, entries = parse_catalog(data)
+    if kind is None:
+        return None, [], "no models in the response"
+    return kind, entries, None
+
+
+def local_catalog_entries(provider, models):
+    bundled = bundled_catalog()
+    known = {}
+    for entry in bundled:
+        if isinstance(entry, dict) and entry.get("slug"):
+            known[str(entry["slug"])] = entry
+    template = known.get("gpt-5.5")
+    if template is None:
+        template = next(
+            (entry for entry in bundled
+             if isinstance(entry, dict)
+             and (entry.get("base_instructions") or
+                  isinstance(entry.get("model_messages"), dict))),
+            bundled[0])
+    entries = []
+    seen = set()
+    for slug, display in models[:MAX_CATALOG_MODELS]:
+        if slug in seen:
+            continue
+        seen.add(slug)
+        if slug in known:
+            entry = copy.deepcopy(known[slug])
+        else:
+            entry = copy.deepcopy(template)
+            entry["slug"] = slug
+            entry["display_name"] = display
+            entry["description"] = f"Model {slug} provided by {provider.name}."
+            entry["upgrade"] = None
+            entry["availability_nux"] = None
+            entry["additional_speed_tiers"] = []
+            entry["service_tiers"] = []
+            entry["default_service_tier"] = None
+        messages = entry.get("model_messages")
+        if not (entry.get("base_instructions") or
+                isinstance(messages, dict) and
+                messages.get("instructions_template")):
+            raise StateError(
+                f"bundled catalog entry for {slug} has no instructions")
+        entries.append(entry)
+    if not entries:
+        raise StateError("the provider did not return any models")
+    return entries
+
+
+def managed_catalog_json(value, home):
+    if not value:
+        return None
+    try:
+        path = Path(str(value)).expanduser()
+    except (OSError, ValueError):
+        return None
+    if path.parent != Path(home):
+        return None
+    if not path.name.startswith(CATALOG_PREFIX) or path.suffix != ".json":
+        return None
+    return path
+
+
+def ensure_official(doc):
+    table = doc["model_providers"]
+    if any(entry.get("name") == OFFICIAL_NAME for entry in table.values()):
+        return
+    if "OpenAIOfficial" in table:
+        raise StateError("OpenAIOfficial is already used by another provider")
+    # Omitting base_url lets Codex choose the official API or ChatGPT endpoint.
+    table["OpenAIOfficial"] = {
+        "name": OFFICIAL_NAME,
+        "wire_api": "responses",
+        "requires_openai_auth": True,
+    }
+
+
+def check_new_label(state, label):
+    if not LABEL_RE.fullmatch(label):
+        raise StateError(f"provider label cannot be used as a filename: {label!r}")
+    if label.casefold() == "official":
+        raise StateError("the official provider is managed automatically")
+    if any(p.label.casefold() == label.casefold() for p in state.providers):
+        raise StateError(f"provider {label} already exists")
+    slot = ACTIVE_SLOT + label
+    if slot in state.doc["model_providers"]:
+        raise StateError(f"{slot} is already used by another provider")
+    return slot
+
+
+def check_base_url(url):
+    url = (url or "").strip()
+    if not url:
+        raise StateError("base URL is required")
+    if not re.match(r"https?://", url):
+        raise StateError("base URL must start with http:// or https://")
+    return url
+
+
+def dump_config(doc):
+    text = tomlkit.dumps(doc)
+    tomlkit.parse(text)
+    return text
+
+
+@dataclass
+class Provider:
+    slot: str
+    label: str
+    name: str
+    base_url: str
+    wire_api: str
+    requires_openai_auth: bool
+    auth_path: Path
+    auth_text: str | None
+    auth_obj: dict | None
+    auth_origin: str
+    auth_error: str | None
+    catalog_url: str | None
+
+    @property
+    def active(self):
+        return self.slot == ACTIVE_SLOT
+
+    def summary(self):
+        if self.auth_error:
+            return f"auth error: {self.auth_error}"
+        if self.auth_obj is None:
+            return "no saved auth"
+        key = self.auth_obj.get("OPENAI_API_KEY")
+        tokens = self.auth_obj.get("tokens")
+        if key:
+            text = f"api key {mask_key(key)}"
+        elif isinstance(tokens, dict) and tokens.get("refresh_token"):
+            text = "ChatGPT login"
+        else:
+            text = "invalid auth"
+        return text
+
+
+@dataclass
+class State:
+    home: Path
+    doc: object
+    providers: list
+    auth_text: str | None
+    auth_obj: dict | None
+    auth_error: str | None
+    texts: dict
+    credentials_file: bool
+    catalog_json: str | None
+    model: str | None
+
+
+@dataclass
+class Catalog:
+    kind: str
+    url: str | None
+    models: list
+    error: str | None
+    base_url: str = ""
+    auth_fingerprint: str = ""
+
+    def slugs(self):
+        return [slug for slug, _ in self.models]
+
+
+@dataclass
+class SwitchPlan:
+    label: str
+    provider: Provider
+    catalog: Catalog
+    current_model: str
+    offered: bool
+
+
+def probe_catalog(base_url, token, known_url=None):
+    if not base_url:
+        return Catalog("none", None, [], "official provider", "", "")
+    if not token:
+        return Catalog("none", None, [], "no saved auth", base_url, "")
+    errors = []
+    openai = None
+    if known_url:
+        kind, entries, error = fetch_catalog(known_url, token)
+        if kind == "codex":
+            return Catalog("codex", known_url, entries, None, base_url,
+                           catalog_fingerprint(token))
+        if kind == "openai":
+            openai = (known_url, entries)
+        else:
+            errors.append(f"{known_url}: {error}")
+    for candidate in catalog_candidates(base_url):
+        if candidate == known_url:
+            continue
+        kind, entries, error = fetch_catalog(candidate, token)
+        if kind == "codex":
+            return Catalog("codex", candidate, entries, None, base_url,
+                           catalog_fingerprint(token))
+        if kind == "openai" and openai is None:
+            openai = (candidate, entries)
+        if kind is None:
+            errors.append(f"{candidate}: {error}")
+    fingerprint = catalog_fingerprint(token)
+    if openai is not None:
+        return Catalog("openai", openai[0], openai[1], None, base_url,
+                       fingerprint)
+    detail = "; ".join(errors) or "no catalog endpoint answered"
+    return Catalog("none", None, [], detail, base_url, fingerprint)
+
+
+def catalog_offered(catalog, model):
+    if not catalog.models or not model:
+        return True
+    wanted = str(model).casefold()
+    return any(slug.casefold() == wanted for slug in catalog.slugs())
+
+
+class Store:
+    def __init__(self, home):
+        self.home = home
+        self.config_path = home / "config.toml"
+        self.auth_path = home / "auth.json"
+        self.lock_path = home / ".codex-provider.lock"
+        self._catalog_cache = {}
+
+    def _read_texts(self):
+        texts = {}
+        paths = [self.config_path, self.auth_path]
+        try:
+            paths.extend(sorted(self.home.glob("auth*.json")))
+            paths.extend(sorted(self.home.glob(CATALOG_PREFIX + "*.json")))
+        except OSError:
+            pass
+        for path in paths:
+            if path not in texts:
+                texts[path] = read_text(path)
+        return texts
+
+    def signature(self):
+        entries = []
+        paths = [self.config_path]
+        try:
+            paths.extend(sorted(self.home.glob("auth*.json")))
+            paths.extend(sorted(self.home.glob(CATALOG_PREFIX + "*.json")))
+        except OSError:
+            pass
+        for path in paths:
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            entries.append((path.name, stat.st_mtime_ns, stat.st_size))
+        return tuple(entries)
+
+    def read(self):
+        texts = self._read_texts()
+        config_text = texts[self.config_path]
+        if config_text is None:
+            raise StateError(f"{short_path(self.config_path)} is missing")
+        try:
+            doc = tomlkit.parse(config_text)
+        except tomlkit.exceptions.ParseError as error:
+            raise StateError(f"{short_path(self.config_path)}: {error}") from None
+        table = doc.get("model_providers")
+        if table is None:
+            raise StateError(
+                f"{short_path(self.config_path)} has no [model_providers]")
+        if ACTIVE_SLOT not in table:
+            raise StateError(
+                f"{short_path(self.config_path)} has no model_providers.OpenAI")
+        ensure_official(doc)
+
+        auth_text = texts[self.auth_path]
+        auth_obj = None
+        auth_error = None
+        if auth_text is None:
+            auth_error = "auth.json is missing"
+        else:
+            try:
+                auth_obj = parse_auth_object(auth_text, "auth.json")
+                check_auth(auth_obj, "auth.json")
+            except StateError as error:
+                auth_error = str(error)
+
+        providers = []
+        seen = set()
+        for slot, entry in table.items():
+            if not slot.startswith("OpenAI"):
+                continue
+            provider = self._make_provider(
+                texts, auth_obj, auth_error, slot, entry)
+            if provider.label.casefold() in seen:
+                raise StateError(f"duplicate provider name: {provider.label}")
+            seen.add(provider.label.casefold())
+            providers.append(provider)
+        catalog_json = doc.get("model_catalog_json")
+        model = doc.get("model")
+        return State(self.home, doc, providers, auth_text, auth_obj,
+                     auth_error, texts,
+                     doc.get("cli_auth_credentials_store", "file") == "file",
+                     str(catalog_json) if catalog_json is not None else None,
+                     str(model) if model is not None else None)
+
+    def _make_provider(self, texts, auth_obj, auth_error, slot, entry):
+        name = entry.get("name", slot)
+        if not isinstance(name, str) or not LABEL_RE.fullmatch(name):
+            raise StateError(
+                f"provider name cannot be used as a filename: {name!r}")
+        label = name.removeprefix("OpenAI-")
+        official = label.casefold() == "official"
+        auth_path = (self.home / "auth.official.json" if official
+                     else self.home / f"auth.{name}.json")
+        text = texts.get(auth_path)
+        origin = "missing"
+        obj = None
+        error = None
+        if official and text is None:
+            fallback = self.home / "auth.OpenAI-Official.json"
+            fallback_text = texts.get(fallback)
+            if fallback_text is not None:
+                text, origin = fallback_text, "fallback"
+        if text is not None:
+            try:
+                obj = parse_auth_object(text, short_path(auth_path))
+                check_auth(obj, short_path(auth_path))
+                if origin == "missing":
+                    origin = "snapshot"
+            except StateError as err:
+                obj, error, origin = None, str(err), "invalid"
+        elif slot != ACTIVE_SLOT:
+            suffix = slot.removeprefix("OpenAI")
+            legacy_key = (auth_obj or {}).get(f"OPENAI_API_KEY{suffix}")
+            if suffix.isdigit() and legacy_key:
+                obj = {"auth_mode": "apikey", "OPENAI_API_KEY": legacy_key}
+                origin = "legacy"
+        if slot == ACTIVE_SLOT:
+            obj = auth_obj
+            text = texts.get(self.auth_path)
+            error = auth_error
+            origin = "auth.json"
+        catalog_url = entry.get("model_catalog_url")
+        return Provider(slot, label, name, entry.get("base_url", "") or "",
+                        entry.get("wire_api", "responses"),
+                        bool(entry.get("requires_openai_auth", False)),
+                        auth_path, text, obj, origin, error,
+                        str(catalog_url) if catalog_url is not None else None)
+
+    @contextlib.contextmanager
+    def _lock(self):
+        fd = os.open(self.lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    def _changed_since(self, texts):
+        for path, old in texts.items():
+            try:
+                new = path.read_text()
+            except FileNotFoundError:
+                new = None
+            except OSError:
+                return True
+            if new != old:
+                return True
+        return False
+
+    def _transact(self, action):
+        for _ in range(RETRIES):
+            with self._lock():
+                state = self.read()
+                writes, message = action(state)
+                if self._changed_since(state.texts):
+                    continue
+                config_text = writes.pop(self.config_path, None)
+                for path, text in writes.items():
+                    write_private(path, text)
+                if config_text is not None:
+                    try:
+                        write_private(self.config_path, config_text)
+                    except OSError:
+                        original = state.texts.get(self.auth_path)
+                        if original is not None:
+                            write_private(self.auth_path, original)
+                        raise
+                return message
+        raise Conflict("config.toml or auth files kept changing; try again")
+
+    def _resolve(self, state, query):
+        wanted = query.casefold()
+        for provider in state.providers:
+            if wanted in (provider.label.casefold(),
+                          provider.slot.casefold(),
+                          f"openai-{provider.label.casefold()}"):
+                return provider
+        choices = ", ".join(p.label for p in state.providers)
+        raise StateError(f"unknown provider; choose {choices}")
+
+    def catalog_for(self, provider, auth_obj=None, refresh=False):
+        auth = auth_obj if auth_obj is not None else provider.auth_obj
+        token = catalog_token(auth)
+        if not provider.base_url:
+            return Catalog("none", None, [], "official provider", "", "")
+        if not token:
+            return Catalog("none", None, [], "no saved auth",
+                           provider.base_url, "")
+        fingerprint = catalog_fingerprint(token)
+        key = (provider.base_url, provider.catalog_url or "", fingerprint)
+        now = time.monotonic()
+        cached = self._catalog_cache.get(key)
+        if (cached is not None and not refresh
+                and now - cached[0] < CATALOG_CACHE_SECONDS):
+            return cached[1]
+        catalog = probe_catalog(provider.base_url, token, provider.catalog_url)
+        self._catalog_cache[key] = (now, catalog)
+        return catalog
+
+    def prepare_switch(self, query):
+        state = self.read()
+        provider = self._resolve(state, query)
+        catalog = self.catalog_for(provider)
+        return SwitchPlan(provider.label, provider, catalog,
+                          state.model or "",
+                          catalog_offered(catalog, state.model))
+
+    def models_for(self, query, refresh=False):
+        state = self.read()
+        provider = self._resolve(state, query)
+        return provider, self.catalog_for(provider, refresh=refresh), state.model
+
+    def configure_catalog(self, query):
+        result = {}
+
+        def action(state):
+            provider = self._resolve(state, query)
+            catalog = self.catalog_for(provider, refresh=True)
+            writes = {}
+            if provider.base_url:
+                effective, notes = self._apply_catalog(
+                    state, provider, catalog, writes, provider.active)
+            else:
+                effective, notes = catalog, []
+            config_text = dump_config(state.doc)
+            if config_text != state.texts[self.config_path]:
+                writes[self.config_path] = config_text
+            message = self._catalog_message(provider, effective)
+            if notes:
+                message += " " + " ".join(notes)
+            result["catalog"] = effective
+            return writes, message
+
+        message = self._transact(action)
+        return result["catalog"], message
+
+    def _catalog_message(self, provider, catalog):
+        if catalog.kind == "codex":
+            return (f"Model catalog: {len(catalog.models)} models from "
+                    f"{catalog.url}.")
+        if catalog.kind == "openai":
+            path = self.home / f"{CATALOG_PREFIX}{provider.name}.json"
+            return (f"Model catalog: {len(catalog.models)} models in "
+                    f"{short_path(path)}.")
+        if not provider.base_url:
+            return "Official provider uses Codex's bundled model catalog."
+        return f"Model catalog unavailable: {catalog.error}."
+
+    def _web_search_original(self, state):
+        current = state.doc.get("web_search")
+        current_value = str(current) if current is not None else None
+        managed = False
+        saved = None
+        for provider in state.providers:
+            if not provider.active:
+                continue
+            path = self.home / f"{CATALOG_PREFIX}{provider.name}.json"
+            meta = catalog_metadata(state.texts.get(path))
+            if meta is not None and "web_search" in meta:
+                managed = True
+                saved = meta["web_search"]
+                break
+        if current_value is not None and current_value != "disabled":
+            return True, current_value
+        if managed:
+            return True, saved
+        return False, current_value
+
+    def _restore_web_search(self, state, notes):
+        managed, original = self._web_search_original(state)
+        if not managed:
+            return
+        current = state.doc.get("web_search")
+        if current is None or str(current) != "disabled":
+            return
+        if original is None:
+            if "web_search" in state.doc:
+                del state.doc["web_search"]
+            notes.append("web_search restored to the default.")
+        else:
+            state.doc["web_search"] = original
+            notes.append(f"web_search restored to {original}.")
+
+    def _apply_catalog(self, state, provider, catalog, writes, activate):
+        entry = state.doc["model_providers"][provider.slot]
+        current = state.doc.get("model_catalog_json")
+        managed = managed_catalog_json(current, self.home)
+        notes = []
+        effective = catalog
+        if catalog.kind == "openai":
+            try:
+                entries = local_catalog_entries(provider, catalog.models)
+            except StateError as error:
+                effective = Catalog("none", None, [], str(error),
+                                    catalog.base_url, catalog.auth_fingerprint)
+            else:
+                _, original_web_search = self._web_search_original(state)
+                payload = {"models": entries,
+                           "_codex_provider": {
+                               "web_search": original_web_search}}
+                text = json_text(payload)
+                while len(entries) > 1 and len(text.encode()) > 900_000:
+                    entries.pop()
+                    text = json_text(payload)
+                path = self.home / f"{CATALOG_PREFIX}{provider.name}.json"
+                writes[path] = text
+                if "model_catalog_url" in entry:
+                    del entry["model_catalog_url"]
+                if activate:
+                    state.doc["web_search"] = "disabled"
+                    notes.append("web_search disabled for this provider.")
+                    if current and managed is None:
+                        notes.append(
+                            "Top-level model_catalog_json is user-managed; "
+                            "left it alone.")
+                    else:
+                        state.doc["model_catalog_json"] = (
+                            f"~/.codex/{path.name}")
+                return effective, notes
+        if effective.kind == "codex":
+            if activate:
+                self._restore_web_search(state, notes)
+            entry["model_catalog_url"] = effective.url
+            if activate and managed is not None:
+                del state.doc["model_catalog_json"]
+            return effective, notes
+        if activate:
+            self._restore_web_search(state, notes)
+            saved = self.home / f"{CATALOG_PREFIX}{provider.name}.json"
+            if state.texts.get(saved) is not None:
+                state.doc["model_catalog_json"] = f"~/.codex/{saved.name}"
+                notes.append("Using the previously saved model catalog.")
+            elif managed is not None:
+                del state.doc["model_catalog_json"]
+                notes.append("No model catalog; using Codex's bundled list.")
+            elif current:
+                notes.append("No model catalog; user model_catalog_json left "
+                             "alone.")
+        return effective, notes
+
+    def switch(self, query, auth=None, model=None, catalog=None):
+        def action(state):
+            provider = self._resolve(state, query)
+            return self._plan_switch(state, provider, auth, model, catalog)
+        return self._transact(action)
+
+    def add(self, label, base_url, auth=None, switch=False, model=None):
+        def action(state):
+            return self._plan_add(state, label, base_url, auth, switch, model)
+        return self._transact(action)
+
+    def use_model(self, query, model):
+        def action(state):
+            provider = self._resolve(state, query)
+            if not provider.active:
+                return self._plan_switch(state, provider, None, model, None)
+            catalog = self.catalog_for(provider)
+            writes = {}
+            effective, notes = self._apply_catalog(
+                state, provider, catalog, writes, True)
+            state.doc["model"] = model
+            writes[self.config_path] = dump_config(state.doc)
+            message = f"Model set to {model} for {provider.label}. "
+            message += self._catalog_message(provider, effective)
+            if notes:
+                message += " " + " ".join(notes)
+            return writes, message
+        return self._transact(action)
+
+    def import_auth(self, query, auth):
+        def action(state):
+            provider = self._resolve(state, query)
+            return self._plan_import(state, provider, auth)
+        return self._transact(action)
+
+    def edit_base_url(self, query, base_url):
+        def action(state):
+            provider = self._resolve(state, query)
+            return self._plan_edit(state, provider, base_url)
+        return self._transact(action)
+
+    def remove(self, query):
+        def action(state):
+            provider = self._resolve(state, query)
+            return self._plan_remove(state, provider)
+        return self._transact(action)
+
+    def _plan_switch(self, state, provider, auth=None, model=None, catalog=None):
+        if not state.credentials_file:
+            raise StateError(
+                "switching auth.json requires cli_auth_credentials_store = 'file'")
+        ensure_official(state.doc)
+        writes = {}
+        if provider.active:
+            if auth is None and model is None:
+                return writes, f"Already using {provider.label} as OpenAI"
+            if auth is None:
+                catalog = self.catalog_for(provider)
+                effective, notes = self._apply_catalog(
+                    state, provider, catalog, writes, True)
+                state.doc["model"] = model
+                writes[self.config_path] = dump_config(state.doc)
+                message = f"Model set to {model} for {provider.label}."
+                message += " " + self._catalog_message(provider, effective)
+                if notes:
+                    message += " " + " ".join(notes)
+                return writes, message
+            selected_obj, selected_text = auth.obj, auth.text
+        elif auth is not None:
+            selected_obj, selected_text = auth.obj, auth.text
+        elif provider.auth_error:
+            raise StateError(f"{provider.label}: {provider.auth_error}")
+        elif provider.auth_obj is None:
+            raise StateError(f"no saved auth for {provider.label}; import one as "
+                             f"{short_path(provider.auth_path)}")
+        else:
+            selected_obj = provider.auth_obj
+            selected_text = provider.auth_text or json_text(selected_obj)
+        check_auth(selected_obj, f"auth for {provider.label}")
+
+        token = catalog_token(selected_obj)
+        if (catalog is None
+                or catalog.base_url != provider.base_url
+                or catalog.auth_fingerprint != catalog_fingerprint(token)):
+            catalog = self.catalog_for(provider, auth_obj=selected_obj)
+        effective, notes = self._apply_catalog(
+            state, provider, catalog, writes, True)
+
+        if provider.active:
+            writes[provider.auth_path] = ensure_newline(selected_text)
+            writes[self.auth_path] = ensure_newline(selected_text)
+            message = f"Updated auth for {provider.label}."
+        else:
+            if state.auth_obj is None:
+                raise StateError(
+                    f"cannot read current auth.json: {state.auth_error}")
+            if state.auth_text is None:
+                raise StateError(
+                    "auth.json is missing; cannot save the current provider")
+            active = next(p for p in state.providers if p.active)
+            writes[active.auth_path] = ensure_newline(state.auth_text)
+            for saved in state.providers:
+                if saved.active or saved.auth_origin != "legacy":
+                    continue
+                writes[saved.auth_path] = json_text(saved.auth_obj)
+            writes[provider.auth_path] = ensure_newline(selected_text)
+            writes[self.auth_path] = ensure_newline(selected_text)
+            table = state.doc["model_providers"]
+            table[ACTIVE_SLOT], table[provider.slot] = (
+                table[provider.slot], table[ACTIVE_SLOT])
+            state.doc["model_provider"] = ACTIVE_SLOT
+            message = (f"Using {provider.label} as OpenAI. "
+                       "Restart Codex to apply.")
+
+        if model:
+            state.doc["model"] = model
+            message += f" Model set to {model}."
+        elif (effective.models and state.model
+              and not catalog_offered(effective, state.model)):
+            notes.append(f"Current model {state.model} is not offered by "
+                         f"{provider.label}.")
+        review_model = state.doc.get("review_model")
+        if (effective.models and review_model
+                and not catalog_offered(effective, str(review_model))):
+            notes.append(f"review_model {review_model} is not offered by "
+                         f"{provider.label}.")
+        message += " " + self._catalog_message(provider, effective)
+        if notes:
+            message += " " + " ".join(notes)
+        writes[self.config_path] = dump_config(state.doc)
+        return writes, message
+
+    def _plan_add(self, state, label, base_url, auth=None, switch=False,
+                  model=None):
+        label = (label or "").strip()
+        slot = check_new_label(state, label)
+        base_url = check_base_url(base_url)
+        ensure_official(state.doc)
+        entry = {
+            "name": f"OpenAI-{label}",
+            "base_url": base_url,
+            "wire_api": "responses",
+            "requires_openai_auth": True,
+        }
+        state.doc["model_providers"][slot] = entry
+        writes = {}
+        if auth is not None:
+            writes[self.home / f"auth.OpenAI-{label}.json"] = (
+                ensure_newline(auth.text))
+        provider = self._make_provider(
+            state.texts, state.auth_obj, state.auth_error, slot, entry)
+        auth_obj = auth.obj if auth is not None else provider.auth_obj
+        if auth_obj is not None:
+            catalog = self.catalog_for(provider, auth_obj=auth_obj, refresh=True)
+        else:
+            catalog = Catalog("none", None, [], "no saved auth",
+                              provider.base_url, "")
+        if switch:
+            switch_writes, message = self._plan_switch(
+                state, provider, auth, model, catalog)
+            writes.update(switch_writes)
+            return writes, f"Added {label}. {message}"
+        effective, notes = self._apply_catalog(
+            state, provider, catalog, writes, False)
+        writes[self.config_path] = dump_config(state.doc)
+        message = f"Added {label} (slot {slot})."
+        if auth_obj is None:
+            message += (" No auth saved yet; the model catalog was not "
+                        "configured.")
+        else:
+            message += " " + self._catalog_message(provider, effective)
+            if notes:
+                message += " " + " ".join(notes)
+        return writes, message
+
+    def _plan_import(self, state, provider, auth):
+        if not state.credentials_file:
+            raise StateError(
+                "switching auth.json requires cli_auth_credentials_store = 'file'")
+        writes = {provider.auth_path: ensure_newline(auth.text)}
+        if not provider.active:
+            return writes, f"Saved auth for {provider.label}."
+        writes[self.auth_path] = ensure_newline(auth.text)
+        catalog = self.catalog_for(provider, auth_obj=auth.obj, refresh=True)
+        effective, notes = self._apply_catalog(
+            state, provider, catalog, writes, True)
+        config_text = dump_config(state.doc)
+        if config_text != state.texts[self.config_path]:
+            writes[self.config_path] = config_text
+        message = f"Updated auth for {provider.label}. "
+        message += self._catalog_message(provider, effective)
+        if notes:
+            message += " " + " ".join(notes)
+        return writes, message
+
+    def _plan_edit(self, state, provider, base_url):
+        if provider.label.casefold() == "official":
+            raise StateError("the official provider has no base URL")
+        base_url = check_base_url(base_url)
+        entry = state.doc["model_providers"][provider.slot]
+        entry["base_url"] = base_url
+        if "model_catalog_url" in entry:
+            del entry["model_catalog_url"]
+        updated = self._make_provider(
+            state.texts, state.auth_obj, state.auth_error, provider.slot, entry)
+        if updated.auth_obj is not None:
+            catalog = self.catalog_for(updated, refresh=True)
+        else:
+            catalog = Catalog("none", None, [], "no saved auth",
+                              updated.base_url, "")
+        writes = {}
+        effective, notes = self._apply_catalog(
+            state, updated, catalog, writes, updated.active)
+        writes[self.config_path] = dump_config(state.doc)
+        message = f"Updated endpoint for {provider.label}. "
+        message += self._catalog_message(updated, effective)
+        if notes:
+            message += " " + " ".join(notes)
+        return writes, message
+
+    def _plan_remove(self, state, provider):
+        if provider.label.casefold() == "official":
+            raise StateError("the official provider is managed automatically")
+        if provider.active:
+            raise StateError(
+                f"{provider.label} is active; switch to another provider first")
+        del state.doc["model_providers"][provider.slot]
+        writes = {self.config_path: dump_config(state.doc)}
+        if state.texts.get(provider.auth_path) is None:
+            return writes, f"Removed {provider.label}."
+        return writes, (f"Removed {provider.label}; auth snapshot kept at "
+                        f"{short_path(provider.auth_path)}.")
+
+
+if TEXTUAL_ERROR is None:
+
+    class AddProviderScreen(ModalScreen):
+        BINDINGS: ClassVar[list[Binding]] = [
+            Binding("escape", "cancel", "Cancel")
+        ]
+
+        def __init__(self, state):
+            super().__init__()
+            self.state = state
+
+        def compose(self):
+            with Vertical(id="dialog"):
+                yield Label("Add provider", classes="title")
+                yield Label("Label")
+                yield Input(placeholder="Ming", id="label")
+                yield Label("Base URL")
+                yield Input(placeholder="https://example.com", id="base-url")
+                yield Label("Auth")
+                yield Select(
+                    [("API key", "key"), ("auth.json file", "file"),
+                     ("Nothing yet", "none")],
+                    value="key", allow_blank=False, id="method")
+                with Vertical(id="key-row"):
+                    yield Label("API key")
+                    yield Input(password=True, id="api-key")
+                with Vertical(id="file-row"):
+                    yield Label("auth.json path")
+                    yield Input(placeholder="~/auth.json", id="auth-file")
+                yield Static(id="error")
+                with Horizontal(id="switch-row"):
+                    yield Switch(value=True, id="switch")
+                    yield Label("Switch to it after adding")
+                with Horizontal(id="buttons"):
+                    yield Button("Add", variant="primary", id="add")
+                    yield Button("Cancel", id="cancel")
+
+        def on_mount(self):
+            self.query_one("#file-row").display = False
+            self.query_one("#label", Input).focus()
+
+        @on(Select.Changed, "#method")
+        def method_changed(self, event):
+            self.query_one("#key-row").display = event.value == "key"
+            self.query_one("#file-row").display = event.value == "file"
+            if event.value == "none":
+                self.query_one("#switch", Switch).value = False
+
+        @on(Button.Pressed, "#add")
+        def add_pressed(self):
+            self.submit()
+
+        @on(Button.Pressed, "#cancel")
+        def cancel_pressed(self):
+            self.dismiss(None)
+
+        @on(Input.Submitted, "#auth-file")
+        def file_submitted(self):
+            self.submit()
+
+        def action_cancel(self):
+            self.dismiss(None)
+
+        def submit(self):
+            label = self.query_one("#label", Input).value.strip()
+            method = self.query_one("#method", Select).value
+            try:
+                if not label:
+                    raise StateError("provider label is required")
+                check_new_label(self.state, label)
+                base_url = check_base_url(
+                    self.query_one("#base-url", Input).value)
+                auth = None
+                if method == "key":
+                    auth = auth_from_key(self.query_one("#api-key", Input).value)
+                elif method == "file":
+                    path = self.query_one("#auth-file", Input).value.strip()
+                    if not path:
+                        raise StateError("auth.json path is required")
+                    auth = load_auth_file(Path(path).expanduser())
+            except HANDLED_ERRORS as error:
+                self.query_one("#error", Static).update(
+                    Text(str(error), style="red"))
+                return
+            self.dismiss({"label": label, "url": base_url, "auth": auth,
+                          "switch": self.query_one("#switch", Switch).value})
+
+    class ImportAuthScreen(ModalScreen):
+        BINDINGS: ClassVar[list[Binding]] = [
+            Binding("escape", "cancel", "Cancel")
+        ]
+
+        def __init__(self, provider):
+            super().__init__()
+            self.provider = provider
+
+        def compose(self):
+            with Vertical(id="dialog"):
+                yield Label(f"Import auth for {self.provider.label}",
+                            classes="title")
+                yield Select([("API key", "key"), ("auth.json file", "file")],
+                             value="key", allow_blank=False, id="method")
+                with Vertical(id="key-row"):
+                    yield Label("API key")
+                    yield Input(password=True, id="api-key")
+                with Vertical(id="file-row"):
+                    yield Label("auth.json path")
+                    yield Input(placeholder="~/auth.json", id="auth-file")
+                yield Static(id="error")
+                with Horizontal(id="buttons"):
+                    yield Button("Save", variant="primary", id="save")
+                    yield Button("Cancel", id="cancel")
+
+        def on_mount(self):
+            self.query_one("#file-row").display = False
+            self.query_one("#api-key", Input).focus()
+
+        @on(Select.Changed, "#method")
+        def method_changed(self, event):
+            self.query_one("#key-row").display = event.value == "key"
+            self.query_one("#file-row").display = event.value == "file"
+
+        @on(Button.Pressed, "#save")
+        def save_pressed(self):
+            self.submit()
+
+        @on(Button.Pressed, "#cancel")
+        def cancel_pressed(self):
+            self.dismiss(None)
+
+        @on(Input.Submitted, "#auth-file")
+        def file_submitted(self):
+            self.submit()
+
+        def action_cancel(self):
+            self.dismiss(None)
+
+        def submit(self):
+            method = self.query_one("#method", Select).value
+            try:
+                if method == "key":
+                    auth = auth_from_key(self.query_one("#api-key", Input).value)
+                else:
+                    path = self.query_one("#auth-file", Input).value.strip()
+                    if not path:
+                        raise StateError("auth.json path is required")
+                    auth = load_auth_file(Path(path).expanduser())
+            except HANDLED_ERRORS as error:
+                self.query_one("#error", Static).update(
+                    Text(str(error), style="red"))
+                return
+            self.dismiss(auth)
+
+    class EditEndpointScreen(ModalScreen):
+        BINDINGS: ClassVar[list[Binding]] = [
+            Binding("escape", "cancel", "Cancel")
+        ]
+
+        def __init__(self, provider):
+            super().__init__()
+            self.provider = provider
+
+        def compose(self):
+            with Vertical(id="dialog"):
+                yield Label(f"Endpoint for {self.provider.label}",
+                            classes="title")
+                yield Input(value=self.provider.base_url, id="url")
+                yield Static(id="error")
+                with Horizontal(id="buttons"):
+                    yield Button("Save", variant="primary", id="save")
+                    yield Button("Cancel", id="cancel")
+
+        def on_mount(self):
+            self.query_one("#url", Input).focus()
+
+        @on(Button.Pressed, "#save")
+        def save_pressed(self):
+            self.submit()
+
+        @on(Button.Pressed, "#cancel")
+        def cancel_pressed(self):
+            self.dismiss(None)
+
+        @on(Input.Submitted, "#url")
+        def url_submitted(self):
+            self.submit()
+
+        def action_cancel(self):
+            self.dismiss(None)
+
+        def submit(self):
+            try:
+                url = check_base_url(self.query_one("#url", Input).value)
+            except HANDLED_ERRORS as error:
+                self.query_one("#error", Static).update(
+                    Text(str(error), style="red"))
+                return
+            self.dismiss(url)
+
+    class ConfirmScreen(ModalScreen):
+        BINDINGS: ClassVar[list[Binding]] = [
+            Binding("escape", "cancel", "Cancel"),
+            Binding("y", "confirm", "Remove"),
+            Binding("n", "cancel", "Cancel", show=False),
+        ]
+
+        def __init__(self, question):
+            super().__init__()
+            self.question = question
+
+        def compose(self):
+            with Vertical(id="dialog"):
+                yield Static(self.question, id="question")
+                with Horizontal(id="buttons"):
+                    yield Button("Remove", variant="error", id="yes")
+                    yield Button("Cancel", id="no")
+
+        @on(Button.Pressed, "#yes")
+        def yes_pressed(self):
+            self.dismiss(True)
+
+        @on(Button.Pressed, "#no")
+        def no_pressed(self):
+            self.dismiss(False)
+
+        def action_confirm(self):
+            self.dismiss(True)
+
+        def action_cancel(self):
+            self.dismiss(False)
+
+    class HelpScreen(ModalScreen):
+        BINDINGS: ClassVar[list[Binding]] = [
+            Binding("escape", "close", "Close"),
+            Binding("question_mark", "close", "Close", show=False),
+            Binding("q", "close", "Close", show=False),
+        ]
+
+        def compose(self):
+            with Vertical(id="dialog"):
+                yield Static(Text(HELP_TEXT), id="help")
+                yield Button("Close", id="close")
+
+        @on(Button.Pressed, "#close")
+        def close_pressed(self):
+            self.dismiss(None)
+
+        def action_close(self):
+            self.dismiss(None)
+
+    class ModelsScreen(ModalScreen):
+        BINDINGS: ClassVar[list[Binding]] = [
+            Binding("escape", "cancel", "Cancel"),
+            Binding("enter", "choose", "Use"),
+            Binding("j", "down", show=False),
+            Binding("k", "up", show=False),
+            Binding("c", "keep", "Keep current", show=False),
+        ]
+
+        def __init__(self, provider, catalog, current,
+                     mode="browse", note=None):
+            super().__init__()
+            self.provider = provider
+            self.catalog = catalog
+            self.current = current
+            self.mode = mode
+            self.note = note
+
+        def compose(self):
+            with Vertical(id="dialog", classes="models"):
+                yield Label(f"Models for {self.provider.label}",
+                            classes="title")
+                yield Static(self.note_text(), id="catalog-note")
+                yield DataTable(id="model-table", cursor_type="row")
+
+        def note_text(self):
+            kind = ("Codex catalog" if self.catalog.kind == "codex"
+                    else "OpenAI-style list")
+            lines = [f"{len(self.catalog.models)} models ({kind})"]
+            if self.catalog.url:
+                lines.append(f"from {self.catalog.url}")
+            if self.note:
+                lines.append(self.note)
+            elif self.mode == "choose":
+                lines.append("Press c to keep the current model, Esc to cancel.")
+            else:
+                lines.append("Enter uses the model; Esc closes.")
+            return "\n".join(lines)
+
+        def on_mount(self):
+            table = self.query_one("#model-table", DataTable)
+            table.add_columns(" ", "Model", "Display name")
+            current_index = None
+            for index, (slug, display) in enumerate(self.catalog.models):
+                marker = "*" if slug == self.current else " "
+                table.add_row(marker, slug, display)
+                if slug == self.current:
+                    current_index = index
+            table.focus()
+            if table.row_count:
+                table.move_cursor(row=current_index or 0)
+
+        @on(DataTable.RowSelected, "#model-table")
+        def model_selected(self):
+            self.action_choose()
+
+        def action_choose(self):
+            table = self.query_one("#model-table", DataTable)
+            if not table.row_count:
+                return
+            row = table.get_row_at(table.cursor_row)
+            slug = row[1].plain if hasattr(row[1], "plain") else str(row[1])
+            self.dismiss(("use", slug))
+
+        def action_down(self):
+            self.query_one("#model-table", DataTable).action_cursor_down()
+
+        def action_up(self):
+            self.query_one("#model-table", DataTable).action_cursor_up()
+
+        def action_keep(self):
+            if self.mode == "choose":
+                self.dismiss(("keep", None))
+
+        def action_cancel(self):
+            self.dismiss(None)
+
+    class CodexProviderApp(TextualApp):
+        TITLE = "Codex Providers"
+        CSS = """
+        #providers { height: 1fr; }
+        #details {
+            height: auto;
+            min-height: 6;
+            padding: 0 1;
+            border-top: solid $panel;
+        }
+        #message { height: 1; padding: 0 1; }
+        AddProviderScreen, ImportAuthScreen, EditEndpointScreen,
+        ConfirmScreen, HelpScreen, ModelsScreen {
+            align: center middle;
+        }
+        #dialog {
+            width: 78;
+            max-width: 95%;
+            height: auto;
+            max-height: 90%;
+            overflow-y: auto;
+            padding: 1 2;
+            border: thick $accent;
+            background: $surface;
+        }
+        #dialog .title { text-style: bold; margin-bottom: 1; }
+        #dialog Input { margin-bottom: 1; }
+        #dialog Select { margin-bottom: 1; }
+        #dialog #error { color: $error; height: auto; }
+        #dialog #buttons { height: auto; margin-top: 1; }
+        #dialog #buttons Button { margin-right: 2; }
+        #dialog #switch-row { height: auto; margin-top: 1; }
+        #dialog #switch-row Label { margin-left: 1; }
+        #dialog.models { width: 92; height: 80%; }
+        #dialog.models #model-table { height: 1fr; }
+        #catalog-note { height: auto; margin-bottom: 1; }
+        """
+        BINDINGS: ClassVar[list[Binding]] = [
+            Binding("enter", "use", "Use", key_display="enter/u"),
+            Binding("u", "use", show=False),
+            Binding("j", "cursor_down", show=False),
+            Binding("k", "cursor_up", show=False),
+            Binding("a", "add", "Add"),
+            Binding("i", "import_auth", "Import auth"),
+            Binding("e", "edit", "Edit"),
+            Binding("d", "remove", "Remove"),
+            Binding("m", "models", "Models"),
+            Binding("r", "reload", "Reload"),
+            Binding("question_mark", "help", "Help", key_display="?"),
+            Binding("q", "quit", "Quit"),
+        ]
+
+        def __init__(self, store):
+            super().__init__()
+            self.store = store
+            self.state = None
+            self.signature = None
+
+        def compose(self):
+            yield Header(show_clock=False)
+            yield DataTable(id="providers", cursor_type="row")
+            yield Static(id="details")
+            yield Static(id="message")
+            yield Footer()
+
+        def on_mount(self):
+            self.sub_title = short_path(self.store.config_path)
+            self.table = self.query_one("#providers", DataTable)
+            self.details = self.query_one("#details", Static)
+            self.message_widget = self.query_one("#message", Static)
+            self.table.add_columns(" ", "Provider", "Auth", "Endpoint")
+            self.table.focus()
+            self.reload()
+            self.set_interval(1.0, self.poll_files)
+
+        def selected_provider(self):
+            if (self.state is None or
+                    not self.state.providers or
+                    self.table.row_count == 0):
+                return None
+            index = min(max(0, self.table.cursor_row),
+                        len(self.state.providers) - 1)
+            return self.state.providers[index]
+
+        def current_label(self):
+            provider = self.selected_provider()
+            return provider.label if provider else None
+
+        def catalog_description(self, provider):
+            if provider.catalog_url:
+                return provider.catalog_url
+            if provider.active and self.state and self.state.catalog_json:
+                path = Path(self.state.catalog_json).expanduser()
+                return "file " + short_path(path)
+            path = self.store.home / f"{CATALOG_PREFIX}{provider.name}.json"
+            if self.state and path in self.state.texts:
+                return "local file (applied on switch)"
+            return "not configured (press m)"
+
+        def reload(self, note=None):
+            previous = self.current_label()
+            try:
+                state = self.store.read()
+            except HANDLED_ERRORS as error:
+                self.state = None
+                self.signature = self.store.signature()
+                self.table.clear()
+                self.details.update("")
+                self.show_message(
+                    f"Cannot load provider files: {error}", error=True)
+                return
+            self.state = state
+            self.signature = self.store.signature()
+            self.fill_table(previous)
+            self.refresh_details()
+            if note:
+                self.show_message(note)
+
+        def poll_files(self):
+            if self.store.signature() != self.signature:
+                self.reload(note="Reloaded; files changed on disk.")
+
+        def fill_table(self, previous):
+            self.table.clear()
+            for provider in self.state.providers:
+                marker = "*" if provider.active else " "
+                label = Text(
+                    provider.label,
+                    style="bold green" if provider.active else "")
+                self.table.add_row(marker, label, provider.summary(),
+                                   provider.base_url or "(official)",
+                                   key=provider.label)
+            if self.table.row_count == 0:
+                return
+            labels = [p.label.casefold()
+                      for p in self.state.providers]
+            index = 0
+            if previous and previous.casefold() in labels:
+                index = labels.index(previous.casefold())
+            self.table.move_cursor(row=index)
+
+        def refresh_details(self):
+            provider = self.selected_provider()
+            if provider is None:
+                self.details.update("")
+                return
+            text = Text()
+            text.append(provider.label, style="bold")
+            if provider.active:
+                text.append("  (active)", style="green")
+            text.append("\n")
+            text.append(
+                f"slot {provider.slot}  |  wire_api {provider.wire_api}  |  "
+                f"requires_openai_auth "
+                f"{str(provider.requires_openai_auth).lower()}",
+                style="dim")
+            text.append("\n")
+            text.append(f"endpoint  {provider.base_url or '(official)'}")
+            text.append("\n")
+            model = self.state.model if self.state else None
+            text.append(f"model     {model or '(default)'}  |  catalog "
+                        f"{self.catalog_description(provider)}")
+            text.append("\n")
+            text.append(
+                f"auth      {provider.summary()} "
+                f"({ORIGIN_NOTES[provider.auth_origin]})")
+            text.append("\n")
+            text.append(f"snapshot  {short_path(provider.auth_path)}",
+                        style="dim")
+            if self.state and not self.state.credentials_file:
+                text.append("\n")
+                text.append("warning: cli_auth_credentials_store is not "
+                            "'file'; auth switching is disabled",
+                            style="yellow")
+            self.details.update(text)
+
+        @on(DataTable.RowHighlighted)
+        def row_highlighted(self):
+            self.refresh_details()
+
+        def show_message(self, text, error=False):
+            self.message_widget.update(
+                Text(text, style="red" if error else "dim"))
+
+        def apply_action(self, func, *args, select=None):
+            try:
+                message = func(*args)
+            except HANDLED_ERRORS as error:
+                self.show_message(str(error), error=True)
+                result = False
+            else:
+                self.show_message(message)
+                result = True
+            self.reload()
+            if result and select:
+                self.select_provider(select)
+            return result
+
+        def select_provider(self, label):
+            if not self.state:
+                return
+            labels = [p.label.casefold() for p in self.state.providers]
+            if label.casefold() in labels:
+                self.table.move_cursor(row=labels.index(label.casefold()))
+                self.refresh_details()
+
+        def use_label(self, label):
+            if self.state:
+                current = next(
+                    (p for p in self.state.providers
+                     if p.label.casefold() == label.casefold()), None)
+                if current is not None and current.active:
+                    self.show_message(
+                        f"Already using {current.label} as OpenAI.")
+                    return
+            try:
+                plan = self.store.prepare_switch(label)
+            except HANDLED_ERRORS as error:
+                self.show_message(str(error), error=True)
+                return
+            if plan.provider.active:
+                self.show_message(f"Already using {plan.label} as OpenAI.")
+                return
+            if plan.catalog.models and not plan.offered:
+                note = (f"{plan.label} does not offer {plan.current_model}. "
+                        "Pick a model, press c to keep it, or Esc to cancel.")
+
+                def finished(choice):
+                    if choice is None:
+                        self.show_message("Switch cancelled.")
+                    elif choice[0] == "keep":
+                        self.apply_action(self.store.switch, plan.label,
+                                          None, None, plan.catalog,
+                                          select=plan.label)
+                    else:
+                        self.apply_action(self.store.switch, plan.label,
+                                          None, choice[1], plan.catalog,
+                                          select=plan.label)
+
+                self.push_screen(
+                    ModelsScreen(plan.provider, plan.catalog,
+                                 plan.current_model, mode="choose",
+                                 note=note),
+                    finished)
+                return
+            self.apply_action(self.store.switch, plan.label, None, None,
+                              plan.catalog, select=plan.label)
+
+        def action_use(self):
+            provider = self.selected_provider()
+            if provider:
+                self.use_label(provider.label)
+
+        def action_models(self):
+            provider = self.selected_provider()
+            if provider is None:
+                return
+            try:
+                catalog, message = self.store.configure_catalog(provider.label)
+            except HANDLED_ERRORS as error:
+                self.show_message(str(error), error=True)
+                return
+            self.reload()
+            if not catalog.models:
+                if provider.base_url:
+                    self.show_message(
+                        f"No model catalog for {provider.label}: "
+                        f"{catalog.error}", error=True)
+                else:
+                    self.show_message(
+                        "Official provider uses Codex's bundled model "
+                        "catalog.")
+                return
+            self.show_message(message)
+            current = self.state.model if self.state else None
+
+            def finished(choice):
+                if choice:
+                    self.apply_action(self.store.use_model, provider.label,
+                                      choice[1], select=provider.label)
+
+            self.push_screen(
+                ModelsScreen(provider, catalog, current, mode="browse"),
+                finished)
+
+        def action_add(self):
+            if self.state is None:
+                self.show_message(
+                    "Cannot add a provider until the files load.", error=True)
+                return
+
+            def finished(request):
+                if request:
+                    added = self.apply_action(
+                        self.store.add, request["label"], request["url"],
+                        request["auth"], False, None)
+                    if added and request["switch"]:
+                        self.use_label(request["label"])
+
+            self.push_screen(AddProviderScreen(self.state), finished)
+
+        def action_import_auth(self):
+            provider = self.selected_provider()
+            if provider is None:
+                return
+
+            def finished(auth):
+                if auth is not None:
+                    self.apply_action(self.store.import_auth, provider.label, auth)
+
+            self.push_screen(ImportAuthScreen(provider), finished)
+
+        def action_edit(self):
+            provider = self.selected_provider()
+            if provider is None:
+                return
+            if provider.label.casefold() == "official":
+                self.show_message(
+                    "The official provider has no base URL.", error=True)
+                return
+
+            def finished(url):
+                if url is not None:
+                    self.apply_action(self.store.edit_base_url,
+                                    provider.label, url)
+
+            self.push_screen(EditEndpointScreen(provider), finished)
+
+        def action_remove(self):
+            provider = self.selected_provider()
+            if provider is None:
+                return
+            if provider.active:
+                self.show_message(f"{provider.label} is active; switch first.",
+                                  error=True)
+                return
+            if provider.label.casefold() == "official":
+                self.show_message(
+                    "The official provider is managed automatically.",
+                    error=True)
+                return
+
+            def finished(confirmed):
+                if confirmed:
+                    self.apply_action(self.store.remove, provider.label)
+
+            self.push_screen(
+                ConfirmScreen(f"Remove {provider.label}? "
+                              "Its auth snapshot is kept."), finished)
+
+        def action_help(self):
+            self.push_screen(HelpScreen())
+
+        def action_reload(self):
+            self.reload(note="Reloaded.")
+
+        def action_cursor_down(self):
+            self.table.action_cursor_down()
+
+        def action_cursor_up(self):
+            self.table.action_cursor_up()
+
+
+def run_tui(store):
+    if TEXTUAL_ERROR is not None:
+        raise StateError(
+            "the TUI requires python-textual; install python-textual or use "
+            "the list/use/add commands")
+    try:
+        CodexProviderApp(store).run()
+    except KeyboardInterrupt:
+        pass
+
+
+def print_list(store):
+    state = store.read()
+    providers = state.providers
+    if not providers:
+        print("no providers")
+        return
+    summaries = [p.summary() for p in providers]
+    label_width = max(len(p.label) for p in providers)
+    active_width = len(" (active)")
+    summary_width = max(len(s) for s in summaries)
+    for provider, summary in zip(providers, summaries):
+        active = " (active)" if provider.active else ""
+        endpoint = provider.base_url or "(official)"
+        print(f"{provider.label:<{label_width}}{active:<{active_width}}  "
+              f"{summary:<{summary_width}}  {endpoint}".rstrip())
+
+
+def print_models(store, query, refresh=False):
+    provider, catalog, current = store.models_for(query, refresh=refresh)
+    label = provider.label + (" (active)" if provider.active else "")
+    if not catalog.models:
+        if not provider.base_url:
+            print(f"{label}: Codex's bundled model catalog is used")
+            return
+        raise StateError(f"{label}: no model catalog ({catalog.error})")
+    kind = ("Codex catalog" if catalog.kind == "codex"
+            else "OpenAI-style list")
+    print(f"{label}: {len(catalog.models)} models ({kind})")
+    if catalog.url:
+        print(f"source: {catalog.url}")
+    for slug, display in catalog.models:
+        marker = "*" if slug == current else " "
+        suffix = f"  ({display})" if display and display != slug else ""
+        print(f"{marker} {slug}{suffix}")
+
+
+def add_auth_arguments(parser):
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--auth", type=Path,
+                       help="import this provider's auth.json")
+    group.add_argument("--api-key", help="use this API key for the provider")
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="codex-provider",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  codex-provider                 open the TUI\n"
+            "  codex-provider list            print providers\n"
+            "  codex-provider Jason           shorthand for 'use Jason'\n"
+            "  codex-provider models LinYun   list a provider's models\n"
+            "  codex-provider use LinYun --model gpt-6-astra\n"
+            "  codex-provider add Ming --base-url https://ming.example.com "
+            "--api-key sk-... --switch\n"
+            "  codex-provider remove Ming     delete a provider entry\n"
+            "\n"
+            "On add/use, the provider's model catalog is probed so Codex's "
+            "model\npicker matches that provider. A generated local catalog "
+            "lives in\n~/.codex/model-catalog.<name>.json.\n"
+        ),
+    )
+    sub = parser.add_subparsers(dest="command", metavar="command")
+
+    sub.add_parser("list", help="print providers")
+    sub.add_parser("tui", help="open the interactive interface")
+
+    models = sub.add_parser("models", help="list a provider's models")
+    models.add_argument("provider")
+    models.add_argument("--refresh", action="store_true",
+                        help="bypass the in-process catalog cache")
+
+    use = sub.add_parser("use", help="switch the active provider")
+    use.add_argument("provider")
+    use.add_argument("--model", help="set this model after switching")
+    add_auth_arguments(use)
+
+    add = sub.add_parser("add", help="register a new provider")
+    add.add_argument("label")
+    add.add_argument("--base-url", required=True,
+                     help="OpenAI-compatible endpoint")
+    add.add_argument("--switch", action="store_true",
+                     help="switch to the new provider after adding it")
+    add.add_argument("--model", help="set this model after switching")
+    add_auth_arguments(add)
+
+    remove = sub.add_parser("remove", help="delete a provider entry")
+    remove.add_argument("provider")
+    return parser
+
+
+def cli_auth(args):
+    if args.auth is not None:
+        return load_auth_file(args.auth.expanduser())
+    if args.api_key is not None:
+        return auth_from_key(args.api_key)
+    return None
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and not argv[0].startswith("-") and argv[0] not in COMMANDS:
+        argv.insert(0, "use")
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.command == "add" and args.model and not args.switch:
+        parser.error("--model requires --switch")
+    store = Store(Path.home() / ".codex")
+
+    if args.command is None:
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            run_tui(store)
+            return
+        args.command = "list"
+    if args.command == "tui":
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            raise StateError("the TUI needs an interactive terminal")
+        run_tui(store)
+    elif args.command == "list":
+        print_list(store)
+    elif args.command == "models":
+        print_models(store, args.provider, args.refresh)
+    elif args.command == "use":
+        print(store.switch(args.provider, cli_auth(args), args.model))
+    elif args.command == "add":
+        print(store.add(args.label, args.base_url, cli_auth(args),
+                        args.switch, args.model))
+    elif args.command == "remove":
+        print(store.remove(args.provider))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except HANDLED_ERRORS as error:
+        sys.exit(f"codex-provider: {error}")
